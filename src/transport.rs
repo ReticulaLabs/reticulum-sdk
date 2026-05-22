@@ -1,6 +1,10 @@
 use alloc::sync::Arc;
 use announce_limits::AnnounceLimits;
 use announce_table::AnnounceTable;
+use discovery::create_discovery_destination;
+use discovery::is_discovery_destination;
+use discovery::RegisteredDiscoveryInterface;
+use discovery::DISCOVERY_JOB_INTERVAL;
 use link_table::LinkTable;
 use packet_cache::PacketCache;
 use path_requests::create_path_request_destination;
@@ -51,11 +55,16 @@ use crate::packet::PacketType;
 
 mod announce_limits;
 mod announce_table;
+mod discovery;
 mod link_table;
 mod packet_cache;
 mod path_requests;
 mod path_table;
 mod reverse_table;
+
+pub use discovery::DiscoveredInterface;
+pub use discovery::DiscoveryInterfaceConfig;
+pub use discovery::DiscoveryInterfaceKind;
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
@@ -120,6 +129,7 @@ struct TransportHandler {
     config: TransportConfig,
     iface_manager: Arc<Mutex<InterfaceManager>>,
     announce_tx: broadcast::Sender<AnnounceEvent>,
+    discovery_tx: broadcast::Sender<DiscoveredInterface>,
 
     path_table: PathTable,
     announce_table: AnnounceTable,
@@ -128,6 +138,8 @@ struct TransportHandler {
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
     probe_destination: Option<Arc<Mutex<SingleInputDestination>>>,
+    discovery_destination: Arc<Mutex<SingleInputDestination>>,
+    discoverable_ifaces: HashMap<AddressHash, RegisteredDiscoveryInterface>,
 
     announce_limits: AnnounceLimits,
 
@@ -148,6 +160,7 @@ struct TransportHandler {
 
 pub struct Transport {
     name: String,
+    discovery_tx: broadcast::Sender<DiscoveredInterface>,
     link_in_event_tx: broadcast::Sender<LinkEventData>,
     link_out_event_tx: broadcast::Sender<LinkEventData>,
     received_data_tx: broadcast::Sender<ReceivedData>,
@@ -214,6 +227,7 @@ impl Default for TransportConfig {
 impl Transport {
     pub fn new(config: TransportConfig) -> Self {
         let (announce_tx, _) = tokio::sync::broadcast::channel(16);
+        let (discovery_tx, _) = tokio::sync::broadcast::channel(16);
         let (link_in_event_tx, _) = tokio::sync::broadcast::channel(16);
         let (link_out_event_tx, _) = tokio::sync::broadcast::channel(16);
         let (received_data_tx, _) = tokio::sync::broadcast::channel(16);
@@ -233,6 +247,8 @@ impl Transport {
         let path_requests = PathRequests::new(config.name.as_str(), transport_id);
 
         let path_request_dest = create_path_request_destination().desc.address_hash;
+        let discovery_destination =
+            Arc::new(Mutex::new(create_discovery_destination(config.identity.clone())));
         let probe_destination = if config.respond_to_probes {
             let mut destination = SingleInputDestination::new(
                 config.identity.clone(),
@@ -273,12 +289,15 @@ impl Transport {
             single_in_destinations,
             single_out_destinations: HashMap::new(),
             probe_destination,
+            discovery_destination,
+            discoverable_ifaces: HashMap::new(),
             announce_limits: AnnounceLimits::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
             path_requests,
             announce_tx,
+            discovery_tx: discovery_tx.clone(),
             link_in_event_tx: link_in_event_tx.clone(),
             received_data_tx: received_data_tx.clone(),
             fixed_dest_path_requests: path_request_dest,
@@ -296,6 +315,7 @@ impl Transport {
 
         Self {
             name,
+            discovery_tx,
             iface_manager,
             link_in_event_tx,
             link_out_event_tx,
@@ -332,6 +352,10 @@ impl Transport {
 
     pub async fn recv_announces(&self) -> broadcast::Receiver<AnnounceEvent> {
         self.handler.lock().await.announce_tx.subscribe()
+    }
+
+    pub fn recv_discovery(&self) -> broadcast::Receiver<DiscoveredInterface> {
+        self.discovery_tx.subscribe()
     }
 
     pub async fn send_packet(&self, packet: Packet) {
@@ -567,6 +591,32 @@ impl Transport {
         self.handler.lock().await.probe_destination.clone()
     }
 
+    pub async fn register_discoverable_interface(
+        &self,
+        iface: AddressHash,
+        config: DiscoveryInterfaceConfig,
+    ) {
+        self.handler
+            .lock()
+            .await
+            .discoverable_ifaces
+            .insert(iface, RegisteredDiscoveryInterface::new(config));
+    }
+
+    pub async fn unregister_discoverable_interface(&self, iface: &AddressHash) {
+        self.handler.lock().await.discoverable_ifaces.remove(iface);
+    }
+
+    pub async fn send_discovery_announce(&self, iface: &AddressHash) -> Result<(), RnsError> {
+        let packet = {
+            let mut handler = self.handler.lock().await;
+            handler.build_discovery_packet(iface).await?
+        };
+
+        self.handler.lock().await.send_packet(packet).await;
+        Ok(())
+    }
+
     pub async fn get_out_destination(&self, address: &AddressHash)
         -> Option<Arc<Mutex<SingleOutputDestination>>>
     {
@@ -658,6 +708,25 @@ impl TransportHandler {
             tx_type: TxMessageType::Broadcast(on_iface),
             packet,
         }).await;
+    }
+
+    async fn build_discovery_packet(&mut self, iface: &AddressHash) -> Result<Packet, RnsError> {
+        let config = self
+            .discoverable_ifaces
+            .get_mut(iface)
+            .ok_or(RnsError::InvalidArgument)?;
+
+        config.last_announce = time::Instant::now();
+
+        let app_data = config.config.build_app_data(
+            self.config.retransmit,
+            self.config.identity.address_hash(),
+        )?;
+
+        self.discovery_destination
+            .lock()
+            .await
+            .announce(OsRng, Some(app_data.as_slice()))
     }
 }
 
@@ -873,6 +942,7 @@ async fn handle_announce<'a>(
         let destination = result.0;
         let app_data = result.1;
         let dest_hash = destination.identity.address_hash;
+        let dest_desc = destination.desc;
         let destination = Arc::new(Mutex::new(destination));
 
         if !handler
@@ -917,6 +987,14 @@ async fn handle_announce<'a>(
             destination,
             app_data: PacketDataBuffer::new_from_slice(&app_data),
         });
+
+        if is_discovery_destination(&dest_desc) {
+            if let Ok(discovered) =
+                DiscoveredInterface::from_announce(dest_desc, packet.header.hops + 1, app_data)
+            {
+                let _ = handler.discovery_tx.send(discovered);
+            }
+        }
     }
 }
 
@@ -1192,6 +1270,42 @@ async fn handle_cleanup<'a>(handler: MutexGuard<'a, TransportHandler>) {
     handler.iface_manager.lock().await.cleanup();
 }
 
+async fn handle_discovery<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
+    let now = time::Instant::now();
+    let mut selected_iface = None;
+    let mut selected_elapsed = Duration::ZERO;
+
+    for (iface, discovery) in &handler.discoverable_ifaces {
+        if !discovery.is_due(now) {
+            continue;
+        }
+
+        let elapsed = now.duration_since(discovery.last_announce);
+        if selected_iface.is_none() || elapsed > selected_elapsed {
+            selected_iface = Some(*iface);
+            selected_elapsed = elapsed;
+        }
+    }
+
+    let Some(iface) = selected_iface else {
+        return;
+    };
+
+    let packet = match handler.build_discovery_packet(&iface).await {
+        Ok(packet) => packet,
+        Err(err) => {
+            log::warn!(
+                "tp({}): failed to build discovery announce on {}: {err:?}",
+                handler.config.name,
+                iface
+            );
+            return;
+        }
+    };
+
+    handler.send_packet(packet).await;
+}
+
 async fn retransmit_announces<'a>(
     mut handler: MutexGuard<'a, TransportHandler>,
     retransmit_old: bool
@@ -1336,6 +1450,28 @@ async fn manage_transport(
                     },
                     _ = time::sleep(INTERVAL_LINKS_CHECK) => {
                         handle_check_links(handler.lock().await).await;
+                    }
+                }
+            }
+        });
+    }
+
+    {
+        let handler = handler.clone();
+        let cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    _ = time::sleep(DISCOVERY_JOB_INTERVAL) => {
+                        handle_discovery(handler.lock().await).await;
                     }
                 }
             }
