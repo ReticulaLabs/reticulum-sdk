@@ -58,11 +58,9 @@ impl PathRequest {
         let mut tag_end = data.len();
 
         if data.len() > ADDRESS_HASH_SIZE * 2 {
-            requesting_transport = Some(
-                AddressHash::new_from_slice(
-                    &data[ADDRESS_HASH_SIZE..2*ADDRESS_HASH_SIZE]
-                )
-            );
+            let mut transport = [0u8; ADDRESS_HASH_SIZE];
+            transport.copy_from_slice(&data[ADDRESS_HASH_SIZE..2 * ADDRESS_HASH_SIZE]);
+            requesting_transport = Some(AddressHash::new(transport));
             tag_start = ADDRESS_HASH_SIZE * 2;
         }
 
@@ -205,5 +203,21 @@ mod tests {
         let decoded = testee.decode(encoded.data.as_slice()).unwrap();
 
         assert_eq!(decoded.destination, dest);
+    }
+
+    #[test]
+    fn path_request_roundtrip_preserves_requesting_transport() {
+        let transport_id = AddressHash::new_from_rand(OsRng);
+        let mut testee = PathRequests::new("", Some(transport_id));
+
+        let dest = AddressHash::new_from_rand(OsRng);
+        let tag = b"fixed-tag".to_vec();
+
+        let encoded = testee.generate(&dest, Some(tag.clone()));
+        let decoded = testee.decode(encoded.data.as_slice()).unwrap();
+
+        assert_eq!(decoded.destination, dest);
+        assert_eq!(decoded.requesting_transport, Some(transport_id));
+        assert_eq!(decoded.tag_bytes, tag);
     }
 }
