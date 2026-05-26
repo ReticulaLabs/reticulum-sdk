@@ -943,14 +943,16 @@ async fn handle_announce<'a>(
         return
     }
 
-    if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
-        log::info!(
-            "tp({}): too many announces from {}, blocked for {} seconds",
-            handler.config.name,
-            &packet.destination,
-            blocked_until.as_secs(),
-        );
-        return;
+    if packet.context != PacketContext::PathResponse {
+        if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
+            log::info!(
+                "tp({}): too many announces from {}, blocked for {} seconds",
+                handler.config.name,
+                &packet.destination,
+                blocked_until.as_secs(),
+            );
+            return;
+        }
     }
 
     log::trace!(
@@ -1626,7 +1628,7 @@ async fn manage_transport(
 mod tests {
     use super::*;
 
-    use crate::destination::{DestinationName, SingleOutputDestination};
+    use crate::destination::{DestinationName, SingleInputDestination, SingleOutputDestination};
     use crate::packet::HeaderType;
 
     #[tokio::test]
@@ -1696,5 +1698,33 @@ mod tests {
         let received = events.recv().await.expect("received data event");
         assert_eq!(received.destination, destination_desc.address_hash);
         assert_eq!(received.data.as_slice(), b"plaintext payload");
+    }
+
+    #[tokio::test]
+    async fn path_response_bypasses_announce_rate_limits() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("example_utilities", "path.response"),
+        );
+        let path_response = remote_destination
+            .path_response(OsRng, None)
+            .expect("valid path response");
+        let iface = AddressHash::new_from_rand(OsRng);
+
+        {
+            let mut guard = handler.lock().await;
+            guard
+                .announce_limits
+                .force_block(path_response.destination, Duration::from_secs(60));
+        }
+
+        handle_announce(&path_response, handler.lock().await, iface).await;
+
+        assert!(
+            handler.lock().await.path_table.get(&path_response.destination).is_some(),
+            "path response should still populate the path table",
+        );
     }
 }
