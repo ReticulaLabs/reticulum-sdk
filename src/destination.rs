@@ -68,14 +68,14 @@ pub struct DestinationName {
 
 impl DestinationName {
     pub fn new(app_name: &str, aspects: &str) -> Self {
-        let hash = Hash::new(
-            Hash::generator()
-                .chain_update(app_name.as_bytes())
-                .chain_update(".".as_bytes())
-                .chain_update(aspects.as_bytes())
-                .finalize()
-                .into(),
-        );
+        let mut hasher = Hash::generator();
+        hasher = hasher.chain_update(app_name.as_bytes());
+        if !aspects.is_empty() {
+            hasher = hasher.chain_update(".".as_bytes());
+            hasher = hasher.chain_update(aspects.as_bytes());
+        }
+
+        let hash = Hash::new(hasher.finalize().into());
 
         Self { hash }
     }
@@ -537,9 +537,10 @@ pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 mod tests {
     use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
     use rand_core::OsRng;
+    use sha2::Digest;
 
     use crate::buffer::OutputBuffer;
-    use crate::hash::Hash;
+    use crate::hash::{AddressHash, Hash};
     use crate::identity::PrivateIdentity;
     use crate::packet::{PacketContext, PacketType};
     use crate::serde::Serialize;
@@ -584,6 +585,32 @@ mod tests {
         assert_eq!(
             Hash::new_from_slice(name.as_name_hash_slice()).to_string(),
             "6b9f66014d9853faab220fba47d027615ec53a8b35c2d620d1f4e0da65de3008"
+        );
+    }
+
+    #[test]
+    fn create_destination_hash_without_aspects_matches_python() {
+        let mut identity_hash_bytes = [0u8; crate::hash::ADDRESS_HASH_SIZE];
+        identity_hash_bytes.copy_from_slice(
+            &test_vectors::decode_hex("f9cd9aa2712d27402dcccb26643c520a"),
+        );
+        let identity_hash = AddressHash::new(identity_hash_bytes);
+        let name = DestinationName::new("kallisti5 desktop", "");
+
+        assert_eq!(
+            name.hash.to_string(),
+            "8bad7554c1eef952c038463e10b382d9f0cd248e14ceb0edb8ce583e5d461ae8"
+        );
+        let destination_hash = AddressHash::new_from_hash(&Hash::new(
+            Hash::generator()
+                .chain_update(name.as_name_hash_slice())
+                .chain_update(identity_hash.as_slice())
+                .finalize()
+                .into(),
+        ));
+        assert_eq!(
+            destination_hash.to_string(),
+            "/a03387d93d7059f3ef2f8306a13e043c/"
         );
     }
 
