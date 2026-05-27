@@ -1007,11 +1007,7 @@ is_path_response={}",
                 .insert(packet.destination, destination.clone());
         }
 
-        handler.announce_table.add(
-            packet,
-            identity_hash,
-            iface,
-        );
+        handler.announce_table.add(packet, packet.destination, iface);
 
         handler.path_table.handle_announce(
             packet,
@@ -1022,10 +1018,10 @@ is_path_response={}",
         let retransmit = handler.config.retransmit;
         if retransmit {
             let transport_id = handler.config.identity.address_hash().clone();
-            if let Some(message) = handler.announce_table.new_packet(
-                &identity_hash,
-                &transport_id,
-            ) {
+            if let Some(message) = handler
+                .announce_table
+                .new_packet(&packet.destination, &transport_id)
+            {
                 handler.send(message).await;
             }
         }
@@ -1736,5 +1732,42 @@ mod tests {
             handler.lock().await.path_table.get(&path_response.destination).is_some(),
             "path response should still populate the path table",
         );
+    }
+
+    #[tokio::test]
+    async fn retransmit_keeps_multiple_aspects_for_same_identity() {
+        let identity = PrivateIdentity::new_from_name("lxst-test-identity");
+        let first_destination = SingleInputDestination::new(
+            identity.clone(),
+            DestinationName::new("lxst", "telephony"),
+        );
+        let second_destination =
+            SingleInputDestination::new(identity, DestinationName::new("lxst", "messaging"));
+        let first_announce = first_destination
+            .announce(OsRng, None)
+            .expect("valid first announce");
+        let second_announce = second_destination
+            .announce(OsRng, None)
+            .expect("valid second announce");
+
+        let mut config = TransportConfig::default();
+        config.set_retransmit(true);
+        let transport_id = config.identity.address_hash().clone();
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+        let iface = AddressHash::new_from_rand(OsRng);
+
+        handle_announce(&first_announce, handler.lock().await, iface).await;
+        handle_announce(&second_announce, handler.lock().await, iface).await;
+
+        let mut guard = handler.lock().await;
+        let retransmitted = guard.announce_table.to_retransmit(&transport_id);
+        let destinations: Vec<_> = retransmitted
+            .iter()
+            .map(|message| message.packet.destination)
+            .collect();
+
+        assert!(destinations.contains(&first_announce.destination));
+        assert!(destinations.contains(&second_announce.destination));
     }
 }
