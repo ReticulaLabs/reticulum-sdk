@@ -91,7 +91,8 @@ impl Packet {
             data: StaticBuffer::new(),
         };
 
-        buffer.read(&mut packet.data.accuire_buf(buffer.bytes_left()))?;
+        let data_len = buffer.bytes_left();
+        buffer.read(packet.data.try_accuire_buf(data_len)?)?;
 
         Ok(packet)
     }
@@ -103,6 +104,7 @@ mod tests {
 
     use crate::{
         buffer::{InputBuffer, OutputBuffer, StaticBuffer},
+        error::RnsError,
         hash::AddressHash,
         packet::{
             ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
@@ -247,5 +249,19 @@ mod tests {
 
         assert!(buffer.offset() <= RETICULUM_MTU);
         assert_eq!(buffer.offset(), RETICULUM_MTU - 1);
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_packet_data() {
+        let mut packet_bytes = Vec::new();
+        packet_bytes.extend_from_slice(&[Header::default().to_meta(), 0]);
+        packet_bytes.extend_from_slice(AddressHash::new_empty().as_slice());
+        packet_bytes.push(PacketContext::None as u8);
+        packet_bytes.resize(packet_bytes.len() + PACKET_MDU + 1, 0);
+
+        let mut input_buffer = InputBuffer::new(&packet_bytes);
+        let result = Packet::deserialize(&mut input_buffer);
+
+        assert!(matches!(result, Err(RnsError::OutOfMemory)));
     }
 }

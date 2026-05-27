@@ -102,6 +102,15 @@ impl<const N: usize> StaticBuffer<N> {
         &mut self.buffer[..self.len]
     }
 
+    pub fn try_accuire_buf(&mut self, len: usize) -> Result<&mut [u8], RnsError> {
+        if len > self.buffer.len() {
+            return Err(RnsError::OutOfMemory);
+        }
+
+        self.len = len;
+        Ok(&mut self.buffer[..self.len])
+    }
+
     pub fn accuire_buf_max(&mut self) -> &mut [u8] {
         self.len = self.buffer.len();
         &mut self.buffer[..self.len]
