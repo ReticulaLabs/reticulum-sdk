@@ -329,6 +329,32 @@ impl Destination<PrivateIdentity, Input, Single> {
     }
 
     #[cfg(test)]
+    fn announce_with_rand_hash(
+        &self,
+        rand_hash: [u8; RAND_HASH_LENGTH],
+        app_data: Option<&[u8]>,
+    ) -> Result<Packet, RnsError> {
+        let packet_data = self.build_announce_packet_data(&rand_hash, app_data)?;
+
+        Ok(Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 0,
+            },
+            ifac: None,
+            destination: self.desc.address_hash,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        })
+    }
+
+    #[cfg(test)]
     fn announce_with_timestamp<R: CryptoRngCore + Copy>(
         &self,
         rng: R,
@@ -519,9 +545,16 @@ mod tests {
     use crate::serde::Serialize;
     use crate::test_vectors;
 
-    use super::DestinationAnnounce;
-    use super::DestinationName;
-    use super::SingleInputDestination;
+    use super::{DestinationAnnounce, DestinationName, SingleInputDestination, RAND_HASH_LENGTH};
+
+    fn python_announce_rand_hash() -> [u8; RAND_HASH_LENGTH] {
+        let timestamp = test_vectors::FIXED_ANNOUNCE_TIMESTAMP.to_be_bytes();
+        let mut rand_hash = [0u8; RAND_HASH_LENGTH];
+        rand_hash[..RAND_HASH_LENGTH / 2]
+            .copy_from_slice(&test_vectors::FIXED_ANNOUNCE_RANDOM_HASH_BYTES[..RAND_HASH_LENGTH / 2]);
+        rand_hash[RAND_HASH_LENGTH / 2..].copy_from_slice(&timestamp[3..]);
+        rand_hash
+    }
 
     #[test]
     fn create_announce() {
@@ -573,11 +606,7 @@ mod tests {
         );
 
         let announce = destination
-            .announce_with_timestamp(
-                test_vectors::FixedRng::new(test_vectors::FIXED_ANNOUNCE_RNG_BYTES),
-                test_vectors::FIXED_ANNOUNCE_TIMESTAMP,
-                None,
-            )
+            .announce_with_rand_hash(python_announce_rand_hash(), None)
             .expect("valid announce packet");
 
         let mut output_data = [0u8; 4096];
@@ -599,11 +628,7 @@ mod tests {
         );
 
         let announce = destination
-            .announce_with_timestamp(
-                test_vectors::FixedRng::new(test_vectors::FIXED_ANNOUNCE_RNG_BYTES),
-                test_vectors::FIXED_ANNOUNCE_TIMESTAMP,
-                None,
-            )
+            .announce_with_rand_hash(python_announce_rand_hash(), None)
             .expect("valid announce packet");
         let mut path_response = announce.clone();
         path_response.context = PacketContext::PathResponse;

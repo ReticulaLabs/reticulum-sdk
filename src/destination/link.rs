@@ -16,12 +16,21 @@ use crate::{
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
         DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
+        RETICULUM_MTU,
     },
 };
 
 use super::DestinationDesc;
 
 const LINK_MTU_SIZE: usize = 3;
+const LINK_MODE_AES256_CBC: u8 = 0x01;
+
+fn link_signalling_bytes() -> [u8; LINK_MTU_SIZE] {
+    let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
+    let signalling_value = (RETICULUM_MTU as u32 & 0x1F_FFFF) + (mode_bits << 16);
+    let bytes = signalling_value.to_be_bytes();
+    [bytes[1], bytes[2], bytes[3]]
+}
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum LinkStatus {
@@ -205,9 +214,11 @@ impl Link {
 
     pub fn request(&mut self) -> Packet {
         let mut packet_data = PacketDataBuffer::new();
+        let signalling = link_signalling_bytes();
 
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
         packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
+        packet_data.safe_write(&signalling);
 
         let packet = Packet {
             header: Header {
@@ -237,16 +248,19 @@ impl Link {
         }
 
         let mut packet_data = PacketDataBuffer::new();
+        let signalling = link_signalling_bytes();
 
         packet_data.safe_write(self.id.as_slice());
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
         packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
+        packet_data.safe_write(&signalling);
 
         let signature = self.priv_identity.sign(packet_data.as_slice());
 
         packet_data.reset();
         packet_data.safe_write(&signature.to_bytes()[..]);
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
+        packet_data.safe_write(&signalling);
 
         let packet = Packet {
             header: Header {
@@ -647,7 +661,8 @@ fn validate_message_proof(
 
 #[cfg(test)]
 mod tests {
-    use rand_core::OsRng;
+    use ed25519_dalek::SigningKey;
+    use x25519_dalek::StaticSecret;
 
     use crate::destination::{DestinationName, SingleInputDestination};
     use crate::hash::AddressHash;
@@ -660,7 +675,10 @@ mod tests {
 
     #[test]
     fn prove_emits_lrproof_with_link_destination_type() {
-        let identity = PrivateIdentity::new_from_name("link-proof-destination");
+        let identity = PrivateIdentity::new(
+            StaticSecret::from(test_vectors::FIXED_LINK_OWNER_PRIVATE_KEY),
+            SigningKey::from_bytes(&test_vectors::FIXED_LINK_OWNER_SIGNING_KEY),
+        );
         let destination = SingleInputDestination::new(
             identity,
             DestinationName::new("example_utilities", "link.prove"),
@@ -668,7 +686,10 @@ mod tests {
         let (event_tx, _) = tokio::sync::broadcast::channel(1);
         let mut link = Link::new(destination.desc, event_tx);
         link.id = AddressHash::new(test_vectors::FIXED_LRPROOF_LINK_ID);
-        link.priv_identity = PrivateIdentity::new_from_name("link-proof-identity");
+        link.priv_identity = PrivateIdentity::new(
+            StaticSecret::from(test_vectors::FIXED_LRPROOF_X25519_PRIVATE_KEY),
+            SigningKey::from_bytes(&test_vectors::FIXED_LINK_OWNER_SIGNING_KEY),
+        );
 
         let proof = link.prove();
 
