@@ -26,6 +26,14 @@ fn setup() {
     });
 }
 
+fn free_local_addr() -> String {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string()
+}
+
 async fn build_transport_full(
     name: &str,
     server_addr: &str,
@@ -112,10 +120,13 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
 async fn calculate_hop_distance() {
     setup();
 
-    let mut transport_a = build_transport("a", "127.0.0.1:8081", &[]).await;
-    let transport_b = build_transport("b", "127.0.0.1:8082", &["127.0.0.1:8081"]).await;
-    let transport_c =
-        build_transport("c", "127.0.0.1:8083", &["127.0.0.1:8081", "127.0.0.1:8082"]).await;
+    let addr_a = free_local_addr();
+    let addr_b = free_local_addr();
+    let addr_c = free_local_addr();
+
+    let mut transport_a = build_transport("a", &addr_a, &[]).await;
+    let transport_b = build_transport("b", &addr_b, &[&addr_a]).await;
+    let transport_c = build_transport("c", &addr_c, &[&addr_a, &addr_b]).await;
 
     let id_a = PrivateIdentity::new_from_name("a");
 
@@ -138,8 +149,11 @@ async fn calculate_hop_distance() {
 async fn direct_path_request_and_response() {
     setup();
 
-    let transport_a = build_transport("a", "127.0.0.1:8181", &[]).await;
-    let mut transport_b = build_transport("b", "127.0.0.1:8182", &["127.0.0.1:8181"]).await;
+    let addr_a = free_local_addr();
+    let addr_b = free_local_addr();
+
+    let transport_a = build_transport("a", &addr_a, &[]).await;
+    let mut transport_b = build_transport("b", &addr_b, &[&addr_a]).await;
 
     let id_b = PrivateIdentity::new_from_name("b");
 
@@ -161,14 +175,18 @@ async fn direct_path_request_and_response() {
 async fn remote_path_request_and_response() {
     setup();
 
-    let transport_a = build_transport("a", "127.0.0.1:8281", &[]).await;
+    let addr_a = free_local_addr();
+    let addr_b = free_local_addr();
+    let addr_c = free_local_addr();
+
+    let transport_a = build_transport("a", &addr_a, &[]).await;
     let mut transport_b = build_transport_full(
         "b",
-        "127.0.0.1:8282",
-        &["127.0.0.1:8281"],
+        &addr_b,
+        &[&addr_a],
         true,
     ).await;
-    let mut transport_c = build_transport("c", "127.0.0.1:8283", &["127.0.0.1:8282"]).await;
+    let mut transport_c = build_transport("c", &addr_c, &[&addr_b]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
     let dest_c = transport_c
@@ -205,13 +223,15 @@ async fn remote_path_request_and_response() {
 async fn message_proof_over_remote_link() {
     setup();
 
-    let transport_a = build_transport("a", "127.0.0.1:8381", &[]).await;
+    let addr_a = free_local_addr();
+    let addr_b = free_local_addr();
+    let addr_c = free_local_addr();
+
+    let transport_a = build_transport("a", &addr_a, &[]).await;
     let _transport_b =
-        build_transport_full("b", "127.0.0.1:8382", &["127.0.0.1:8381"], true)
+        build_transport_full("b", &addr_b, &[&addr_a], true)
         .await;
-    let mut transport_c =
-        build_transport("c", "127.0.0.1:8383", &["127.0.0.1:8382"])
-        .await;
+    let mut transport_c = build_transport("c", &addr_c, &[&addr_b]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
     let dest_c = transport_c
@@ -291,11 +311,14 @@ async fn recv_expected_proof(
 async fn probe_destination_returns_direct_packet_proof() {
     setup();
 
-    let transport_a = build_transport("a", "127.0.0.1:8481", &[]).await;
+    let addr_a = free_local_addr();
+    let addr_b = free_local_addr();
+
+    let transport_a = build_transport("a", &addr_a, &[]).await;
     let transport_b = build_transport_probe(
         "b",
-        "127.0.0.1:8482",
-        &["127.0.0.1:8481"],
+        &addr_b,
+        &[&addr_a],
         true,
         false,
         true,
@@ -332,19 +355,23 @@ async fn probe_destination_returns_direct_packet_proof() {
 async fn probe_destination_returns_multihop_packet_proof() {
     setup();
 
-    let transport_a = build_transport("a", "127.0.0.1:8581", &[]).await;
+    let addr_a = free_local_addr();
+    let addr_b = free_local_addr();
+    let addr_c = free_local_addr();
+
+    let transport_a = build_transport("a", &addr_a, &[]).await;
     let _transport_b = build_transport_probe(
         "b",
-        "127.0.0.1:8582",
-        &["127.0.0.1:8581"],
+        &addr_b,
+        &[&addr_a],
         false,
         true,
         false,
     ).await;
     let transport_c = build_transport_probe(
         "c",
-        "127.0.0.1:8583",
-        &["127.0.0.1:8582"],
+        &addr_c,
+        &[&addr_b],
         false,
         false,
         true,
