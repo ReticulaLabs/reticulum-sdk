@@ -108,7 +108,7 @@ mod tests {
         hash::AddressHash,
         packet::{
             ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
-            PacketType, PropagationType, PACKET_MDU, RETICULUM_MTU,
+            PacketType, PropagationType, PACKET_DATA_BUFFER_SIZE, PACKET_MDU, RETICULUM_MTU,
         },
         test_vectors,
     };
@@ -257,7 +257,7 @@ mod tests {
         packet_bytes.extend_from_slice(&[Header::default().to_meta(), 0]);
         packet_bytes.extend_from_slice(AddressHash::new_empty().as_slice());
         packet_bytes.push(PacketContext::None as u8);
-        packet_bytes.resize(packet_bytes.len() + PACKET_MDU + 1, 0);
+        packet_bytes.resize(packet_bytes.len() + PACKET_DATA_BUFFER_SIZE + 1, 0);
 
         let mut input_buffer = InputBuffer::new(&packet_bytes);
         let result = Packet::deserialize(&mut input_buffer);

@@ -1635,7 +1635,7 @@ mod tests {
     use super::*;
 
     use crate::destination::{DestinationName, SingleInputDestination, SingleOutputDestination};
-    use crate::packet::HeaderType;
+    use crate::packet::{HeaderType, PACKET_MDU};
 
     #[tokio::test]
     async fn drop_duplicates() {
@@ -1769,5 +1769,69 @@ mod tests {
 
         assert!(destinations.contains(&first_announce.destination));
         assert!(destinations.contains(&second_announce.destination));
+    }
+
+    #[tokio::test]
+    async fn retransmit_sends_multiple_aspects_between_interfaces() {
+        let identity = PrivateIdentity::new_from_name("lxst-interface-identity");
+        let first_destination = SingleInputDestination::new(
+            identity.clone(),
+            DestinationName::new("lxst", "telephony"),
+        );
+        let second_destination =
+            SingleInputDestination::new(identity, DestinationName::new("lxst", "messaging"));
+        let first_announce = first_destination
+            .announce(OsRng, None)
+            .expect("valid first announce");
+        let large_agent_data = [0x42u8; PACKET_MDU + 1];
+        let second_announce = second_destination
+            .announce(OsRng, Some(&large_agent_data))
+            .expect("valid second announce");
+
+        let mut config = TransportConfig::default();
+        config.set_retransmit(true);
+        let transport = Transport::new(config);
+        let (in_address, in_rx, mut out_tx) = {
+            let iface_manager = transport.iface_manager();
+            let mut iface_manager = iface_manager.lock().await;
+            let in_channel = iface_manager.new_channel(4);
+            let out_channel = iface_manager.new_channel(4);
+            (
+                *in_channel.address(),
+                in_channel.rx_channel.clone(),
+                out_channel.tx_channel,
+            )
+        };
+
+        in_rx
+            .send(RxMessage {
+                address: in_address,
+                packet: first_announce,
+            })
+            .await
+            .expect("queued first announce");
+        in_rx
+            .send(RxMessage {
+                address: in_address,
+                packet: second_announce,
+            })
+            .await
+            .expect("queued second announce");
+
+        let first_retransmit = time::timeout(Duration::from_secs(2), out_tx.recv())
+            .await
+            .expect("first retransmit")
+            .expect("first retransmit message");
+        let second_retransmit = time::timeout(Duration::from_secs(2), out_tx.recv())
+            .await
+            .expect("second retransmit")
+            .expect("second retransmit message");
+        let destinations = [
+            first_retransmit.packet.destination,
+            second_retransmit.packet.destination,
+        ];
+
+        assert!(destinations.contains(&first_destination.desc.address_hash));
+        assert!(destinations.contains(&second_destination.desc.address_hash));
     }
 }

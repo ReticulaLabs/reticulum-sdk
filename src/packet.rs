@@ -14,6 +14,10 @@ pub const RETICULUM_MAX_HEADER_SIZE: usize = 35usize;
 pub const RETICULUM_MIN_IFAC_SIZE: usize = 1usize;
 pub const PACKET_MDU: usize =
     RETICULUM_MTU - RETICULUM_MAX_HEADER_SIZE - RETICULUM_MIN_IFAC_SIZE;
+// Keep packet storage large enough to receive and forward announces with
+// interface-sized app data, while PACKET_MDU remains the conservative payload
+// size for packets that must fit in the fixed Reticulum MTU.
+pub const PACKET_DATA_BUFFER_SIZE: usize = 2048usize;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -238,7 +242,7 @@ impl fmt::Display for Header {
     }
 }
 
-pub type PacketDataBuffer = StaticBuffer<PACKET_MDU>;
+pub type PacketDataBuffer = StaticBuffer<PACKET_DATA_BUFFER_SIZE>;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct PacketIfac {
