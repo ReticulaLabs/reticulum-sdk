@@ -3,27 +3,23 @@ use tokio::time::{Duration, Instant};
 
 use crate::{
     hash::AddressHash,
-    packet::{Header, HeaderType, IfacFlag, Packet, PropagationType},
+    packet::{Header, Packet},
 };
 
 pub struct ReverseEntry {
     pub timestamp: Instant,
     pub received_from: AddressHash,
-    pub next_hop: AddressHash,
 }
 
 fn send_backwards(packet: &Packet, entry: &ReverseEntry) -> (Packet, AddressHash) {
     let propagated = Packet {
         header: Header {
-            ifac_flag: IfacFlag::Open,
-            header_type: HeaderType::Type2,
-            propagation_type: PropagationType::Transport,
             hops: packet.header.hops + 1,
             ..packet.header
         },
         ifac: None,
         destination: packet.destination,
-        transport: Some(entry.next_hop),
+        transport: packet.transport,
         context: packet.context,
         data: packet.data,
     };
@@ -38,12 +34,11 @@ impl ReverseTable {
         Self(HashMap::new())
     }
 
-    pub fn add(&mut self, packet: &Packet, received_from: AddressHash, next_hop: AddressHash) {
+    pub fn add(&mut self, packet: &Packet, received_from: AddressHash) {
         let truncated_packet_hash = AddressHash::new_from_hash(&packet.hash());
         let entry = ReverseEntry {
             timestamp: Instant::now(),
             received_from,
-            next_hop,
         };
 
         self.0.insert(truncated_packet_hash, entry);
@@ -74,7 +69,6 @@ mod tests {
     fn forwards_proof_back_to_previous_hop() {
         let original_destination = AddressHash::new_from_slice(b"probe-destination");
         let previous_hop_iface = AddressHash::new_from_slice(b"previous-hop-iface");
-        let next_hop = AddressHash::new_from_slice(b"next-hop");
 
         let mut original_data = PacketDataBuffer::new();
         original_data.safe_write(b"payload");
@@ -93,7 +87,7 @@ mod tests {
         };
 
         let mut reverse_table = ReverseTable::new();
-        reverse_table.add(&original, previous_hop_iface, next_hop);
+        reverse_table.add(&original, previous_hop_iface);
 
         let mut proof_data = PacketDataBuffer::new();
         proof_data.safe_write(b"proof");
@@ -116,7 +110,7 @@ mod tests {
 
         assert_eq!(iface, previous_hop_iface);
         assert_eq!(propagated.destination, proof.destination);
-        assert_eq!(propagated.transport, Some(next_hop));
+        assert_eq!(propagated.transport, None);
         assert_eq!(propagated.header.hops, proof.header.hops + 1);
     }
 }

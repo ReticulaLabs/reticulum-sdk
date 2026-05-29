@@ -902,6 +902,24 @@ async fn handle_data<'a>(
             return;
         }
 
+        if let Some((packet, iface)) = handler.link_table.handle_packet(packet, iface) {
+            let destination = packet.destination;
+            handler
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(iface),
+                    packet,
+                })
+                .await;
+
+            log::trace!(
+                "tp({}): forwarded packet for remote link {}",
+                handler.config.name,
+                destination
+            );
+
+            return;
+        }
+
         let lookup = handler.link_table.original_destination(&packet.destination);
         if lookup.is_some() {
             let sent = send_to_next_hop(packet, &handler, lookup).await;
@@ -970,8 +988,8 @@ async fn handle_data<'a>(
                     .await;
             }
         } else {
-            if let Some((next_hop, _)) = handler.path_table.next_hop_full(&packet.destination) {
-                handler.reverse_table.add(packet, iface, next_hop);
+            if handler.path_table.next_hop_full(&packet.destination).is_some() {
+                handler.reverse_table.add(packet, iface);
             }
 
             data_handled = send_to_next_hop(packet, &handler, None).await;
@@ -1224,8 +1242,8 @@ async fn handle_link_request_as_destination<'a>(
 
 async fn handle_link_request_as_intermediate<'a>(
     received_from: AddressHash,
-    next_hop: AddressHash,
     next_hop_iface: AddressHash,
+    remaining_hops: u8,
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>
 ) {
@@ -1233,8 +1251,8 @@ async fn handle_link_request_as_intermediate<'a>(
         packet,
         packet.destination,
         received_from,
-        next_hop,
-        next_hop_iface
+        next_hop_iface,
+        remaining_hops,
     );
 
     send_to_next_hop(packet, &handler, None).await;
@@ -1257,18 +1275,19 @@ async fn handle_link_request<'a>(
         );
 
         handle_link_request_as_destination(destination, packet, handler).await;
-    } else if let Some(entry) = handler.path_table.next_hop_full(&packet.destination) {
+    } else if let Some(entry) = handler.path_table.next_hop_route(&packet.destination) {
         log::trace!(
             "tp({}): handle link request for remote destination {}",
             handler.config.name,
             packet.destination
         );
 
-        let (next_hop, next_iface) = entry;
+        let (_, next_iface, path_hops) = entry;
+        let remaining_hops = path_hops.saturating_sub(1);
         handle_link_request_as_intermediate(
             iface,
-            next_hop,
             next_iface,
+            remaining_hops,
             packet,
             handler
         ).await;
