@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeSet, BTreeMap};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use rand_core::OsRng;
 
@@ -29,6 +29,8 @@ pub fn create_path_request_destination() -> PlainInputDestination {
 
 pub type TagBytes = Vec<u8>;
 
+const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn create_random_tag() -> TagBytes {
     AddressHash::new_from_rand(OsRng).as_slice().into()
 }
@@ -36,7 +38,13 @@ pub fn create_random_tag() -> TagBytes {
 pub struct PathRequest {
     pub destination: AddressHash,
     pub requesting_transport: Option<AddressHash>,
-    pub tag_bytes: TagBytes
+    pub tag_bytes: TagBytes,
+}
+
+#[derive(Clone)]
+pub struct DiscoveryPathRequest {
+    pub timeout: Instant,
+    pub requesting_iface: AddressHash,
 }
 
 impl PathRequest {
@@ -71,7 +79,11 @@ impl PathRequest {
 
         let tag_bytes = data[tag_start..tag_end].into();
 
-        Some(Self { destination, requesting_transport, tag_bytes })
+        Some(Self {
+            destination,
+            requesting_transport,
+            tag_bytes,
+        })
     }
 }
 
@@ -80,7 +92,7 @@ pub struct PathRequests {
     name: String,
     transport_id: Option<AddressHash>,
     controlled_destination: PlainInputDestination,
-    discovery: BTreeMap<AddressHash, Instant>,
+    discovery: BTreeMap<AddressHash, DiscoveryPathRequest>,
 }
 
 impl PathRequests {
@@ -98,9 +110,9 @@ impl PathRequests {
         let path_request = PathRequest::decode(data, &self.name);
 
         if let Some(ref request) = path_request {
-            let is_new = self.cache.insert(
-                (request.destination, request.tag_bytes.clone())
-            );
+            let is_new = self
+                .cache
+                .insert((request.destination, request.tag_bytes.clone()));
 
             if !is_new {
                 log::info!(
@@ -151,12 +163,12 @@ impl PathRequests {
     fn allow_recursive(
         &mut self,
         destination: &AddressHash,
-        on_iface: Option<AddressHash>,
+        requesting_iface: AddressHash,
     ) -> bool {
         let now = Instant::now();
 
         if let Some(timeout) = self.discovery.get(destination) {
-            if *timeout < now {
+            if timeout.timeout > now {
                 log::info!(
                     "tp({}): rejecting discovery path request for destination {} as a request is already pending",
                     self.name,
@@ -168,16 +180,34 @@ impl PathRequests {
 
         // TODO implement announce queue and announce cap, reject requests based on that
 
+        self.discovery.insert(
+            *destination,
+            DiscoveryPathRequest {
+                timeout: now + PATH_REQUEST_TIMEOUT,
+                requesting_iface,
+            },
+        );
+
         true
+    }
+
+    pub fn take_discovery(&mut self, destination: &AddressHash) -> Option<AddressHash> {
+        let request = self.discovery.remove(destination)?;
+
+        if request.timeout > Instant::now() {
+            Some(request.requesting_iface)
+        } else {
+            None
+        }
     }
 
     pub fn generate_recursive(
         &mut self,
         destination: &AddressHash,
-        on_iface: Option<AddressHash>,
+        requesting_iface: AddressHash,
         tag: Option<TagBytes>,
     ) -> Option<Packet> {
-        if self.allow_recursive(destination, on_iface) {
+        if self.allow_recursive(destination, requesting_iface) {
             log::trace!(
                 "tp({}): sending discovery path request for {}",
                 self.name,
@@ -242,5 +272,29 @@ mod tests {
         assert_eq!(decoded.destination, dest);
         assert_eq!(decoded.requesting_transport, Some(transport_id));
         assert_eq!(decoded.tag_bytes, tag);
+    }
+
+    #[test]
+    fn recursive_path_request_tracks_requesting_interface() {
+        let mut testee = PathRequests::new("", None);
+        let destination = AddressHash::new_from_slice(b"destination");
+        let iface = AddressHash::new_from_slice(b"requesting-iface");
+        let tag = b"fixed-tag".to_vec();
+
+        assert!(testee
+            .generate_recursive(&destination, iface, Some(tag))
+            .is_some());
+        assert_eq!(testee.take_discovery(&destination), Some(iface));
+        assert_eq!(testee.take_discovery(&destination), None);
+    }
+
+    #[test]
+    fn recursive_path_request_rejects_duplicate_pending_request() {
+        let mut testee = PathRequests::new("", None);
+        let destination = AddressHash::new_from_slice(b"destination");
+        let iface = AddressHash::new_from_slice(b"requesting-iface");
+
+        assert!(testee.generate_recursive(&destination, iface, None).is_some());
+        assert!(testee.generate_recursive(&destination, iface, None).is_none());
     }
 }

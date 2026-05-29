@@ -49,10 +49,13 @@ use crate::iface::TxMessageType;
 
 use crate::packet::DestinationType;
 use crate::packet::Header;
+use crate::packet::HeaderType;
+use crate::packet::IfacFlag;
 use crate::packet::Packet;
 use crate::packet::PacketContext;
 use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
+use crate::packet::PropagationType;
 
 mod announce_limits;
 mod announce_table;
@@ -1089,6 +1092,40 @@ is_path_response={}",
             iface,
         );
 
+        if let Some(response_iface) = handler.path_requests.take_discovery(&packet.destination) {
+            let transport_id = handler.config.identity.address_hash().clone();
+            let response = Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type2,
+                    context_flag: packet.header.context_flag,
+                    propagation_type: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Announce,
+                    hops: packet.header.hops + 1,
+                },
+                ifac: None,
+                destination: packet.destination,
+                transport: Some(transport_id),
+                context: PacketContext::PathResponse,
+                data: packet.data,
+            };
+
+            handler
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(response_iface),
+                    packet: response,
+                })
+                .await;
+
+            log::trace!(
+                "tp({}): answered waiting discovery path request for {} over {}",
+                handler.config.name,
+                packet.destination,
+                response_iface
+            );
+        }
+
         let retransmit = handler.config.retransmit;
         if retransmit {
             let transport_id = handler.config.identity.address_hash().clone();
@@ -1173,8 +1210,8 @@ async fn handle_path_request<'a>(
 
         if let Some(packet) = handler.path_requests.generate_recursive(
             &request.destination,
-            Some(iface),
-            None
+            iface,
+            Some(request.tag_bytes.clone()),
         ) {
             handler.send(TxMessage {
                 tx_type: TxMessageType::Broadcast(Some(iface)),
