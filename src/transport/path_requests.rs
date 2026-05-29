@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, VecDeque};
 
 use rand_core::OsRng;
 
@@ -30,6 +30,8 @@ pub fn create_path_request_destination() -> PlainInputDestination {
 pub type TagBytes = Vec<u8>;
 
 const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const PATH_REQUEST_GATE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_DISCOVERY_PATH_REQUEST_TAGS: usize = 32_000;
 
 pub fn create_random_tag() -> TagBytes {
     AddressHash::new_from_rand(OsRng).as_slice().into()
@@ -88,7 +90,8 @@ impl PathRequest {
 }
 
 pub struct PathRequests {
-    cache: BTreeSet<(AddressHash, TagBytes)>,
+    cache: BTreeMap<(AddressHash, TagBytes), Instant>,
+    cache_order: VecDeque<(AddressHash, TagBytes)>,
     name: String,
     transport_id: Option<AddressHash>,
     controlled_destination: PlainInputDestination,
@@ -98,7 +101,8 @@ pub struct PathRequests {
 impl PathRequests {
     pub fn new(name: &str, transport_id: Option<AddressHash>) -> Self {
         Self {
-            cache: BTreeSet::new(),
+            cache: BTreeMap::new(),
+            cache_order: VecDeque::new(),
             name: name.into(),
             transport_id,
             controlled_destination: create_path_request_destination(),
@@ -110,11 +114,10 @@ impl PathRequests {
         let path_request = PathRequest::decode(data, &self.name);
 
         if let Some(ref request) = path_request {
-            let is_new = self
-                .cache
-                .insert((request.destination, request.tag_bytes.clone()));
+            self.release_expired();
 
-            if !is_new {
+            let tag = (request.destination, request.tag_bytes.clone());
+            if self.cache.contains_key(&tag) {
                 log::info!(
                     "tp({}): ignoring duplicate path request for destination {}",
                     self.name,
@@ -122,9 +125,38 @@ impl PathRequests {
                 );
                 return None;
             }
+
+            self.cache.insert(tag.clone(), Instant::now() + PATH_REQUEST_GATE_TIMEOUT);
+            self.cache_order.push_back(tag);
+            self.enforce_cache_limit();
         }
 
         path_request
+    }
+
+    fn release_expired(&mut self) {
+        let now = Instant::now();
+
+        self.cache.retain(|_, expires| *expires > now);
+        self.discovery.retain(|_, request| request.timeout > now);
+
+        while let Some(tag) = self.cache_order.front() {
+            if self.cache.contains_key(tag) {
+                break;
+            }
+            self.cache_order.pop_front();
+        }
+    }
+
+    fn enforce_cache_limit(&mut self) {
+        while self.cache.len() > MAX_DISCOVERY_PATH_REQUEST_TAGS {
+            match self.cache_order.pop_front() {
+                Some(tag) => {
+                    self.cache.remove(&tag);
+                }
+                None => break,
+            }
+        }
     }
 
     pub fn generate(
@@ -296,5 +328,35 @@ mod tests {
 
         assert!(testee.generate_recursive(&destination, iface, None).is_some());
         assert!(testee.generate_recursive(&destination, iface, None).is_none());
+    }
+
+    #[test]
+    fn duplicate_path_request_is_allowed_after_gate_timeout() {
+        let mut testee = PathRequests::new("", None);
+        let destination = AddressHash::new_from_slice(b"destination");
+        let tag = b"fixed-tag".to_vec();
+        let packet = testee.generate(&destination, Some(tag.clone()));
+
+        assert!(testee.decode(packet.data.as_slice()).is_some());
+        assert!(testee.decode(packet.data.as_slice()).is_none());
+
+        let cache_key = (destination, tag);
+        *testee.cache.get_mut(&cache_key).expect("cache entry") = Instant::now();
+
+        assert!(testee.decode(packet.data.as_slice()).is_some());
+    }
+
+    #[test]
+    fn duplicate_path_request_cache_is_bounded() {
+        let mut testee = PathRequests::new("", None);
+        let destination = AddressHash::new_from_slice(b"destination");
+
+        for i in 0..(MAX_DISCOVERY_PATH_REQUEST_TAGS + 1) {
+            let tag = i.to_be_bytes().to_vec();
+            let packet = testee.generate(&destination, Some(tag));
+            assert!(testee.decode(packet.data.as_slice()).is_some());
+        }
+
+        assert_eq!(testee.cache.len(), MAX_DISCOVERY_PATH_REQUEST_TAGS);
     }
 }
