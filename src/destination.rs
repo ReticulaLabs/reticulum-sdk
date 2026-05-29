@@ -146,6 +146,19 @@ impl DestinationAnnounce {
         offset += NAME_HASH_LENGTH;
         let rand_hash = &announce_data[offset..(offset + RAND_HASH_LENGTH)];
         offset += RAND_HASH_LENGTH;
+
+        let ratchet = if packet.header.context_flag == ContextFlag::Set {
+            if announce_data.len() < MIN_ANNOUNCE_DATA_LENGTH + PUBLIC_KEY_LENGTH {
+                return Err(RnsError::OutOfMemory);
+            }
+
+            let ratchet = &announce_data[offset..(offset + PUBLIC_KEY_LENGTH)];
+            offset += PUBLIC_KEY_LENGTH;
+            ratchet
+        } else {
+            &[]
+        };
+
         let signature = &announce_data[offset..(offset + SIGNATURE_LENGTH)];
         offset += SIGNATURE_LENGTH;
         let app_data = &announce_data[offset..];
@@ -160,6 +173,7 @@ impl DestinationAnnounce {
             .chain_write(verifying_key.as_bytes())?
             .chain_write(name_hash)?
             .chain_write(rand_hash)?
+            .chain_write(ratchet)?
             .chain_write(app_data)?
             .finalize();
 
@@ -541,8 +555,8 @@ mod tests {
 
     use crate::buffer::OutputBuffer;
     use crate::hash::{AddressHash, Hash};
-    use crate::identity::PrivateIdentity;
-    use crate::packet::{PacketContext, PacketType};
+    use crate::identity::{PrivateIdentity, PUBLIC_KEY_LENGTH};
+    use crate::packet::{ContextFlag, PacketContext, PacketDataBuffer, PacketType};
     use crate::serde::Serialize;
     use crate::test_vectors;
 
@@ -666,6 +680,51 @@ mod tests {
 
         assert_eq!(buffer.as_slice(), test_vectors::decode_hex(test_vectors::PATH_RESPONSE_PACKET_HEX));
         DestinationAnnounce::validate(&path_response).expect("path response validates");
+    }
+
+    #[test]
+    fn validate_ratchet_announce() {
+        let priv_identity = test_vectors::fixed_private_identity();
+        let destination = SingleInputDestination::new(
+            priv_identity,
+            DestinationName::new("example_utilities", "announcesample.fruits"),
+        );
+
+        let rand_hash = python_announce_rand_hash();
+        let ratchet = [0x42u8; PUBLIC_KEY_LENGTH];
+        let app_data = b"ratchet announce";
+        let pub_key = destination.identity.as_identity().public_key_bytes();
+        let verifying_key = destination.identity.as_identity().verifying_key_bytes();
+
+        let mut signed_data = PacketDataBuffer::new();
+        signed_data
+            .chain_safe_write(destination.desc.address_hash.as_slice())
+            .chain_safe_write(pub_key)
+            .chain_safe_write(verifying_key)
+            .chain_safe_write(destination.desc.name.as_name_hash_slice())
+            .chain_safe_write(&rand_hash)
+            .chain_safe_write(&ratchet)
+            .chain_safe_write(app_data);
+
+        let signature = destination.identity.sign(signed_data.as_slice());
+
+        let mut announce = destination
+            .announce_with_rand_hash(rand_hash, Some(app_data))
+            .expect("valid announce packet");
+        let mut packet_data = PacketDataBuffer::new();
+        packet_data
+            .chain_safe_write(pub_key)
+            .chain_safe_write(verifying_key)
+            .chain_safe_write(destination.desc.name.as_name_hash_slice())
+            .chain_safe_write(&rand_hash)
+            .chain_safe_write(&ratchet)
+            .chain_safe_write(&signature.to_bytes())
+            .chain_safe_write(app_data);
+
+        announce.header.context_flag = ContextFlag::Set;
+        announce.data = packet_data;
+
+        DestinationAnnounce::validate(&announce).expect("ratchet announce validates");
     }
 
     #[test]
