@@ -1,4 +1,5 @@
 pub mod hdlc;
+pub mod kiss;
 
 pub mod tcp_client;
 pub mod tcp_server;

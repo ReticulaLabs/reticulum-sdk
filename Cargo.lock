@@ -969,6 +969,7 @@ dependencies = [
  "env_logger",
  "hkdf",
  "hmac",
+ "libc",
  "log",
  "prost",
  "rand_core",
