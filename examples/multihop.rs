@@ -5,8 +5,8 @@ use tokio::io::AsyncBufReadExt;
 
 use rand_core::OsRng;
 
-use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
 use reticulum_sdk::destination::link::{LinkEvent, LinkStatus};
+use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
 use reticulum_sdk::hash::AddressHash;
 use reticulum_sdk::identity::PrivateIdentity;
 use reticulum_sdk::iface::tcp_client::TcpClient;
@@ -36,7 +36,11 @@ async fn main() {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
-    log::info!(">>> MULTIHOP EXAMPLE (place in chain: {}/{}) <<<", our_hop, last_hop);
+    log::info!(
+        ">>> MULTIHOP EXAMPLE (place in chain: {}/{}) <<<",
+        our_hop,
+        last_hop
+    );
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport_id = identity.address_hash().clone();
@@ -44,13 +48,13 @@ async fn main() {
     let last_hop_id = PrivateIdentity::new_from_name("last_hop");
     let last_hop_name = DestinationName::new("last_hop", "app");
 
-    let last_hop_destination = SingleInputDestination::new(
-        last_hop_id.clone(),
-        last_hop_name,
-    );
+    let last_hop_destination = SingleInputDestination::new(last_hop_id.clone(), last_hop_name);
     let last_hop_address = last_hop_destination.desc.address_hash.clone();
 
-    log::info!("Destination on last hop will be {}", last_hop_destination.desc);
+    log::info!(
+        "Destination on last hop will be {}",
+        last_hop_destination.desc
+    );
 
     let mut config = TransportConfig::new("server", &identity, false);
     config.set_retransmit(true);
@@ -65,17 +69,15 @@ async fn main() {
 
     if our_hop > 0 {
         let connect_to = format!("127.0.0.1:{}", our_hop + 5100);
-        let client_addr = transport.iface_manager().lock().await.spawn(
-            TcpClient::new(connect_to),
-            TcpClient::spawn,
-        );
+        let client_addr = transport
+            .iface_manager()
+            .lock()
+            .await
+            .spawn(TcpClient::new(connect_to), TcpClient::spawn);
 
         let destination;
         if our_hop == last_hop {
-            destination = transport.add_destination(
-                last_hop_id,
-                last_hop_name
-            ).await;
+            destination = transport.add_destination(last_hop_id, last_hop_name).await;
         } else {
             let id = PrivateIdentity::new_from_rand(OsRng);
             let name = DestinationName::new(&format!("hop-{}", our_hop), "app");
@@ -84,11 +86,7 @@ async fn main() {
 
         log::info!("Created destination {}", destination.lock().await.desc);
 
-        let mut announce = destination
-            .lock()
-            .await
-            .announce(OsRng, None)
-            .unwrap();
+        let mut announce = destination.lock().await.announce(OsRng, None).unwrap();
 
         announce.transport = Some(transport_id);
         announce.header.header_type = HeaderType::Type2;
@@ -140,7 +138,6 @@ async fn main() {
                 }
             }
         }
-
     } else {
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         let mut link = None;

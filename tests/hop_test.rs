@@ -4,8 +4,8 @@ use std::time::Duration;
 use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
 use rand_core::OsRng;
 use reticulum_sdk::{
-    destination::{DestinationDesc, DestinationName, SingleOutputDestination},
     destination::link::LinkEvent,
+    destination::{DestinationDesc, DestinationName, SingleOutputDestination},
     hash::{AddressHash, HASH_SIZE},
     identity::Identity,
     identity::PrivateIdentity,
@@ -13,16 +13,14 @@ use reticulum_sdk::{
     packet::{Packet, PacketContext, PacketType},
     transport::{Transport, TransportConfig},
 };
-use tokio::time;
 use tokio::sync::broadcast;
+use tokio::time;
 
 static INIT: Once = Once::new();
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("trace")
-        ).init()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init()
     });
 }
 
@@ -38,13 +36,9 @@ async fn build_transport_full(
     name: &str,
     server_addr: &str,
     client_addr: &[&str],
-    retransmit: bool
+    retransmit: bool,
 ) -> Transport {
-    let mut config = TransportConfig::new(
-        name,
-        &PrivateIdentity::new_from_rand(OsRng),
-        true
-    );
+    let mut config = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), true);
 
     if retransmit {
         config.set_retransmit(true);
@@ -78,11 +72,7 @@ async fn build_transport_probe(
     retransmit: bool,
     respond_to_probes: bool,
 ) -> Transport {
-    let mut config = TransportConfig::new(
-        name,
-        &PrivateIdentity::new_from_rand(OsRng),
-        broadcast
-    );
+    let mut config = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), broadcast);
 
     if retransmit {
         config.set_retransmit(true);
@@ -180,12 +170,7 @@ async fn remote_path_request_and_response() {
     let addr_c = free_local_addr();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
-    let mut transport_b = build_transport_full(
-        "b",
-        &addr_b,
-        &[&addr_a],
-        true,
-    ).await;
+    let mut transport_b = build_transport_full("b", &addr_b, &[&addr_a], true).await;
     let mut transport_c = build_transport("c", &addr_c, &[&addr_b]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
@@ -228,9 +213,7 @@ async fn message_proof_over_remote_link() {
     let addr_c = free_local_addr();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
-    let _transport_b =
-        build_transport_full("b", &addr_b, &[&addr_a], true)
-        .await;
+    let _transport_b = build_transport_full("b", &addr_b, &[&addr_a], true).await;
     let mut transport_c = build_transport("c", &addr_c, &[&addr_b]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
@@ -263,7 +246,9 @@ async fn message_proof_over_remote_link() {
 
     let message = "foo";
 
-    let sent = transport_a.send_to_out_links(&dest_c_hash, message.as_bytes()).await;
+    let sent = transport_a
+        .send_to_out_links(&dest_c_hash, message.as_bytes())
+        .await;
     let expected_hash = sent[0];
 
     tokio::select! {
@@ -305,8 +290,9 @@ async fn recv_expected_proof(
 ) -> Packet {
     loop {
         match iface_rx.recv().await.unwrap().packet {
-            packet if packet.header.packet_type == PacketType::Proof
-                && packet.destination == expected_destination =>
+            packet
+                if packet.header.packet_type == PacketType::Proof
+                    && packet.destination == expected_destination =>
             {
                 return packet;
             }
@@ -323,14 +309,7 @@ async fn probe_destination_returns_direct_packet_proof() {
     let addr_b = free_local_addr();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
-    let transport_b = build_transport_probe(
-        "b",
-        &addr_b,
-        &[&addr_a],
-        true,
-        false,
-        true,
-    ).await;
+    let transport_b = build_transport_probe("b", &addr_b, &[&addr_a], true, false, true).await;
 
     let probe_destination = transport_b.probe_destination().await.unwrap();
     let probe_destination = probe_destination.lock().await;
@@ -368,22 +347,8 @@ async fn probe_destination_returns_multihop_packet_proof() {
     let addr_c = free_local_addr();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
-    let _transport_b = build_transport_probe(
-        "b",
-        &addr_b,
-        &[&addr_a],
-        false,
-        true,
-        false,
-    ).await;
-    let transport_c = build_transport_probe(
-        "c",
-        &addr_c,
-        &[&addr_b],
-        false,
-        false,
-        true,
-    ).await;
+    let _transport_b = build_transport_probe("b", &addr_b, &[&addr_a], false, true, false).await;
+    let transport_c = build_transport_probe("c", &addr_c, &[&addr_b], false, false, true).await;
 
     let probe_destination = transport_c.probe_destination().await.unwrap();
     let probe_destination = probe_destination.lock().await;

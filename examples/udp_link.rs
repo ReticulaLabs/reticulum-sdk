@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand_core::OsRng;
-use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
 use reticulum_sdk::destination::link::{Link, LinkEvent, LinkStatus};
+use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
 use reticulum_sdk::hash::AddressHash;
 use reticulum_sdk::identity::PrivateIdentity;
 use reticulum_sdk::iface::udp::UdpInterface;
@@ -29,14 +29,16 @@ async fn main() {
     log::info!(">>> UDP LINK APP <<<");
 
     let id = PrivateIdentity::new_from_rand(OsRng);
-    let destination = SingleInputDestination::new(id.clone(), DestinationName::new("example", "app"));
+    let destination =
+        SingleInputDestination::new(id.clone(), DestinationName::new("example", "app"));
     let transport = Transport::new(TransportConfig::new("server", &id, true));
 
     let _ = transport.iface_manager().lock().await.spawn(
         UdpInterface::new("0.0.0.0:4243", Some("127.0.0.1:4242")),
-        UdpInterface::spawn);
+        UdpInterface::spawn,
+    );
 
-    let dest = Arc::new(tokio::sync::Mutex::new (destination));
+    let dest = Arc::new(tokio::sync::Mutex::new(destination));
 
     let mut announce_recv = transport.recv_announces().await;
     let mut out_link_events = transport.out_link_events();
@@ -58,7 +60,7 @@ async fn main() {
             let link = link.lock().await;
             log::info!("link {}: {:?}", link.id(), link.status());
             if link.status() == LinkStatus::Active {
-                let packet = link.data_packet (b"foo").unwrap();
+                let packet = link.data_packet(b"foo").unwrap();
                 transport.send_packet(packet).await;
             }
         }
@@ -66,16 +68,17 @@ async fn main() {
             match link_event.event {
                 LinkEvent::Activated => log::info!("link {} activated", link_event.id),
                 LinkEvent::Closed => log::info!("link {} closed", link_event.id),
-                LinkEvent::Data(payload) => log::info!("link {} data payload: {}", link_event.id,
+                LinkEvent::Data(payload) => log::info!(
+                    "link {} data payload: {}",
+                    link_event.id,
                     std::str::from_utf8(payload.as_slice())
                         .map(str::to_string)
-                        .unwrap_or_else(|_| format!("{:?}", payload.as_slice()))),
-                _ => {},
+                        .unwrap_or_else(|_| format!("{:?}", payload.as_slice()))
+                ),
+                _ => {}
             }
         }
-        transport
-            .send_announce(&dest, None)
-            .await;
+        transport.send_announce(&dest, None).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 

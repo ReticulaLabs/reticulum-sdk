@@ -164,7 +164,10 @@ impl Identity {
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
         )
-        .encrypt(PlainText::from(text), &mut out_buf[ephemeral_public_bytes.len()..])?;
+        .encrypt(
+            PlainText::from(text),
+            &mut out_buf[ephemeral_public_bytes.len()..],
+        )?;
 
         let out_len = ephemeral_public_bytes.len() + token.len();
 

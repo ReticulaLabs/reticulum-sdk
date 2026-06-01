@@ -9,8 +9,8 @@ use crate::destination::PlainInputDestination;
 use crate::hash::AddressHash;
 use crate::hash::ADDRESS_HASH_SIZE;
 use crate::identity::EmptyIdentity;
-use crate::packet::DestinationType;
 use crate::packet::ContextFlag;
+use crate::packet::DestinationType;
 use crate::packet::Header;
 use crate::packet::HeaderType;
 use crate::packet::IfacFlag;
@@ -22,8 +22,8 @@ use crate::packet::PropagationType;
 
 pub fn create_path_request_destination() -> PlainInputDestination {
     PlainInputDestination::new(
-        EmptyIdentity { },
-        DestinationName::new("rnstransport","path.request")
+        EmptyIdentity {},
+        DestinationName::new("rnstransport", "path.request"),
     )
 }
 
@@ -55,7 +55,11 @@ impl PathRequest {
             log::info!(
                 "tp({}): ignoring malformed path request: no {}",
                 transport_name,
-                if data.len() < ADDRESS_HASH_SIZE { "destination" } else { "tag" }
+                if data.len() < ADDRESS_HASH_SIZE {
+                    "destination"
+                } else {
+                    "tag"
+                }
             );
             return None;
         }
@@ -126,7 +130,8 @@ impl PathRequests {
                 return None;
             }
 
-            self.cache.insert(tag.clone(), Instant::now() + PATH_REQUEST_GATE_TIMEOUT);
+            self.cache
+                .insert(tag.clone(), Instant::now() + PATH_REQUEST_GATE_TIMEOUT);
             self.cache_order.push_back(tag);
             self.enforce_cache_limit();
         }
@@ -159,11 +164,7 @@ impl PathRequests {
         }
     }
 
-    pub fn generate(
-        &mut self,
-        destination: &AddressHash,
-        tag: Option<TagBytes>
-    ) -> Packet {
+    pub fn generate(&mut self, destination: &AddressHash, tag: Option<TagBytes>) -> Packet {
         let mut data = PacketDataBuffer::new_from_slice(destination.as_slice());
 
         if let Some(transport_id) = self.transport_id {
@@ -188,7 +189,7 @@ impl PathRequests {
             destination,
             transport: self.transport_id.clone(),
             context: PacketContext::None,
-            data
+            data,
         }
     }
 
@@ -263,8 +264,8 @@ mod tests {
         let mut testee = PathRequests::new("", None);
 
         let dest = AddressHash::new([
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
         ]);
         let tag = b"fixed-tag".to_vec();
 
@@ -283,14 +284,14 @@ mod tests {
     #[test]
     fn path_request_roundtrip_preserves_requesting_transport() {
         let transport_id = AddressHash::new([
-            0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
-            0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
+            0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+            0x11, 0x00,
         ]);
         let mut testee = PathRequests::new("", Some(transport_id));
 
         let dest = AddressHash::new([
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
         ]);
         let tag = b"fixed-tag".to_vec();
 
@@ -326,8 +327,12 @@ mod tests {
         let destination = AddressHash::new_from_slice(b"destination");
         let iface = AddressHash::new_from_slice(b"requesting-iface");
 
-        assert!(testee.generate_recursive(&destination, iface, None).is_some());
-        assert!(testee.generate_recursive(&destination, iface, None).is_none());
+        assert!(testee
+            .generate_recursive(&destination, iface, None)
+            .is_some());
+        assert!(testee
+            .generate_recursive(&destination, iface, None)
+            .is_none());
     }
 
     #[test]

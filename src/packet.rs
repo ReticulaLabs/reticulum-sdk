@@ -12,8 +12,7 @@ use crate::hash::Hash;
 pub const RETICULUM_MTU: usize = 500usize;
 pub const RETICULUM_MAX_HEADER_SIZE: usize = 35usize;
 pub const RETICULUM_MIN_IFAC_SIZE: usize = 1usize;
-pub const PACKET_MDU: usize =
-    RETICULUM_MTU - RETICULUM_MAX_HEADER_SIZE - RETICULUM_MIN_IFAC_SIZE;
+pub const PACKET_MDU: usize = RETICULUM_MTU - RETICULUM_MAX_HEADER_SIZE - RETICULUM_MIN_IFAC_SIZE;
 // Keep packet storage large enough to receive and forward announces with
 // interface-sized app data, while PACKET_MDU remains the conservative payload
 // size for packets that must fit in the fixed Reticulum MTU.
@@ -128,7 +127,7 @@ impl From<u8> for PacketType {
 pub enum PacketContext {
     None = 0x00,                    // Generic data packet
     Resource = 0x01,                // Packet is part of a resource
-    ResourceAdvertisement = 0x02,    // Packet is a resource advertisement
+    ResourceAdvertisement = 0x02,   // Packet is a resource advertisement
     ResourceRequest = 0x03,         // Packet is a resource part request
     ResourceHashUpdate = 0x04,      // Packet is a resource hashmap update
     ResourceProof = 0x05,           // Packet is a resource proof

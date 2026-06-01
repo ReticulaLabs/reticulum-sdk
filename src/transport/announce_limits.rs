@@ -6,9 +6,9 @@ use tokio::time::Instant;
 use crate::hash::AddressHash;
 
 pub struct AnnounceRateLimit {
-  pub target: Duration,
-  pub grace: u32,
-  pub penalty: Option<Duration>
+    pub target: Duration,
+    pub grace: u32,
+    pub penalty: Option<Duration>,
 }
 
 impl Default for AnnounceRateLimit {
@@ -73,12 +73,14 @@ impl AnnounceLimitEntry {
 }
 
 pub struct AnnounceLimits {
-    limits: BTreeMap<AddressHash, AnnounceLimitEntry>
+    limits: BTreeMap<AddressHash, AnnounceLimitEntry>,
 }
 
 impl AnnounceLimits {
     pub fn new() -> Self {
-        Self { limits: BTreeMap::new() }
+        Self {
+            limits: BTreeMap::new(),
+        }
     }
 
     pub fn check(&mut self, destination: &AddressHash) -> Option<Duration> {
@@ -88,7 +90,7 @@ impl AnnounceLimits {
 
         self.limits.insert(
             destination.clone(),
-            AnnounceLimitEntry::new(Default::default())
+            AnnounceLimitEntry::new(Default::default()),
         );
 
         None

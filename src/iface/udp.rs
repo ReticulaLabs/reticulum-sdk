@@ -14,14 +14,11 @@ const PACKET_TRACE: bool = true;
 
 pub struct UdpInterface {
     bind_addr: String,
-    forward_addr: Option<String>
+    forward_addr: Option<String>,
 }
 
 impl UdpInterface {
-    pub fn new<T: Into<String>>(
-        bind_addr: T,
-        forward_addr: Option<T>
-    ) -> Self {
+    pub fn new<T: Into<String>>(bind_addr: T, forward_addr: Option<T>) -> Self {
         Self {
             bind_addr: bind_addr.into(),
             forward_addr: forward_addr.map(Into::into),

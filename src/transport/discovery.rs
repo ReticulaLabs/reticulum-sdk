@@ -40,10 +40,7 @@ const FLAG_ENCRYPTED: u8 = 0b0000_0010;
 
 #[derive(Clone, Debug)]
 pub enum DiscoveryInterfaceKind {
-    TcpServer {
-        reachable_on: String,
-        port: u16,
-    },
+    TcpServer { reachable_on: String, port: u16 },
 }
 
 impl DiscoveryInterfaceKind {
@@ -127,7 +124,10 @@ impl DiscoveryInterfaceConfig {
         transport_id: &AddressHash,
     ) -> Result<PacketDataBuffer, RnsError> {
         let mut info = vec![
-            (u8_value(KEY_INTERFACE_TYPE), Value::from(self.kind.interface_type())),
+            (
+                u8_value(KEY_INTERFACE_TYPE),
+                Value::from(self.kind.interface_type()),
+            ),
             (u8_value(KEY_TRANSPORT), Value::Boolean(transport_enabled)),
             (
                 u8_value(KEY_TRANSPORT_ID),
@@ -141,13 +141,19 @@ impl DiscoveryInterfaceConfig {
 
         match &self.kind {
             DiscoveryInterfaceKind::TcpServer { reachable_on, port } => {
-                info.push((u8_value(KEY_REACHABLE_ON), Value::from(reachable_on.as_str())));
+                info.push((
+                    u8_value(KEY_REACHABLE_ON),
+                    Value::from(reachable_on.as_str()),
+                ));
                 info.push((u8_value(KEY_PORT), Value::from(*port)));
             }
         }
 
         if let Some(ifac_netname) = &self.ifac_netname {
-            info.push((u8_value(KEY_IFAC_NETNAME), Value::from(ifac_netname.as_str())));
+            info.push((
+                u8_value(KEY_IFAC_NETNAME),
+                Value::from(ifac_netname.as_str()),
+            ));
         }
         if let Some(ifac_netkey) = &self.ifac_netkey {
             info.push((u8_value(KEY_IFAC_NETKEY), Value::from(ifac_netkey.as_str())));
@@ -157,7 +163,11 @@ impl DiscoveryInterfaceConfig {
         write_value(&mut packed, &Value::Map(info)).map_err(|_| RnsError::PacketError)?;
 
         let infohash = Hash::new_from_slice(&packed);
-        let stamp = generate_stamp(infohash.as_slice(), self.stamp_cost, WORKBLOCK_EXPAND_ROUNDS)?;
+        let stamp = generate_stamp(
+            infohash.as_slice(),
+            self.stamp_cost,
+            WORKBLOCK_EXPAND_ROUNDS,
+        )?;
 
         let mut payload = PacketDataBuffer::new();
         payload.write(&[0u8])?;
@@ -320,7 +330,8 @@ fn stamp_workblock(material: &[u8], expand_rounds: usize) -> Result<StaticBuffer
 
     for round in 0..expand_rounds {
         let mut round_buf = Vec::new();
-        write_value(&mut round_buf, &Value::from(round as u64)).map_err(|_| RnsError::PacketError)?;
+        write_value(&mut round_buf, &Value::from(round as u64))
+            .map_err(|_| RnsError::PacketError)?;
 
         let salt = Hash::generator()
             .chain_update(material)
@@ -416,10 +427,7 @@ fn get_bool(map: &[(Value, Value)], key: u8) -> Result<Option<bool>, RnsError> {
 fn get_f64(map: &[(Value, Value)], key: u8) -> Result<Option<f64>, RnsError> {
     match map_value(map, key) {
         Some(Value::Nil) | None => Ok(None),
-        Some(value) => value
-            .as_f64()
-            .map(Some)
-            .ok_or(RnsError::PacketError),
+        Some(value) => value.as_f64().map(Some).ok_or(RnsError::PacketError),
     }
 }
 
@@ -460,8 +468,7 @@ mod tests {
         let transport_id = AddressHash::new_from_slice(b"transport-id");
         let app_data = config.build_app_data(true, &transport_id).unwrap();
 
-        let source = create_discovery_destination(PrivateIdentity::new_from_name("discovery"))
-            .desc;
+        let source = create_discovery_destination(PrivateIdentity::new_from_name("discovery")).desc;
         let decoded = DiscoveredInterface::from_announce(source, 1, app_data.as_slice()).unwrap();
 
         assert_eq!(decoded.interface_type, "TCPServerInterface");

@@ -17,7 +17,11 @@ fn setup() {
     });
 }
 
-async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) -> (Transport, reticulum_sdk::hash::AddressHash) {
+async fn build_transport(
+    name: &str,
+    server_addr: &str,
+    client_addr: &[&str],
+) -> (Transport, reticulum_sdk::hash::AddressHash) {
     let transport = Transport::new(TransportConfig::new(
         name,
         &PrivateIdentity::new_from_rand(OsRng),

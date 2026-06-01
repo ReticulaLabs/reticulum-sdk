@@ -20,7 +20,7 @@ fn propagate(packet: &Packet, iface: AddressHash) -> (Packet, AddressHash) {
     let propagated = Packet {
         header: Header {
             hops: packet.header.hops.saturating_add(1),
-            .. packet.header
+            ..packet.header
         },
         ifac: None,
         destination: packet.destination,
@@ -64,14 +64,17 @@ impl LinkTable {
             original_destination: destination,
             taken_hops,
             remaining_hops,
-            validated: false
+            validated: false,
         };
 
         self.0.insert(link_id, entry);
     }
 
     pub fn original_destination(&self, link_id: &LinkId) -> Option<AddressHash> {
-        self.0.get(&link_id).filter(|e| e.validated).map(|e| e.original_destination)
+        self.0
+            .get(&link_id)
+            .filter(|e| e.validated)
+            .map(|e| e.original_destination)
     }
 
     pub fn handle_keepalive(&self, packet: &Packet) -> Option<(Packet, AddressHash)> {
@@ -92,7 +95,8 @@ impl LinkTable {
         }
 
         let outbound_iface = if entry.next_hop_iface == entry.received_from {
-            if packet.header.hops == entry.remaining_hops || packet.header.hops == entry.taken_hops {
+            if packet.header.hops == entry.remaining_hops || packet.header.hops == entry.taken_hops
+            {
                 Some(entry.next_hop_iface)
             } else {
                 None
@@ -126,8 +130,8 @@ impl LinkTable {
                 entry.validated = true;
 
                 Some(propagate(proof, entry.received_from))
-            },
-            None => None
+            }
+            None => None,
         }
     }
 

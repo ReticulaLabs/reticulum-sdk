@@ -130,7 +130,9 @@ mod tests {
 
         let mut output_data = [0u8; 4096];
         let mut output_buffer = OutputBuffer::new(&mut output_data);
-        packet.serialize(&mut output_buffer).expect("serialized forwarded announce");
+        packet
+            .serialize(&mut output_buffer)
+            .expect("serialized forwarded announce");
 
         let expected = test_vectors::decode_hex(test_vectors::FORWARDED_ANNOUNCE_PACKET_HEX);
         assert_eq!(output_buffer.as_slice(), expected.as_slice());
@@ -151,7 +153,9 @@ mod tests {
 
         let mut output_data = [0u8; 4096];
         let mut output_buffer = OutputBuffer::new(&mut output_data);
-        packet.serialize(&mut output_buffer).expect("reserialized announce");
+        packet
+            .serialize(&mut output_buffer)
+            .expect("reserialized announce");
         assert_eq!(output_buffer.as_slice(), packet_bytes.as_slice());
     }
 
@@ -170,7 +174,9 @@ mod tests {
 
         let mut output_data = [0u8; 4096];
         let mut output_buffer = OutputBuffer::new(&mut output_data);
-        packet.serialize(&mut output_buffer).expect("reserialized path response");
+        packet
+            .serialize(&mut output_buffer)
+            .expect("reserialized path response");
         assert_eq!(output_buffer.as_slice(), packet_bytes.as_slice());
     }
 
@@ -192,7 +198,9 @@ mod tests {
 
         let mut output_data = [0u8; 4096];
         let mut output_buffer = OutputBuffer::new(&mut output_data);
-        packet.serialize(&mut output_buffer).expect("reserialized lrproof");
+        packet
+            .serialize(&mut output_buffer)
+            .expect("reserialized lrproof");
         assert_eq!(output_buffer.as_slice(), packet_bytes.as_slice());
     }
 

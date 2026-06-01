@@ -21,10 +21,7 @@ pub struct AnnounceEntry {
 }
 
 impl AnnounceEntry {
-    pub fn retransmit(
-        &mut self,
-        transport_id: &AddressHash,
-    ) -> Option<TxMessage> {
+    pub fn retransmit(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
         if self.retries == 0 || Instant::now() >= self.timeout {
             return None;
         }
@@ -34,10 +31,7 @@ impl AnnounceEntry {
         Some(self.always_retransmit(transport_id))
     }
 
-    pub fn always_retransmit(
-        &self,
-        transport_id: &AddressHash,
-    ) -> TxMessage {
+    pub fn always_retransmit(&self, transport_id: &AddressHash) -> TxMessage {
         let context = if self.response_to_iface.is_some() {
             PacketContext::PathResponse
         } else {
@@ -67,14 +61,13 @@ impl AnnounceEntry {
         };
 
         TxMessage { tx_type, packet }
-
     }
 }
 
 struct AnnounceCache {
     newer: Option<BTreeMap<AddressHash, AnnounceEntry>>,
     older: Option<BTreeMap<AddressHash, AnnounceEntry>>,
-    capacity: usize
+    capacity: usize,
 }
 
 impl AnnounceCache {
@@ -82,7 +75,7 @@ impl AnnounceCache {
         Self {
             newer: Some(BTreeMap::new()),
             older: None,
-            capacity
+            capacity,
         }
     }
 
@@ -128,12 +121,7 @@ impl AnnounceTable {
         }
     }
 
-    pub fn add(
-        &mut self,
-        announce: &Packet,
-        destination: AddressHash,
-        received_from: AddressHash
-    ) {
+    pub fn add(&mut self, announce: &Packet, destination: AddressHash, received_from: AddressHash) {
         let now = Instant::now();
         let hops = announce.header.hops.saturating_add(1);
 
@@ -169,7 +157,7 @@ impl AnnounceTable {
         &mut self,
         destination: AddressHash,
         to_iface: AddressHash,
-        hops: u8
+        hops: u8,
     ) -> bool {
         if let Some(entry) = self.map.get(&destination) {
             self.do_add_response(entry.clone(), destination, to_iface, hops);
@@ -196,13 +184,12 @@ impl AnnounceTable {
         transport_id: &AddressHash,
     ) -> Option<TxMessage> {
         // temporary hack
-        self.map.get_mut(dest_hash).map_or(None, |e| e.retransmit(transport_id))
+        self.map
+            .get_mut(dest_hash)
+            .map_or(None, |e| e.retransmit(transport_id))
     }
 
-    pub fn to_retransmit(
-        &mut self,
-        transport_id: &AddressHash,
-    ) -> Vec<TxMessage> {
+    pub fn to_retransmit(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {
         let mut messages = vec![];
         let mut completed = vec![];
 
@@ -248,10 +235,7 @@ impl AnnounceTable {
         messages
     }
 
-    pub fn to_retransmit_old(
-        &mut self,
-        transport_id: &AddressHash,
-    ) -> Vec<TxMessage> {
+    pub fn to_retransmit_old(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {
         let mut messages = vec![];
 
         if let Some(ref cache) = self.cache.newer {

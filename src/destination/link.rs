@@ -82,10 +82,7 @@ impl LinkPayload {
             buffer[i] = data[i];
         }
 
-        Self {
-            buffer,
-            len,
-        }
+        Self { buffer, len }
     }
 
     pub fn len(&self) -> usize {
@@ -321,20 +318,25 @@ impl Link {
                     log::error!("link({}): can't decrypt packet", self.id);
                 }
             }
-            PacketContext::LinkIdentify => if !out_link {
-                let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
-                    match self.validate_link_identify(plain_text) {
-                        Ok(identity) => {
-                            self.request_time = Instant::now();
-                            self.post_event(LinkEvent::RemoteIdentified(identity));
+            PacketContext::LinkIdentify => {
+                if !out_link {
+                    let mut buffer = [0u8; PACKET_MDU];
+                    if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                        match self.validate_link_identify(plain_text) {
+                            Ok(identity) => {
+                                self.request_time = Instant::now();
+                                self.post_event(LinkEvent::RemoteIdentified(identity));
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "link({}): invalid link identify packet: {err:?}",
+                                    self.id
+                                );
+                            }
                         }
-                        Err(err) => {
-                            log::warn!("link({}): invalid link identify packet: {err:?}", self.id);
-                        }
+                    } else {
+                        log::error!("link({}): can't decrypt link identify packet", self.id);
                     }
-                } else {
-                    log::error!("link({}): can't decrypt link identify packet", self.id);
                 }
             }
             PacketContext::Request => {
@@ -382,16 +384,18 @@ impl Link {
                     return LinkHandleResult::None;
                 }
             }
-            PacketContext::LinkRTT => if !out_link {
-                let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
-                    if let Ok(rtt) = rmp::decode::read_f32(&mut &plain_text[..]) {
-                        self.rtt = Duration::from_secs_f32(rtt);
+            PacketContext::LinkRTT => {
+                if !out_link {
+                    let mut buffer = [0u8; PACKET_MDU];
+                    if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                        if let Ok(rtt) = rmp::decode::read_f32(&mut &plain_text[..]) {
+                            self.rtt = Duration::from_secs_f32(rtt);
+                        } else {
+                            log::error!("link({}): failed to decode rtt", self.id);
+                        }
                     } else {
-                        log::error!("link({}): failed to decode rtt", self.id);
+                        log::error!("link({}): can't decrypt rtt packet", self.id);
                     }
-                } else {
-                    log::error!("link({}): can't decrypt rtt packet", self.id);
                 }
             }
             PacketContext::LinkClose => {
@@ -399,8 +403,10 @@ impl Link {
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     match plain_text[..].try_into() {
                         Err(err) => {
-                            log::error!("link({}): invalid decode link close payload: {err}",
-                                self.id)
+                            log::error!(
+                                "link({}): invalid decode link close payload: {err}",
+                                self.id
+                            )
                         }
                         Ok(dest_bytes) => {
                             let link_id = LinkId::new(dest_bytes);
@@ -432,11 +438,8 @@ impl Link {
     }
 
     fn handle_proof_packet(&mut self, packet: &Packet) -> LinkHandleResult {
-        if self.status == LinkStatus::Pending
-            && packet.context == PacketContext::LinkRequestProof
-        {
-            if let Ok(identity) = validate_proof_packet(&self.destination, &self.id, packet)
-            {
+        if self.status == LinkStatus::Pending && packet.context == PacketContext::LinkRequestProof {
+            if let Ok(identity) = validate_proof_packet(&self.destination, &self.id, packet) {
                 log::debug!("link({}): has been proved", self.id);
 
                 self.handshake(identity);
@@ -455,10 +458,7 @@ impl Link {
         }
 
         if self.status == LinkStatus::Active && packet.context == PacketContext::None {
-            if let Ok(hash) = validate_message_proof(
-                &self.destination,
-                packet.data.as_slice()
-            ) {
+            if let Ok(hash) = validate_message_proof(&self.destination, packet.data.as_slice()) {
                 self.post_event(LinkEvent::Proof(hash));
             }
         }
@@ -470,10 +470,14 @@ impl Link {
         self.encrypted_data_packet(data, PacketContext::None)
     }
 
-    fn encrypted_data_packet(&self, data: &[u8], context: PacketContext) -> Result<Packet, RnsError> {
+    fn encrypted_data_packet(
+        &self,
+        data: &[u8],
+        context: PacketContext,
+    ) -> Result<Packet, RnsError> {
         if self.status != LinkStatus::Active && self.status != LinkStatus::Stale {
             log::warn!("link: can't create data packet for closed link");
-            return Err(RnsError::LinkClosed)
+            return Err(RnsError::LinkClosed);
         }
 
         let mut packet_data = PacketDataBuffer::new();
@@ -526,7 +530,11 @@ impl Link {
     pub fn request_packet(&self, path: &str, data: Value) -> Result<Packet, RnsError> {
         let request = Value::Array(vec![
             Value::F64(now_seconds()),
-            Value::Binary(AddressHash::new_from_slice(path.as_bytes()).as_slice().to_vec()),
+            Value::Binary(
+                AddressHash::new_from_slice(path.as_bytes())
+                    .as_slice()
+                    .to_vec(),
+            ),
             data,
         ]);
         let packed_request = encode_msgpack(&request)?;
@@ -537,11 +545,12 @@ impl Link {
         self.encrypted_data_packet(&packed_request, PacketContext::Request)
     }
 
-    pub fn response_packet(&self, request_id: AddressHash, data: Value) -> Result<Packet, RnsError> {
-        let response = Value::Array(vec![
-            Value::Binary(request_id.as_slice().to_vec()),
-            data,
-        ]);
+    pub fn response_packet(
+        &self,
+        request_id: AddressHash,
+        data: Value,
+    ) -> Result<Packet, RnsError> {
+        let response = Value::Array(vec![Value::Binary(request_id.as_slice().to_vec()), data]);
         let packed_response = encode_msgpack(&response)?;
         if packed_response.len() > PACKET_MDU {
             return Err(RnsError::OutOfMemory);
@@ -571,7 +580,11 @@ impl Link {
     }
 
     pub fn message_proof(&self, hash: Hash) -> Packet {
-        log::trace!("link({}): creating proof for message hash {}", self.id, hash);
+        log::trace!(
+            "link({}): creating proof for message hash {}",
+            self.id,
+            hash
+        );
 
         let signature = self.priv_identity.sign(hash.as_slice());
 
@@ -786,10 +799,7 @@ fn validate_proof_packet(
     Ok(identity)
 }
 
-fn validate_message_proof(
-    destination: &DestinationDesc,
-    data: &[u8],
-) -> Result<Hash, RnsError> {
+fn validate_message_proof(destination: &DestinationDesc, data: &[u8]) -> Result<Hash, RnsError> {
     if data.len() <= HASH_SIZE {
         return Err(RnsError::PacketError);
     }
@@ -802,7 +812,12 @@ fn validate_message_proof(
 
     let hash_slice = &data[..HASH_SIZE];
 
-    if destination.identity.verifying_key.verify(hash_slice, &signature).is_ok() {
+    if destination
+        .identity
+        .verifying_key
+        .verify(hash_slice, &signature)
+        .is_ok()
+    {
         Ok(Hash::new(hash_slice.try_into().unwrap()))
     } else {
         Err(RnsError::IncorrectSignature)
@@ -969,7 +984,10 @@ mod tests {
     fn link_request_and_response_emit_events() {
         let (mut out_link, mut in_link, mut out_events, mut in_events) = create_active_link_pair();
         let request = out_link
-            .request_packet("/offer", Value::Array(vec![Value::from(1), Value::from("abc")]))
+            .request_packet(
+                "/offer",
+                Value::Array(vec![Value::from(1), Value::from("abc")]),
+            )
             .expect("request packet");
         let request_id = AddressHash::new_from_hash(&request.hash());
 

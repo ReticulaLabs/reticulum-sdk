@@ -281,7 +281,11 @@ impl Destination<PrivateIdentity, Input, Single> {
     ) -> [u8; RAND_HASH_LENGTH] {
         let rand_hash = Hash::new_from_rand(rng);
         let timestamp = timestamp_secs.to_be_bytes();
-        let rand_hash = [&rand_hash.as_slice()[..RAND_HASH_LENGTH / 2], &timestamp[3..]].concat();
+        let rand_hash = [
+            &rand_hash.as_slice()[..RAND_HASH_LENGTH / 2],
+            &timestamp[3..],
+        ]
+        .concat();
 
         rand_hash.try_into().expect("rand hash has fixed length")
     }
@@ -451,8 +455,12 @@ impl Destination<PrivateIdentity, Input, Single> {
     }
 
     pub fn decrypt<'a>(&self, data: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
-        self.identity
-            .decrypt_packet(OsRng, data, Some(self.identity.as_address_hash_slice()), out_buf)
+        self.identity.decrypt_packet(
+            OsRng,
+            data,
+            Some(self.identity.as_address_hash_slice()),
+            out_buf,
+        )
     }
 }
 
@@ -565,8 +573,9 @@ mod tests {
     fn python_announce_rand_hash() -> [u8; RAND_HASH_LENGTH] {
         let timestamp = test_vectors::FIXED_ANNOUNCE_TIMESTAMP.to_be_bytes();
         let mut rand_hash = [0u8; RAND_HASH_LENGTH];
-        rand_hash[..RAND_HASH_LENGTH / 2]
-            .copy_from_slice(&test_vectors::FIXED_ANNOUNCE_RANDOM_HASH_BYTES[..RAND_HASH_LENGTH / 2]);
+        rand_hash[..RAND_HASH_LENGTH / 2].copy_from_slice(
+            &test_vectors::FIXED_ANNOUNCE_RANDOM_HASH_BYTES[..RAND_HASH_LENGTH / 2],
+        );
         rand_hash[RAND_HASH_LENGTH / 2..].copy_from_slice(&timestamp[3..]);
         rand_hash
     }
@@ -582,8 +591,14 @@ mod tests {
             .announce(OsRng, None)
             .expect("valid announce packet");
 
-        assert_eq!(announce_packet.header.packet_type, crate::packet::PacketType::Announce);
-        assert_eq!(announce_packet.destination, single_in_destination.desc.address_hash);
+        assert_eq!(
+            announce_packet.header.packet_type,
+            crate::packet::PacketType::Announce
+        );
+        assert_eq!(
+            announce_packet.destination,
+            single_in_destination.desc.address_hash
+        );
         assert_eq!(announce_packet.context, crate::packet::PacketContext::None);
         DestinationAnnounce::validate(&announce_packet).expect("announce validates");
     }
@@ -605,9 +620,9 @@ mod tests {
     #[test]
     fn create_destination_hash_without_aspects_matches_python() {
         let mut identity_hash_bytes = [0u8; crate::hash::ADDRESS_HASH_SIZE];
-        identity_hash_bytes.copy_from_slice(
-            &test_vectors::decode_hex("f9cd9aa2712d27402dcccb26643c520a"),
-        );
+        identity_hash_bytes.copy_from_slice(&test_vectors::decode_hex(
+            "f9cd9aa2712d27402dcccb26643c520a",
+        ));
         let identity_hash = AddressHash::new(identity_hash_bytes);
         let name = DestinationName::new("kallisti5 desktop", "");
 
@@ -656,7 +671,10 @@ mod tests {
         announce.serialize(&mut buffer).expect("correct data");
 
         assert_eq!(announce.header.packet_type, PacketType::Announce);
-        assert_eq!(buffer.as_slice(), test_vectors::decode_hex(test_vectors::ANNOUNCE_PACKET_HEX));
+        assert_eq!(
+            buffer.as_slice(),
+            test_vectors::decode_hex(test_vectors::ANNOUNCE_PACKET_HEX)
+        );
         DestinationAnnounce::validate(&announce).expect("announce validates");
     }
 
@@ -678,7 +696,10 @@ mod tests {
         let mut buffer = OutputBuffer::new(&mut output_data);
         path_response.serialize(&mut buffer).expect("correct data");
 
-        assert_eq!(buffer.as_slice(), test_vectors::decode_hex(test_vectors::PATH_RESPONSE_PACKET_HEX));
+        assert_eq!(
+            buffer.as_slice(),
+            test_vectors::decode_hex(test_vectors::PATH_RESPONSE_PACKET_HEX)
+        );
         DestinationAnnounce::validate(&path_response).expect("path response validates");
     }
 
@@ -746,8 +767,10 @@ mod tests {
     #[test]
     fn create_explicit_packet_proof() {
         let identity = test_vectors::fixed_private_identity();
-        let destination =
-            SingleInputDestination::new(identity, DestinationName::new("example_utilities", "announcesample.fruits"));
+        let destination = SingleInputDestination::new(
+            identity,
+            DestinationName::new("example_utilities", "announcesample.fruits"),
+        );
         let packet_hash = Hash::new_from_slice(b"probe packet");
         let proof = destination.proof_packet(&packet_hash);
 
@@ -771,7 +794,10 @@ mod tests {
         let mut output_data = [0u8; 4096];
         let mut buffer = OutputBuffer::new(&mut output_data);
         proof.serialize(&mut buffer).expect("serialized proof");
-        assert_eq!(buffer.as_slice(), test_vectors::decode_hex(test_vectors::EXPLICIT_PACKET_PROOF_HEX));
+        assert_eq!(
+            buffer.as_slice(),
+            test_vectors::decode_hex(test_vectors::EXPLICIT_PACKET_PROOF_HEX)
+        );
     }
 
     #[test]
@@ -781,7 +807,8 @@ mod tests {
             identity,
             DestinationName::new("example_utilities", "single.roundtrip"),
         );
-        let output_destination = super::SingleOutputDestination::new_from_desc(input_destination.desc);
+        let output_destination =
+            super::SingleOutputDestination::new_from_desc(input_destination.desc);
 
         let payload = b"hello over single destination";
         let packet = output_destination

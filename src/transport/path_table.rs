@@ -31,10 +31,15 @@ impl PathTable {
     }
 
     pub fn next_hop_full(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
-        self.map.get(destination).map(|entry| (entry.received_from, entry.iface))
+        self.map
+            .get(destination)
+            .map(|entry| (entry.received_from, entry.iface))
     }
 
-    pub fn next_hop_route(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash, u8)> {
+    pub fn next_hop_route(
+        &self,
+        destination: &AddressHash,
+    ) -> Option<(AddressHash, AddressHash, u8)> {
         self.map
             .get(destination)
             .map(|entry| (entry.received_from, entry.iface, entry.hops))
@@ -139,7 +144,7 @@ self_referential_transport={}",
                     header_type,
                     propagation_type,
                     hops,
-                    .. original_packet.header
+                    ..original_packet.header
                 },
                 ifac: None,
                 destination: original_packet.destination,
@@ -182,7 +187,7 @@ self_referential_transport={}",
                 header: Header {
                     header_type: HeaderType::Type2,
                     propagation_type: PropagationType::Transport,
-                    .. original_packet.header
+                    ..original_packet.header
                 },
                 ifac: original_packet.ifac,
                 destination: original_packet.destination,
@@ -201,8 +206,7 @@ mod tests {
     use crate::{
         hash::AddressHash,
         packet::{
-            DestinationType, Header, HeaderType, Packet, PacketContext, PacketType,
-            PropagationType,
+            DestinationType, Header, HeaderType, Packet, PacketContext, PacketType, PropagationType,
         },
     };
 
@@ -245,7 +249,10 @@ mod tests {
 
         assert_eq!(forwarded_iface, Some(iface));
         assert_eq!(forwarded.header.header_type, HeaderType::Type1);
-        assert_eq!(forwarded.header.propagation_type, PropagationType::Broadcast);
+        assert_eq!(
+            forwarded.header.propagation_type,
+            PropagationType::Broadcast
+        );
         assert_eq!(forwarded.header.hops, 1);
         assert_eq!(forwarded.transport, None);
     }
@@ -291,7 +298,10 @@ mod tests {
 
         assert_eq!(forwarded_iface, Some(iface));
         assert_eq!(forwarded.header.header_type, HeaderType::Type2);
-        assert_eq!(forwarded.header.propagation_type, PropagationType::Transport);
+        assert_eq!(
+            forwarded.header.propagation_type,
+            PropagationType::Transport
+        );
         assert_eq!(forwarded.header.hops, 1);
         assert_eq!(forwarded.transport, Some(transport));
     }

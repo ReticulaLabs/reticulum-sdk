@@ -50,6 +50,5 @@ async fn main() {
         }
     });
 
-
     let _ = tokio::signal::ctrl_c().await;
 }

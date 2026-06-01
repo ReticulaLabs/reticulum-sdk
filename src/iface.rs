@@ -195,7 +195,7 @@ impl InterfaceManager {
                     }
 
                     should_send
-                },
+                }
                 TxMessageType::Direct(address) => address == iface.address,
             };
 
