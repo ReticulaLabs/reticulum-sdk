@@ -2,7 +2,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use rand_core::OsRng;
-use reticulum::{
+use reticulum_sdk::{
     identity::PrivateIdentity,
     iface::{tcp_client::TcpClient, tcp_server::TcpServer},
     transport::{DiscoveryInterfaceConfig, Transport, TransportConfig},
@@ -17,7 +17,7 @@ fn setup() {
     });
 }
 
-async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) -> (Transport, reticulum::hash::AddressHash) {
+async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) -> (Transport, reticulum_sdk::hash::AddressHash) {
     let transport = Transport::new(TransportConfig::new(
         name,
         &PrivateIdentity::new_from_rand(OsRng),

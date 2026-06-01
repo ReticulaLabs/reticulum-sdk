@@ -37,7 +37,7 @@
 //! ## Creating a Transport instance
 //!
 //! ```
-//! use reticulum::transport::{Transport, TransportConfig};
+//! use reticulum_sdk::transport::{Transport, TransportConfig};
 //! #[tokio::main]
 //! async fn main() {
 //!     let transport = Transport::new(TransportConfig::default());
@@ -47,8 +47,8 @@
 //! ## Creating interfaces
 //!
 //! ```
-//! # use reticulum::transport::{Transport, TransportConfig};
-//! # use reticulum::iface::tcp_client::TcpClient;
+//! # use reticulum_sdk::transport::{Transport, TransportConfig};
+//! # use reticulum_sdk::iface::tcp_client::TcpClient;
 //! # #[tokio::main]
 //! # async fn main() {
 //!     # let transport = Transport::new(TransportConfig::default());
@@ -65,10 +65,10 @@
 //!
 //! ```
 //! # use rand_core::OsRng;
-//! # use reticulum::transport::{Transport, TransportConfig};
-//! # use reticulum::identity::PrivateIdentity;
-//! # use reticulum::destination::{SingleInputDestination, DestinationName};
-//! # use reticulum::hash::AddressHash;
+//! # use reticulum_sdk::transport::{Transport, TransportConfig};
+//! # use reticulum_sdk::identity::PrivateIdentity;
+//! # use reticulum_sdk::destination::{SingleInputDestination, DestinationName};
+//! # use reticulum_sdk::hash::AddressHash;
 //! # #[tokio::main]
 //! # async fn main() {
 //!     # let mut transport = Transport::new(TransportConfig::default());
@@ -92,9 +92,9 @@
 //! # use rand_core::OsRng;
 //! # use tokio::sync::Mutex;
 //! # use std::sync::Arc;
-//! # use reticulum::transport::{Transport, TransportConfig};
-//! # use reticulum::hash::AddressHash;
-//! # use reticulum::destination::link::{Link, LinkEvent};
+//! # use reticulum_sdk::transport::{Transport, TransportConfig};
+//! # use reticulum_sdk::hash::AddressHash;
+//! # use reticulum_sdk::destination::link::{Link, LinkEvent};
 //! # #[tokio::main]
 //! # async fn main() {
 //!     # let transport = Transport::new(TransportConfig::default());

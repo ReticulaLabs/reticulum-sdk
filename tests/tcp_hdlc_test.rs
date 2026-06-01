@@ -2,7 +2,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use rand_core::OsRng;
-use reticulum::{
+use reticulum_sdk::{
     identity::PrivateIdentity,
     iface::{tcp_client::TcpClient, tcp_server::TcpServer},
     packet::Packet,

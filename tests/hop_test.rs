@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
 use rand_core::OsRng;
-use reticulum::{
+use reticulum_sdk::{
     destination::{DestinationDesc, DestinationName, SingleOutputDestination},
     destination::link::LinkEvent,
     hash::{AddressHash, HASH_SIZE},
@@ -300,7 +300,7 @@ fn assert_valid_packet_proof(
 }
 
 async fn recv_expected_proof(
-    iface_rx: &mut broadcast::Receiver<reticulum::iface::RxMessage>,
+    iface_rx: &mut broadcast::Receiver<reticulum_sdk::iface::RxMessage>,
     expected_destination: AddressHash,
 ) -> Packet {
     loop {

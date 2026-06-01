@@ -79,20 +79,8 @@ name = "link_client"
 path = "examples/link_client.rs"
 
 [[example]]
-name = "kaonic_client"
-path = "examples/kaonic_client.rs"
-
-[[example]]
 name = "testnet_client"
 path = "examples/testnet_client.rs"
-
-[[example]]
-name = "kaonic_tcp_mesh"
-path = "examples/kaonic_tcp_mesh.rs"
-
-[[example]]
-name = "kaonic_mesh"
-path = "examples/kaonic_mesh.rs"
 
 [[example]]
 name = "multihop"

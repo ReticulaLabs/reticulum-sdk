@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use reticulum::iface::tcp_client::TcpClient;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum_sdk::iface::tcp_client::TcpClient;
+use reticulum_sdk::transport::{Transport, TransportConfig};
 use tokio::select;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;

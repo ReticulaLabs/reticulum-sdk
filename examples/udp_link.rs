@@ -15,12 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand_core::OsRng;
-use reticulum::destination::{DestinationName, SingleInputDestination};
-use reticulum::destination::link::{Link, LinkEvent, LinkStatus};
-use reticulum::hash::AddressHash;
-use reticulum::identity::PrivateIdentity;
-use reticulum::iface::udp::UdpInterface;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
+use reticulum_sdk::destination::link::{Link, LinkEvent, LinkStatus};
+use reticulum_sdk::hash::AddressHash;
+use reticulum_sdk::identity::PrivateIdentity;
+use reticulum_sdk::iface::udp::UdpInterface;
+use reticulum_sdk::transport::{Transport, TransportConfig};
 
 #[tokio::main]
 async fn main() {

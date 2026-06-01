@@ -5,14 +5,14 @@ use tokio::io::AsyncBufReadExt;
 
 use rand_core::OsRng;
 
-use reticulum::destination::{DestinationName, SingleInputDestination};
-use reticulum::destination::link::{LinkEvent, LinkStatus};
-use reticulum::hash::AddressHash;
-use reticulum::identity::PrivateIdentity;
-use reticulum::iface::tcp_client::TcpClient;
-use reticulum::iface::tcp_server::TcpServer;
-use reticulum::packet::{HeaderType, Packet, PacketDataBuffer, PropagationType};
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
+use reticulum_sdk::destination::link::{LinkEvent, LinkStatus};
+use reticulum_sdk::hash::AddressHash;
+use reticulum_sdk::identity::PrivateIdentity;
+use reticulum_sdk::iface::tcp_client::TcpClient;
+use reticulum_sdk::iface::tcp_server::TcpServer;
+use reticulum_sdk::packet::{HeaderType, Packet, PacketDataBuffer, PropagationType};
+use reticulum_sdk::transport::{Transport, TransportConfig};
 
 fn create_data_packet(message: &String, destination: AddressHash) -> Packet {
     let mut packet: Packet = Default::default();

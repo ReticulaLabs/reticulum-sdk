@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 use rand_core::OsRng;
-use reticulum::destination::{DestinationName, SingleInputDestination};
-use reticulum::identity::PrivateIdentity;
-use reticulum::iface::tcp_client::TcpClient;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
+use reticulum_sdk::identity::PrivateIdentity;
+use reticulum_sdk::iface::tcp_client::TcpClient;
+use reticulum_sdk::transport::{Transport, TransportConfig};
 
 #[tokio::main]
 async fn main() {

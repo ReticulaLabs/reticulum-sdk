@@ -1,7 +1,7 @@
 use rand_core::OsRng;
-use reticulum::identity::PrivateIdentity;
-use reticulum::iface::tcp_server::TcpServer;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum_sdk::identity::PrivateIdentity;
+use reticulum_sdk::iface::tcp_server::TcpServer;
+use reticulum_sdk::transport::{Transport, TransportConfig};
 
 #[tokio::main]
 async fn main() {
