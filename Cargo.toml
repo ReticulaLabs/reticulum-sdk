@@ -1,15 +1,15 @@
 [package]
-name = "reticulum"
-version = "0.1.0"
+name = "reticulum-sdk"
+version = "1.0.5"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs"
+repository = "https://github.com/GhostMeshLabs/reticulum-sdk"
 categories = ["network-programming"]
 keywords = ["reticulum", "mesh", "radio", "async"]
 
 description = """
-Reticulum-rs is a Rust implementation of the Reticulum Network Stack - a cryptographic, 
+reticulum-sdk is a Rust implementation of the Reticulum Network Stack - a cryptographic,
 decentralised, and resilient mesh networking protocol designed for communication over any physical 
 layer.
 

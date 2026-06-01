@@ -1,7 +1,7 @@
 
-# Reticulum-rs
+# reticulum-sdk
 
-**Reticulum-rs** is a Rust implementation of the [Reticulum Network Stack](https://reticulum.network/) — a cryptographic, decentralised, and resilient mesh networking protocol designed for communication over any physical layer.
+**reticulum-sdk** is a Rust implementation of the [Reticulum Network Stack](https://reticulum.network/) — a cryptographic, decentralised, and resilient mesh networking protocol designed for communication over any physical layer.
 
 This project brings Reticulum's capabilities to the Rust ecosystem, enabling embedded, and constrained deployments with maximum performance and minimal dependencies.
 
@@ -18,7 +18,7 @@ This project brings Reticulum's capabilities to the Rust ecosystem, enabling emb
 
 
 ```
-Reticulum-rs/
+reticulum-sdk/
 ├── src/                 # Core Reticulum protocol implementation
 │   ├── buffer.rs
 │   ├── crypt.rs
