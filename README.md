@@ -30,7 +30,7 @@ Reticulum operates independently of traditional IP, and can function effectively
 * ❌ BackboneInterface
 * ❌ I2PInterface
 * ❌ RNodeMultiInterface
-* ❌ RNodeInterface
+* ✅ RNodeInterface (over Serial)
 * ❌ SerialInterface
 * ❌ PipeInterface
 * ✅ KISSInterface
