@@ -99,6 +99,7 @@ pub struct DestinationDesc {
     pub identity: Identity,
     pub address_hash: AddressHash,
     pub name: DestinationName,
+    pub ratchet_public_key: Option<[u8; PUBLIC_KEY_LENGTH]>,
 }
 
 impl fmt::Display for DestinationDesc {
@@ -192,10 +193,14 @@ impl DestinationAnnounce {
 
         identity.verify(signed_data.as_slice(), &signature)?;
 
-        Ok((
-            SingleOutputDestination::new(identity, DestinationName::new_from_hash_slice(name_hash)),
-            app_data,
-        ))
+        let mut destination =
+            SingleOutputDestination::new(identity, DestinationName::new_from_hash_slice(name_hash));
+        if !ratchet.is_empty() {
+            destination.desc.ratchet_public_key =
+                Some(ratchet.try_into().map_err(|_| RnsError::PacketError)?);
+        }
+
+        Ok((destination, app_data))
     }
 }
 
@@ -313,6 +318,7 @@ impl Destination<PrivateIdentity, Input, Single> {
                 identity: pub_identity,
                 name,
                 address_hash,
+                ratchet_public_key: None,
             },
             accept_link_requests: true,
             prove_packets: false,
@@ -486,6 +492,7 @@ impl Destination<Identity, Output, Single> {
                 identity,
                 name,
                 address_hash,
+                ratchet_public_key: None,
             },
             accept_link_requests: false,
             prove_packets: false,
@@ -507,12 +514,22 @@ impl Destination<Identity, Output, Single> {
         let mut packet_data = PacketDataBuffer::new();
 
         let cipher_text_len = {
-            let cipher_text = self.identity.encrypt_packet(
-                OsRng,
-                data,
-                Some(self.identity.as_address_hash_slice()),
-                packet_data.accuire_buf_max(),
-            )?;
+            let cipher_text = if let Some(ratchet_public_key) = self.desc.ratchet_public_key {
+                self.identity.encrypt_packet_to_public_key(
+                    OsRng,
+                    &PublicKey::from(ratchet_public_key),
+                    data,
+                    Some(self.identity.as_address_hash_slice()),
+                    packet_data.accuire_buf_max(),
+                )?
+            } else {
+                self.identity.encrypt_packet(
+                    OsRng,
+                    data,
+                    Some(self.identity.as_address_hash_slice()),
+                    packet_data.accuire_buf_max(),
+                )?
+            };
             cipher_text.len()
         };
 
@@ -544,6 +561,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
                 identity: Default::default(),
                 name,
                 address_hash,
+                ratchet_public_key: None,
             },
             accept_link_requests: false,
             prove_packets: false,
@@ -571,6 +589,7 @@ mod tests {
     use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
     use rand_core::OsRng;
     use sha2::Digest;
+    use x25519_dalek::{PublicKey, StaticSecret};
 
     use crate::buffer::OutputBuffer;
     use crate::hash::{AddressHash, Hash};
@@ -776,7 +795,70 @@ mod tests {
         announce.header.context_flag = ContextFlag::Set;
         announce.data = packet_data;
 
-        DestinationAnnounce::validate(&announce).expect("ratchet announce validates");
+        let (validated_destination, _) =
+            DestinationAnnounce::validate(&announce).expect("ratchet announce validates");
+        assert_eq!(validated_destination.desc.ratchet_public_key, Some(ratchet));
+    }
+
+    #[test]
+    fn ratchet_announce_encrypts_outbound_packets_to_ratchet_key() {
+        let priv_identity = test_vectors::fixed_private_identity();
+        let destination = SingleInputDestination::new(
+            priv_identity,
+            DestinationName::new("example_utilities", "announcesample.fruits"),
+        );
+
+        let rand_hash = python_announce_rand_hash();
+        let ratchet_secret = StaticSecret::from([0x24u8; PUBLIC_KEY_LENGTH]);
+        let ratchet_public = PublicKey::from(&ratchet_secret);
+        let ratchet = ratchet_public.to_bytes();
+        let pub_key = destination.identity.as_identity().public_key_bytes();
+        let verifying_key = destination.identity.as_identity().verifying_key_bytes();
+
+        let mut signed_data = PacketDataBuffer::new();
+        signed_data
+            .chain_safe_write(destination.desc.address_hash.as_slice())
+            .chain_safe_write(pub_key)
+            .chain_safe_write(verifying_key)
+            .chain_safe_write(destination.desc.name.as_name_hash_slice())
+            .chain_safe_write(&rand_hash)
+            .chain_safe_write(&ratchet);
+
+        let signature = destination.identity.sign(signed_data.as_slice());
+
+        let mut packet_data = PacketDataBuffer::new();
+        packet_data
+            .chain_safe_write(pub_key)
+            .chain_safe_write(verifying_key)
+            .chain_safe_write(destination.desc.name.as_name_hash_slice())
+            .chain_safe_write(&rand_hash)
+            .chain_safe_write(&ratchet)
+            .chain_safe_write(&signature.to_bytes());
+
+        let mut announce = destination
+            .announce_with_rand_hash(rand_hash, None)
+            .expect("valid announce packet");
+        announce.header.context_flag = ContextFlag::Set;
+        announce.data = packet_data;
+
+        let (output_destination, _) =
+            DestinationAnnounce::validate(&announce).expect("ratchet announce validates");
+        let packet = output_destination
+            .data_packet(b"ratchet encrypted payload")
+            .expect("ratchet-encrypted data packet");
+
+        let ratchet_identity = PrivateIdentity::new(ratchet_secret, destination.sign_key().clone());
+        let mut plain_text = [0u8; crate::packet::PACKET_MDU];
+        let decrypted = ratchet_identity
+            .decrypt_packet(
+                OsRng,
+                packet.data.as_slice(),
+                Some(destination.identity.as_identity().address_hash.as_slice()),
+                &mut plain_text,
+            )
+            .expect("decrypted with ratchet private key");
+
+        assert_eq!(decrypted, b"ratchet encrypted payload");
     }
 
     #[test]

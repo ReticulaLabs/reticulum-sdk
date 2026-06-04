@@ -148,6 +148,17 @@ impl Identity {
         salt: Option<&[u8]>,
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], RnsError> {
+        self.encrypt_packet_to_public_key(rng, &self.public_key, text, salt, out_buf)
+    }
+
+    pub fn encrypt_packet_to_public_key<'a, R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        public_key: &PublicKey,
+        text: &[u8],
+        salt: Option<&[u8]>,
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], RnsError> {
         let ephemeral_key = EphemeralSecret::random_from_rng(rng);
         let ephemeral_public = PublicKey::from(&ephemeral_key);
         let ephemeral_public_bytes = ephemeral_public.as_bytes();
@@ -158,7 +169,7 @@ impl Identity {
 
         out_buf[..ephemeral_public_bytes.len()].copy_from_slice(ephemeral_public_bytes);
 
-        let derived_key = DerivedKey::new(&ephemeral_key.diffie_hellman(&self.public_key), salt);
+        let derived_key = DerivedKey::new(&ephemeral_key.diffie_hellman(public_key), salt);
         let token = Fernet::new_from_slices(
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
