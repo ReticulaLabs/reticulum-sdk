@@ -743,6 +743,17 @@ impl TransportHandler {
         self.single_out_destinations.contains_key(address)
     }
 
+    fn accepts_transport_packet(&self, packet: &Packet) -> bool {
+        if packet.header.packet_type == PacketType::Announce {
+            return true;
+        }
+
+        match packet.transport {
+            Some(transport_id) => transport_id == *self.config.identity.address_hash(),
+            None => true,
+        }
+    }
+
     async fn filter_duplicate_packets(&self, packet: &Packet) -> bool {
         let mut allow_duplicate = false;
 
@@ -1599,6 +1610,19 @@ async fn manage_transport(
                             continue;
                         }
 
+                        if !handler.accepts_transport_packet(&packet) {
+                            log::trace!(
+                                "tp({}): dropping packet for other transport: dst={}, transport={}",
+                                handler.config.name,
+                                packet.destination,
+                                packet
+                                    .transport
+                                    .map(|transport| transport.to_string())
+                                    .unwrap_or_else(|| "None".to_owned()),
+                            );
+                            continue;
+                        }
+
                         if !handler.filter_duplicate_packets(&packet).await {
                             log::debug!(
                                 "tp({}): dropping duplicate packet: dst={}, ctx={:?}, type={:?}",
@@ -1871,6 +1895,33 @@ mod tests {
                 .filter_duplicate_packets(&duplicate)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_packets_for_other_transport_instances() {
+        let local_identity = PrivateIdentity::new_from_name("local transport");
+        let local_transport_id = *local_identity.address_hash();
+        let mut config = TransportConfig::new("transport-filter", &local_identity, true);
+        config.set_retransmit(true);
+
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+        let other_transport_id = AddressHash::new_from_slice(b"other transport instance");
+
+        let mut packet: Packet = Default::default();
+        packet.header.header_type = HeaderType::Type2;
+        packet.header.packet_type = PacketType::Data;
+        packet.header.propagation_type = PropagationType::Transport;
+        packet.transport = Some(other_transport_id);
+
+        assert!(!handler.lock().await.accepts_transport_packet(&packet));
+
+        packet.transport = Some(local_transport_id);
+        assert!(handler.lock().await.accepts_transport_packet(&packet));
+
+        packet.transport = Some(other_transport_id);
+        packet.header.packet_type = PacketType::Announce;
+        assert!(handler.lock().await.accepts_transport_packet(&packet));
     }
 
     #[tokio::test]
