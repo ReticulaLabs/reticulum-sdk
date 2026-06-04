@@ -164,6 +164,17 @@ impl DestinationAnnounce {
         let app_data = &announce_data[offset..];
 
         let destination = &packet.destination;
+        let expected_destination = AddressHash::new_from_hash(&Hash::new(
+            Hash::generator()
+                .chain_update(name_hash)
+                .chain_update(identity.address_hash.as_slice())
+                .finalize()
+                .into(),
+        ));
+
+        if *destination != expected_destination {
+            return Err(RnsError::IncorrectHash);
+        }
 
         // Keeping signed data on stack is only option for now.
         // Verification function doesn't support prehashed message.
@@ -676,6 +687,26 @@ mod tests {
             test_vectors::decode_hex(test_vectors::ANNOUNCE_PACKET_HEX)
         );
         DestinationAnnounce::validate(&announce).expect("announce validates");
+    }
+
+    #[test]
+    fn validate_rejects_announce_with_wrong_destination_hash() {
+        let priv_identity = test_vectors::fixed_private_identity();
+
+        let destination = SingleInputDestination::new(
+            priv_identity,
+            DestinationName::new("example_utilities", "announcesample.fruits"),
+        );
+
+        let mut announce = destination
+            .announce_with_rand_hash(python_announce_rand_hash(), None)
+            .expect("valid announce packet");
+        announce.destination = AddressHash::new_from_slice(b"not the announced destination");
+
+        assert!(matches!(
+            DestinationAnnounce::validate(&announce),
+            Err(crate::error::RnsError::IncorrectHash)
+        ));
     }
 
     #[test]
