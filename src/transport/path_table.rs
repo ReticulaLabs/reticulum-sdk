@@ -162,7 +162,7 @@ self_referential_transport={}",
         }
     }
 
-    pub fn handle_packet(&mut self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
+    pub fn handle_packet(&self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
         if original_packet.header.header_type == HeaderType::Type2 {
             return (*original_packet, None);
         }

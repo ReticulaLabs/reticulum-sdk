@@ -332,14 +332,7 @@ impl Transport {
     }
 
     pub async fn outbound(&self, packet: &Packet) {
-        let (packet, maybe_iface) = self.handler.lock().await.path_table.handle_packet(packet);
-
-        if let Some(iface) = maybe_iface {
-            self.send_direct(iface, packet.clone()).await;
-            log::trace!("Sent outbound packet to {}", iface);
-        }
-
-        // TODO handle other cases
+        self.handler.lock().await.send_packet(*packet).await;
     }
 
     pub fn iface_manager(&self) -> Arc<Mutex<InterfaceManager>> {
@@ -721,12 +714,20 @@ impl Drop for Transport {
 
 impl TransportHandler {
     async fn send_packet(&self, packet: Packet) {
-        let message = TxMessage {
-            tx_type: TxMessageType::Broadcast(None),
-            packet,
+        let (packet, maybe_iface) = self.path_table.handle_packet(&packet);
+        let tx_type = if let Some(iface) = maybe_iface {
+            log::trace!(
+                "tp({}): outbound routed packet to {} over {}",
+                self.config.name,
+                packet.destination,
+                iface,
+            );
+            TxMessageType::Direct(iface)
+        } else {
+            TxMessageType::Broadcast(None)
         };
 
-        self.send(message).await;
+        self.send(TxMessage { tx_type, packet }).await;
     }
 
     async fn send(&self, message: TxMessage) {
@@ -1897,6 +1898,54 @@ mod tests {
         let received = events.recv().await.expect("received data event");
         assert_eq!(received.destination, destination_desc.address_hash);
         assert_eq!(received.data.as_slice(), b"plaintext payload");
+    }
+
+    #[tokio::test]
+    async fn send_packet_uses_known_multihop_path() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let (iface, mut tx) = {
+            let iface_manager = transport.iface_manager();
+            let mut iface_manager = iface_manager.lock().await;
+            let channel = iface_manager.new_channel(4);
+            (*channel.address(), channel.tx_channel)
+        };
+
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("example_utilities", "known.path"),
+        );
+        let mut announce = remote_destination
+            .announce(OsRng, None)
+            .expect("valid announce");
+        let destination = announce.destination;
+        let next_hop = AddressHash::new_from_slice(b"next-hop-transport");
+
+        announce.header.header_type = HeaderType::Type2;
+        announce.header.propagation_type = PropagationType::Transport;
+        announce.header.hops = 1;
+        announce.transport = Some(next_hop);
+
+        handle_announce(&announce, handler.lock().await, iface).await;
+
+        let mut packet: Packet = Default::default();
+        packet.header.destination_type = DestinationType::Single;
+        packet.header.packet_type = PacketType::Data;
+        packet.destination = destination;
+        packet.data = PacketDataBuffer::new_from_slice(b"payload");
+
+        transport.send_packet(packet).await;
+
+        let sent = time::timeout(Duration::from_secs(1), tx.recv())
+            .await
+            .expect("routed packet")
+            .expect("routed packet message");
+
+        assert_eq!(sent.tx_type, TxMessageType::Direct(iface));
+        assert_eq!(sent.packet.header.header_type, HeaderType::Type2);
+        assert_eq!(sent.packet.header.propagation_type, PropagationType::Transport);
+        assert_eq!(sent.packet.destination, destination);
+        assert_eq!(sent.packet.transport, Some(next_hop));
     }
 
     #[tokio::test]
