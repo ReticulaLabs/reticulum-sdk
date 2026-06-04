@@ -31,9 +31,8 @@ impl Serialize for Packet {
         self.header.serialize(buffer)?;
 
         if self.header.header_type == HeaderType::Type2 {
-            if let Some(transport) = &self.transport {
-                transport.serialize(buffer)?;
-            }
+            let transport = self.transport.as_ref().ok_or(RnsError::PacketError)?;
+            transport.serialize(buffer)?;
         }
 
         self.destination.serialize(buffer)?;
@@ -257,6 +256,33 @@ mod tests {
 
         assert!(buffer.offset() <= RETICULUM_MTU);
         assert_eq!(buffer.offset(), RETICULUM_MTU - 1);
+    }
+
+    #[test]
+    fn serialize_rejects_type2_packet_without_transport_id() {
+        let mut output_data = [0u8; RETICULUM_MTU];
+        let mut buffer = OutputBuffer::new(&mut output_data);
+
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type2,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Transport,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 0,
+            },
+            ifac: None,
+            destination: AddressHash::new_from_rand(OsRng),
+            transport: None,
+            context: PacketContext::None,
+            data: StaticBuffer::new(),
+        };
+
+        let result = packet.serialize(&mut buffer);
+
+        assert!(matches!(result, Err(RnsError::PacketError)));
     }
 
     #[test]
