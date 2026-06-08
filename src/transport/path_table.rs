@@ -1,9 +1,20 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use crate::{
+    destination::{NAME_HASH_LENGTH, RAND_HASH_LENGTH},
     hash::{AddressHash, Hash},
+    identity::PUBLIC_KEY_LENGTH,
     packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, PropagationType},
 };
+
+const PATHFINDER_E: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+const MAX_RANDOM_BLOBS: usize = 64;
+const ANNOUNCE_RANDOM_BLOB_OFFSET: usize = PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH;
+
+type RandomBlob = [u8; RAND_HASH_LENGTH];
 
 pub struct PathEntry {
     pub timestamp: Instant,
@@ -11,6 +22,8 @@ pub struct PathEntry {
     pub hops: u8,
     pub iface: AddressHash,
     pub packet_hash: Hash,
+    expires: Instant,
+    random_blobs: Vec<RandomBlob>,
 }
 
 pub struct PathTable {
@@ -63,11 +76,21 @@ impl PathTable {
             return;
         };
 
+        let random_blob = announce_random_blob(announce);
+
         if let Some(existing_entry) = self.map.get(&announce.destination) {
-            if hops > existing_entry.hops {
-                return;
-            }
-            if !self.reroute_eager && hops == existing_entry.hops {
+            let should_install = match random_blob {
+                Some(blob) => existing_entry.should_accept(announce.destination, hops, blob),
+                None => {
+                    if hops > existing_entry.hops {
+                        false
+                    } else {
+                        self.reroute_eager || hops < existing_entry.hops
+                    }
+                }
+            };
+
+            if !should_install {
                 return;
             }
         }
@@ -99,6 +122,12 @@ self_referential_transport={}",
             hops,
             iface,
             packet_hash: announce.hash(),
+            expires: Instant::now() + PATHFINDER_E,
+            random_blobs: self
+                .map
+                .get(&announce.destination)
+                .map(|entry| entry.updated_random_blobs(random_blob))
+                .unwrap_or_else(|| random_blob.into_iter().collect()),
         };
 
         self.map.insert(announce.destination, new_entry);
@@ -200,10 +229,104 @@ self_referential_transport={}",
     }
 }
 
+impl PathEntry {
+    fn should_accept(&self, destination: AddressHash, hops: u8, random_blob: RandomBlob) -> bool {
+        let announce_emitted = timebase_from_random_blob(random_blob);
+        let path_timebase = self.timebase();
+
+        if self.random_blobs.contains(&random_blob) {
+            log::trace!(
+                "path_table reject duplicate announce for {} at timebase {}",
+                destination,
+                announce_emitted
+            );
+            return false;
+        }
+
+        if hops <= self.hops {
+            if announce_emitted > path_timebase {
+                return true;
+            }
+
+            log::trace!(
+                "path_table reject stale announce for {} at timebase {}, current {}",
+                destination,
+                announce_emitted,
+                path_timebase
+            );
+            return false;
+        }
+
+        if Instant::now() >= self.expires {
+            return true;
+        }
+
+        if announce_emitted > path_timebase {
+            return true;
+        }
+
+        log::trace!(
+            "path_table reject longer stale announce for {} at timebase {}, current {}",
+            destination,
+            announce_emitted,
+            path_timebase
+        );
+        false
+    }
+
+    fn timebase(&self) -> u64 {
+        self.random_blobs
+            .iter()
+            .map(|blob| timebase_from_random_blob(*blob))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn updated_random_blobs(&self, random_blob: Option<RandomBlob>) -> Vec<RandomBlob> {
+        let mut random_blobs = self.random_blobs.clone();
+
+        if let Some(blob) = random_blob {
+            if !random_blobs.contains(&blob) {
+                random_blobs.push(blob);
+            }
+        }
+
+        if random_blobs.len() > MAX_RANDOM_BLOBS {
+            random_blobs.drain(0..random_blobs.len() - MAX_RANDOM_BLOBS);
+        }
+
+        random_blobs
+    }
+}
+
+fn announce_random_blob(packet: &Packet) -> Option<RandomBlob> {
+    let data = packet.data.as_slice();
+    let end = ANNOUNCE_RANDOM_BLOB_OFFSET + RAND_HASH_LENGTH;
+    if data.len() < end {
+        return None;
+    }
+
+    data[ANNOUNCE_RANDOM_BLOB_OFFSET..end].try_into().ok()
+}
+
+fn timebase_from_random_blob(random_blob: RandomBlob) -> u64 {
+    u64::from_be_bytes([
+        0,
+        0,
+        0,
+        random_blob[5],
+        random_blob[6],
+        random_blob[7],
+        random_blob[8],
+        random_blob[9],
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::PathTable;
     use crate::{
+        buffer::StaticBuffer,
         hash::AddressHash,
         packet::{
             DestinationType, Header, HeaderType, Packet, PacketContext, PacketType, PropagationType,
@@ -344,5 +467,107 @@ mod tests {
         let (_, forwarded_iface) = table.handle_inbound_packet(&original, None);
 
         assert_eq!(forwarded_iface, None);
+    }
+
+    fn random_blob(prefix: u8, emitted: u64) -> [u8; super::RAND_HASH_LENGTH] {
+        let emitted = emitted.to_be_bytes();
+        [
+            prefix, prefix, prefix, prefix, prefix, emitted[3], emitted[4], emitted[5], emitted[6],
+            emitted[7],
+        ]
+    }
+
+    fn announce_with_random_blob(
+        destination: AddressHash,
+        hops: u8,
+        blob: [u8; super::RAND_HASH_LENGTH],
+    ) -> Packet {
+        let mut data = StaticBuffer::new();
+        data.resize(super::ANNOUNCE_RANDOM_BLOB_OFFSET);
+        data.safe_write(&blob);
+
+        Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                hops,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn duplicate_announce_random_blob_does_not_replace_path() {
+        let destination = AddressHash::new_from_slice(b"replayed-destination");
+        let first_iface = AddressHash::new_from_slice(b"first-iface");
+        let second_iface = AddressHash::new_from_slice(b"second-iface");
+        let mut table = PathTable::new(true);
+        let blob = random_blob(1, 100);
+
+        table.handle_announce(
+            &announce_with_random_blob(destination, 2, blob),
+            None,
+            first_iface,
+        );
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, blob),
+            None,
+            second_iface,
+        );
+
+        let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
+        assert_eq!(iface, first_iface);
+        assert_eq!(hops, 3);
+    }
+
+    #[test]
+    fn older_announce_does_not_replace_path_even_with_shorter_hop_count() {
+        let destination = AddressHash::new_from_slice(b"stale-destination");
+        let first_iface = AddressHash::new_from_slice(b"first-iface");
+        let second_iface = AddressHash::new_from_slice(b"second-iface");
+        let mut table = PathTable::new(true);
+
+        table.handle_announce(
+            &announce_with_random_blob(destination, 2, random_blob(1, 100)),
+            None,
+            first_iface,
+        );
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, random_blob(2, 99)),
+            None,
+            second_iface,
+        );
+
+        let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
+        assert_eq!(iface, first_iface);
+        assert_eq!(hops, 3);
+    }
+
+    #[test]
+    fn newer_equal_hop_announce_replaces_path_without_eager_reroute() {
+        let destination = AddressHash::new_from_slice(b"newer-destination");
+        let first_iface = AddressHash::new_from_slice(b"first-iface");
+        let second_iface = AddressHash::new_from_slice(b"second-iface");
+        let mut table = PathTable::new(false);
+
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, random_blob(1, 100)),
+            None,
+            first_iface,
+        );
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, random_blob(2, 101)),
+            None,
+            second_iface,
+        );
+
+        let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
+        assert_eq!(iface, second_iface);
+        assert_eq!(hops, 2);
     }
 }
