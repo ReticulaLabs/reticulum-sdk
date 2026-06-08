@@ -11,7 +11,6 @@ use x25519_dalek::StaticSecret;
 
 use crate::{
     buffer::OutputBuffer,
-    destination::Destination,
     error::RnsError,
     hash::{AddressHash, Hash, ADDRESS_HASH_SIZE, HASH_SIZE},
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
@@ -25,12 +24,20 @@ use super::DestinationDesc;
 
 const LINK_MTU_SIZE: usize = 3;
 const LINK_MODE_AES256_CBC: u8 = 0x01;
+const CHANNEL_HEADER_SIZE: usize = 6;
+const CHANNEL_SEQUENCE_MAX: u16 = u16::MAX;
+const CHANNEL_SEQUENCE_MODULUS: u32 = CHANNEL_SEQUENCE_MAX as u32 + 1;
+const CHANNEL_WINDOW_MAX: u16 = 48;
 
 fn link_signalling_bytes() -> [u8; LINK_MTU_SIZE] {
     let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
     let signalling_value = (RETICULUM_MTU as u32 & 0x1F_FFFF) + (mode_bits << 16);
     let bytes = signalling_value.to_be_bytes();
     [bytes[1], bytes[2], bytes[3]]
+}
+
+fn channel_sequence_distance(base: u16, sequence: u16) -> u32 {
+    (sequence as u32 + CHANNEL_SEQUENCE_MODULUS - base as u32) % CHANNEL_SEQUENCE_MODULUS
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -131,6 +138,7 @@ pub enum LinkEvent {
     RemoteIdentified(Identity),
     Request(LinkRequest),
     Response(LinkResponse),
+    Channel(ChannelEnvelope),
     Proof(Hash),
     Closed,
 }
@@ -147,6 +155,67 @@ pub struct LinkRequest {
 pub struct LinkResponse {
     pub request_id: AddressHash,
     pub data: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelEnvelope {
+    pub msg_type: u16,
+    pub sequence: u16,
+    pub payload: Vec<u8>,
+}
+
+impl ChannelEnvelope {
+    pub fn new(msg_type: u16, sequence: u16, payload: &[u8]) -> Result<Self, RnsError> {
+        if payload.len() > u16::MAX as usize {
+            return Err(RnsError::OutOfMemory);
+        }
+
+        Ok(Self {
+            msg_type,
+            sequence,
+            payload: payload.to_vec(),
+        })
+    }
+
+    pub fn pack(&self) -> Result<Vec<u8>, RnsError> {
+        if self.payload.len() > u16::MAX as usize {
+            return Err(RnsError::OutOfMemory);
+        }
+
+        let mut raw = Vec::with_capacity(CHANNEL_HEADER_SIZE + self.payload.len());
+        raw.extend_from_slice(&self.msg_type.to_be_bytes());
+        raw.extend_from_slice(&self.sequence.to_be_bytes());
+        raw.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&self.payload);
+        Ok(raw)
+    }
+
+    pub fn unpack(raw: &[u8]) -> Result<Self, RnsError> {
+        if raw.len() < CHANNEL_HEADER_SIZE {
+            return Err(RnsError::PacketError);
+        }
+
+        let msg_type = u16::from_be_bytes([raw[0], raw[1]]);
+        let sequence = u16::from_be_bytes([raw[2], raw[3]]);
+        let payload_len = u16::from_be_bytes([raw[4], raw[5]]) as usize;
+        let payload = &raw[CHANNEL_HEADER_SIZE..];
+        if payload.len() != payload_len {
+            return Err(RnsError::PacketError);
+        }
+
+        Ok(Self {
+            msg_type,
+            sequence,
+            payload: payload.to_vec(),
+        })
+    }
+}
+
+pub trait ChannelMessage: Sized {
+    const MSG_TYPE: u16;
+
+    fn pack(&self) -> Result<Vec<u8>, RnsError>;
+    fn unpack(payload: &[u8]) -> Result<Self, RnsError>;
 }
 
 #[derive(Clone)]
@@ -167,6 +236,9 @@ pub struct Link {
     rtt: Duration,
     event_tx: tokio::sync::broadcast::Sender<LinkEventData>,
     proves_messages: bool,
+    next_channel_sequence: u16,
+    next_rx_channel_sequence: u16,
+    channel_rx_ring: Vec<ChannelEnvelope>,
 }
 
 impl Link {
@@ -185,6 +257,9 @@ impl Link {
             rtt: Duration::from_secs(0),
             event_tx,
             proves_messages: false,
+            next_channel_sequence: 0,
+            next_rx_channel_sequence: 0,
+            channel_rx_ring: Vec::new(),
         }
     }
 
@@ -221,6 +296,9 @@ impl Link {
             rtt: Duration::from_secs(0),
             event_tx,
             proves_messages: false,
+            next_channel_sequence: 0,
+            next_rx_channel_sequence: 0,
+            channel_rx_ring: Vec::new(),
         };
 
         link.handshake(peer_identity);
@@ -372,6 +450,25 @@ impl Link {
                     log::error!("link({}): can't decrypt response packet", self.id);
                 }
             }
+            PacketContext::Channel => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    match ChannelEnvelope::unpack(plain_text) {
+                        Ok(envelope) => {
+                            self.request_time = Instant::now();
+                            self.handle_channel_envelope(envelope);
+                            return LinkHandleResult::MessageReceived(Some(
+                                self.message_proof(packet.hash()),
+                            ));
+                        }
+                        Err(err) => {
+                            log::warn!("link({}): invalid channel packet: {err:?}", self.id);
+                        }
+                    }
+                } else {
+                    log::error!("link({}): can't decrypt channel packet", self.id);
+                }
+            }
             PacketContext::KeepAlive => {
                 if packet.data.len() >= 1 && packet.data.as_slice()[0] == 0xFF {
                     self.request_time = Instant::now();
@@ -470,6 +567,31 @@ impl Link {
         self.encrypted_data_packet(data, PacketContext::None)
     }
 
+    pub fn channel_mdu(&self) -> usize {
+        PACKET_MDU.saturating_sub(CHANNEL_HEADER_SIZE)
+    }
+
+    pub fn channel_packet<M: ChannelMessage>(&mut self, message: &M) -> Result<Packet, RnsError> {
+        let payload = message.pack()?;
+        self.channel_raw_packet(M::MSG_TYPE, &payload)
+    }
+
+    pub fn channel_raw_packet(
+        &mut self,
+        msg_type: u16,
+        payload: &[u8],
+    ) -> Result<Packet, RnsError> {
+        if payload.len() > self.channel_mdu() {
+            return Err(RnsError::OutOfMemory);
+        }
+
+        let sequence = self.next_channel_sequence;
+        self.next_channel_sequence = self.next_channel_sequence.wrapping_add(1);
+        let envelope = ChannelEnvelope::new(msg_type, sequence, payload)?;
+        let raw = envelope.pack()?;
+        self.encrypted_data_packet(&raw, PacketContext::Channel)
+    }
+
     fn encrypted_data_packet(
         &self,
         data: &[u8],
@@ -501,6 +623,50 @@ impl Link {
             context,
             data: packet_data,
         })
+    }
+
+    fn handle_channel_envelope(&mut self, envelope: ChannelEnvelope) {
+        if !self.channel_sequence_in_window(envelope.sequence) {
+            log::trace!(
+                "link({}): invalid channel sequence {}",
+                self.id,
+                envelope.sequence
+            );
+            return;
+        }
+
+        if self
+            .channel_rx_ring
+            .iter()
+            .any(|existing| existing.sequence == envelope.sequence)
+        {
+            log::trace!(
+                "link({}): duplicate channel sequence {}",
+                self.id,
+                envelope.sequence
+            );
+            return;
+        }
+
+        self.channel_rx_ring.push(envelope);
+        self.channel_rx_ring.sort_by_key(|envelope| {
+            channel_sequence_distance(self.next_rx_channel_sequence, envelope.sequence)
+        });
+
+        while let Some(index) = self
+            .channel_rx_ring
+            .iter()
+            .position(|envelope| envelope.sequence == self.next_rx_channel_sequence)
+        {
+            let envelope = self.channel_rx_ring.remove(index);
+            self.next_rx_channel_sequence = self.next_rx_channel_sequence.wrapping_add(1);
+            self.post_event(LinkEvent::Channel(envelope));
+        }
+    }
+
+    fn channel_sequence_in_window(&self, sequence: u16) -> bool {
+        channel_sequence_distance(self.next_rx_channel_sequence, sequence)
+            < CHANNEL_WINDOW_MAX as u32
     }
 
     pub fn identify_packet(&self, identity: &PrivateIdentity) -> Result<Packet, RnsError> {
@@ -886,13 +1052,28 @@ mod tests {
     use x25519_dalek::StaticSecret;
 
     use crate::destination::{DestinationName, SingleInputDestination};
+    use crate::error::RnsError;
     use crate::hash::AddressHash;
     use crate::identity::PrivateIdentity;
     use crate::packet::{DestinationType, PacketContext, PacketType};
     use crate::serde::Serialize;
     use crate::test_vectors;
 
-    use super::{Link, LinkEvent};
+    use super::{ChannelEnvelope, ChannelMessage, Link, LinkEvent, LinkHandleResult};
+
+    struct TestChannelMessage(Vec<u8>);
+
+    impl ChannelMessage for TestChannelMessage {
+        const MSG_TYPE: u16 = 0x1234;
+
+        fn pack(&self) -> Result<Vec<u8>, RnsError> {
+            Ok(self.0.clone())
+        }
+
+        fn unpack(payload: &[u8]) -> Result<Self, RnsError> {
+            Ok(Self(payload.to_vec()))
+        }
+    }
 
     #[test]
     fn prove_emits_lrproof_with_link_destination_type() {
@@ -1019,5 +1200,100 @@ mod tests {
             }
             _ => unreachable!("unexpected link event"),
         }
+    }
+
+    #[test]
+    fn channel_envelope_matches_python_wire_format() {
+        let envelope = ChannelEnvelope::new(0x1234, 0x0002, b"hello").expect("envelope");
+        let raw = envelope.pack().expect("packed envelope");
+
+        assert_eq!(
+            raw,
+            vec![0x12, 0x34, 0x00, 0x02, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o']
+        );
+        assert_eq!(ChannelEnvelope::unpack(&raw).expect("unpacked"), envelope);
+        assert!(ChannelEnvelope::unpack(&raw[..raw.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn channel_packet_uses_channel_context_and_sequence() {
+        let (mut out_link, mut in_link, _out_events, mut in_events) = create_active_link_pair();
+        let message = TestChannelMessage(b"hello".to_vec());
+        let packet = out_link.channel_packet(&message).expect("channel packet");
+
+        assert_eq!(packet.header.destination_type, DestinationType::Link);
+        assert_eq!(packet.header.packet_type, PacketType::Data);
+        assert_eq!(packet.context, PacketContext::Channel);
+
+        match in_link.handle_packet(&packet, false) {
+            LinkHandleResult::MessageReceived(Some(proof)) => {
+                assert_eq!(proof.header.destination_type, DestinationType::Link);
+                assert_eq!(proof.header.packet_type, PacketType::Proof);
+            }
+            _ => unreachable!("channel packet should request a proof"),
+        }
+
+        let event = in_events.try_recv().expect("channel event");
+        match event.event {
+            LinkEvent::Channel(envelope) => {
+                assert_eq!(envelope.msg_type, TestChannelMessage::MSG_TYPE);
+                assert_eq!(envelope.sequence, 0);
+                assert_eq!(envelope.payload, b"hello");
+                let decoded =
+                    TestChannelMessage::unpack(&envelope.payload).expect("decoded channel message");
+                assert_eq!(decoded.0, b"hello");
+            }
+            _ => unreachable!("unexpected link event"),
+        }
+    }
+
+    #[test]
+    fn channel_receive_delivers_contiguous_messages_in_order() {
+        let (mut out_link, mut in_link, _out_events, mut in_events) = create_active_link_pair();
+        let first = out_link
+            .channel_raw_packet(0x1234, b"first")
+            .expect("first channel packet");
+        let second = out_link
+            .channel_raw_packet(0x1234, b"second")
+            .expect("second channel packet");
+
+        assert!(matches!(
+            in_link.handle_packet(&second, false),
+            LinkHandleResult::MessageReceived(Some(_))
+        ));
+        assert!(in_events.try_recv().is_err());
+
+        assert!(matches!(
+            in_link.handle_packet(&first, false),
+            LinkHandleResult::MessageReceived(Some(_))
+        ));
+
+        let event = in_events.try_recv().expect("first channel event");
+        match event.event {
+            LinkEvent::Channel(envelope) => {
+                assert_eq!(envelope.sequence, 0);
+                assert_eq!(envelope.payload, b"first");
+            }
+            _ => unreachable!("unexpected link event"),
+        }
+
+        let event = in_events.try_recv().expect("second channel event");
+        match event.event {
+            LinkEvent::Channel(envelope) => {
+                assert_eq!(envelope.sequence, 1);
+                assert_eq!(envelope.payload, b"second");
+            }
+            _ => unreachable!("unexpected link event"),
+        }
+    }
+
+    #[test]
+    fn channel_packet_accepts_system_message_types() {
+        let (mut out_link, _in_link, _out_events, _in_events) = create_active_link_pair();
+        let packet = out_link
+            .channel_raw_packet(0xff00, b"")
+            .expect("system channel packet");
+
+        assert_eq!(packet.context, PacketContext::Channel);
     }
 }
