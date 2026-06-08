@@ -1265,7 +1265,8 @@ fn handle_shared_rpc_request(request: &Value) -> Value {
 
     if let Some(operation) = shared_rpc_map_str(map, "get") {
         return match operation {
-            "path_table" | "interface_stats" | "rate_table" => Value::Array(vec![]),
+            "path_table" | "rate_table" => Value::Array(vec![]),
+            "interface_stats" => shared_rpc_interface_stats(),
             "next_hop_if_name" => Value::from(""),
             "next_hop" => Value::Boolean(false),
             "packet_rssi" | "packet_snr" | "packet_q" => Value::Boolean(false),
@@ -1311,6 +1312,17 @@ fn handle_shared_rpc_request(request: &Value) -> Value {
 
     log::warn!("share_instance: unsupported RPC request {:?}", request);
     Value::Boolean(false)
+}
+
+fn shared_rpc_interface_stats() -> Value {
+    Value::Map(vec![
+        (Value::from("interfaces"), Value::Array(vec![])),
+        (Value::from("rxb"), Value::from(0)),
+        (Value::from("txb"), Value::from(0)),
+        (Value::from("rxs"), Value::from(0)),
+        (Value::from("txs"), Value::from(0)),
+        (Value::from("rss"), Value::Nil),
+    ])
 }
 
 fn shared_rpc_map_str<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a str> {
@@ -1380,6 +1392,7 @@ fn read_python_pickle_value(data: &[u8]) -> Result<Value, String> {
             b'N' => stack.push(PickleStackItem::Value(Value::Nil)),
             0x88 => stack.push(PickleStackItem::Value(Value::Boolean(true))),
             0x89 => stack.push(PickleStackItem::Value(Value::Boolean(false))),
+            b']' => stack.push(PickleStackItem::Value(Value::Array(vec![]))),
             b'K' => stack.push(PickleStackItem::Value(Value::from(read_pickle_u8(
                 data, &mut index,
             )?))),
@@ -3040,7 +3053,6 @@ mod tests {
     fn shared_rpc_handles_python_client_requests() {
         let expected = [
             ("path_table", Value::Array(vec![])),
-            ("interface_stats", Value::Array(vec![])),
             ("rate_table", Value::Array(vec![])),
             ("next_hop_if_name", Value::from("")),
             ("next_hop", Value::Boolean(false)),
@@ -3069,6 +3081,34 @@ mod tests {
                 "RPC response must not be MessagePack false"
             );
         }
+
+        let request = Value::Map(vec![(Value::from("get"), Value::from("interface_stats"))]);
+        let response = handle_shared_rpc_request(&request);
+        let stats = response.as_map().expect("interface stats dict");
+        assert_eq!(
+            shared_rpc_map_value(stats, "interfaces"),
+            Some(&Value::Array(vec![]))
+        );
+        assert_eq!(
+            shared_rpc_map_value(stats, "rxb").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            shared_rpc_map_value(stats, "txb").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            shared_rpc_map_value(stats, "rxs").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            shared_rpc_map_value(stats, "txs").and_then(Value::as_u64),
+            Some(0)
+        );
+
+        let encoded = write_python_pickle_value(&response).expect("encoded stats response");
+        let decoded = read_python_pickle_value(&encoded).expect("decoded stats response");
+        assert_eq!(decoded, response);
 
         let request = Value::Map(vec![(
             Value::from("destination_data"),
