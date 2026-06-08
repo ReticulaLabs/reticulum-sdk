@@ -1,3 +1,4 @@
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Once;
 use std::time::Duration;
 
@@ -24,12 +25,15 @@ fn setup() {
     });
 }
 
-fn free_local_addr() -> String {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string()
+fn free_local_addrs(count: usize) -> Vec<SocketAddr> {
+    let listeners = (0..count)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect::<Vec<_>>();
+
+    listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap())
+        .collect()
 }
 
 async fn build_transport_full(
@@ -110,9 +114,10 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
 async fn calculate_hop_distance() {
     setup();
 
-    let addr_a = free_local_addr();
-    let addr_b = free_local_addr();
-    let addr_c = free_local_addr();
+    let addrs = free_local_addrs(3);
+    let addr_a = addrs[0].to_string();
+    let addr_b = addrs[1].to_string();
+    let addr_c = addrs[2].to_string();
 
     let mut transport_a = build_transport("a", &addr_a, &[]).await;
     let transport_b = build_transport("b", &addr_b, &[&addr_a]).await;
@@ -139,8 +144,9 @@ async fn calculate_hop_distance() {
 async fn direct_path_request_and_response() {
     setup();
 
-    let addr_a = free_local_addr();
-    let addr_b = free_local_addr();
+    let addrs = free_local_addrs(2);
+    let addr_a = addrs[0].to_string();
+    let addr_b = addrs[1].to_string();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
     let mut transport_b = build_transport("b", &addr_b, &[&addr_a]).await;
@@ -165,9 +171,10 @@ async fn direct_path_request_and_response() {
 async fn remote_path_request_and_response() {
     setup();
 
-    let addr_a = free_local_addr();
-    let addr_b = free_local_addr();
-    let addr_c = free_local_addr();
+    let addrs = free_local_addrs(3);
+    let addr_a = addrs[0].to_string();
+    let addr_b = addrs[1].to_string();
+    let addr_c = addrs[2].to_string();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
     let mut transport_b = build_transport_full("b", &addr_b, &[&addr_a], true).await;
@@ -208,9 +215,10 @@ async fn remote_path_request_and_response() {
 async fn message_proof_over_remote_link() {
     setup();
 
-    let addr_a = free_local_addr();
-    let addr_b = free_local_addr();
-    let addr_c = free_local_addr();
+    let addrs = free_local_addrs(3);
+    let addr_a = addrs[0].to_string();
+    let addr_b = addrs[1].to_string();
+    let addr_c = addrs[2].to_string();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
     let _transport_b = build_transport_full("b", &addr_b, &[&addr_a], true).await;
@@ -305,8 +313,9 @@ async fn recv_expected_proof(
 async fn probe_destination_returns_direct_packet_proof() {
     setup();
 
-    let addr_a = free_local_addr();
-    let addr_b = free_local_addr();
+    let addrs = free_local_addrs(2);
+    let addr_a = addrs[0].to_string();
+    let addr_b = addrs[1].to_string();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
     let transport_b = build_transport_probe("b", &addr_b, &[&addr_a], true, false, true).await;
@@ -342,9 +351,10 @@ async fn probe_destination_returns_direct_packet_proof() {
 async fn probe_destination_returns_multihop_packet_proof() {
     setup();
 
-    let addr_a = free_local_addr();
-    let addr_b = free_local_addr();
-    let addr_c = free_local_addr();
+    let addrs = free_local_addrs(3);
+    let addr_a = addrs[0].to_string();
+    let addr_b = addrs[1].to_string();
+    let addr_c = addrs[2].to_string();
 
     let transport_a = build_transport("a", &addr_a, &[]).await;
     let _transport_b = build_transport_probe("b", &addr_b, &[&addr_a], false, true, false).await;

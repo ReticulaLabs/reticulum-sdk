@@ -1,3 +1,4 @@
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Once;
 use std::time::Duration;
 
@@ -18,12 +19,15 @@ fn setup() {
     });
 }
 
-fn free_local_addr() -> String {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string()
+fn free_local_addrs(count: usize) -> Vec<SocketAddr> {
+    let listeners = (0..count)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect::<Vec<_>>();
+
+    listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap())
+        .collect()
 }
 
 async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) -> Transport {
@@ -55,8 +59,12 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
 async fn packet_overload() {
     setup();
 
-    let transport_a = build_transport("a", "127.0.0.1:8081", &[]).await;
-    let transport_b = build_transport("b", "127.0.0.1:8082", &["127.0.0.1:8081"]).await;
+    let addrs = free_local_addrs(2);
+    let addr_a = addrs[0].to_string();
+    let addr_b = addrs[1].to_string();
+
+    let transport_a = build_transport("a", &addr_a, &[]).await;
+    let transport_b = build_transport("b", &addr_b, &[addr_a.as_str()]).await;
 
     let stop = CancellationToken::new();
 
@@ -126,9 +134,10 @@ async fn packet_overload() {
 async fn unavailable_tcp_client_does_not_block_server_traffic() {
     setup();
 
-    let server_addr_a = free_local_addr();
-    let server_addr_b = free_local_addr();
-    let unavailable_addr = free_local_addr();
+    let addrs = free_local_addrs(3);
+    let server_addr_a = addrs[0].to_string();
+    let server_addr_b = addrs[1].to_string();
+    let unavailable_addr = addrs[2].to_string();
 
     let transport_a = build_transport("a", &server_addr_a, &[&unavailable_addr]).await;
     let transport_b = build_transport("b", &server_addr_b, &[&server_addr_a]).await;

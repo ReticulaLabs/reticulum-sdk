@@ -1,3 +1,4 @@
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Once;
 use std::time::Duration;
 
@@ -15,6 +16,17 @@ fn setup() {
     INIT.call_once(|| {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init()
     });
+}
+
+fn free_local_addrs(count: usize) -> Vec<SocketAddr> {
+    let listeners = (0..count)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect::<Vec<_>>();
+
+    listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap())
+        .collect()
 }
 
 async fn build_transport(
@@ -48,14 +60,18 @@ async fn build_transport(
 async fn discovery_announce_roundtrip() {
     setup();
 
-    let (transport_a, server_iface_a) = build_transport("a", "127.0.0.1:8581", &[]).await;
-    let (transport_b, _server_iface_b) =
-        build_transport("b", "127.0.0.1:8582", &["127.0.0.1:8581"]).await;
+    let addrs = free_local_addrs(2);
+    let addr_a = addrs[0].to_string();
+    let addr_b = addrs[1].to_string();
+    let port_a = addrs[0].port();
+
+    let (transport_a, server_iface_a) = build_transport("a", &addr_a, &[]).await;
+    let (transport_b, _server_iface_b) = build_transport("b", &addr_b, &[addr_a.as_str()]).await;
 
     transport_a
         .register_discoverable_interface(
             server_iface_a,
-            DiscoveryInterfaceConfig::tcp_server("Rust Test Node", "127.0.0.1", 8581),
+            DiscoveryInterfaceConfig::tcp_server("Rust Test Node", "127.0.0.1", port_a),
         )
         .await;
 
@@ -75,7 +91,7 @@ async fn discovery_announce_roundtrip() {
     assert_eq!(discovered.interface_type, "TCPServerInterface");
     assert_eq!(discovered.name, "Rust Test Node");
     assert_eq!(discovered.reachable_on.as_deref(), Some("127.0.0.1"));
-    assert_eq!(discovered.port, Some(8581));
+    assert_eq!(discovered.port, Some(port_a));
     assert!(discovered.stamp_value >= 14);
     assert!(discovered.config_entry.is_some());
 }
