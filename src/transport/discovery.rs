@@ -409,10 +409,14 @@ fn map_value<'a>(map: &'a [(Value, Value)], key: u8) -> Option<&'a Value> {
 fn get_string(map: &[(Value, Value)], key: u8) -> Result<Option<String>, RnsError> {
     match map_value(map, key) {
         Some(Value::Nil) | None => Ok(None),
-        Some(value) => value
+        Some(Value::String(value)) => value
             .as_str()
             .map(|value| Some(value.to_string()))
             .ok_or(RnsError::PacketError),
+        Some(Value::Binary(bytes)) => std::str::from_utf8(bytes)
+            .map(|value| Some(value.to_string()))
+            .map_err(|_| RnsError::PacketError),
+        _ => Err(RnsError::PacketError),
     }
 }
 
@@ -480,5 +484,78 @@ mod tests {
         assert_eq!(decoded.ifac_netname.as_deref(), Some("mesh"));
         assert_eq!(decoded.ifac_netkey.as_deref(), Some("shared-secret"));
         assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);
+    }
+
+    #[test]
+    fn discovery_payload_accepts_unicode_names() {
+        let config = DiscoveryInterfaceConfig::tcp_server("København 測試", "127.0.0.1", 4242)
+            .with_ifac("møøse-net", "nøgle");
+        let transport_id = AddressHash::new_from_slice(b"transport-id");
+        let app_data = config.build_app_data(true, &transport_id).unwrap();
+
+        let source = create_discovery_destination(PrivateIdentity::new_from_name("discovery")).desc;
+        let decoded = DiscoveredInterface::from_announce(source, 1, app_data.as_slice()).unwrap();
+
+        assert_eq!(decoded.name, "København 測試");
+        assert_eq!(decoded.ifac_netname.as_deref(), Some("møøse-net"));
+        assert_eq!(decoded.ifac_netkey.as_deref(), Some("nøgle"));
+        assert!(decoded
+            .config_entry
+            .as_deref()
+            .unwrap()
+            .contains("[[København 測試]]"));
+    }
+
+    #[test]
+    fn discovery_payload_accepts_utf8_binary_names_from_python() {
+        let transport_id = AddressHash::new_from_slice(b"transport-id");
+        let info = vec![
+            (
+                u8_value(KEY_INTERFACE_TYPE),
+                Value::Binary(b"TCPServerInterface".to_vec()),
+            ),
+            (u8_value(KEY_TRANSPORT), Value::Boolean(true)),
+            (
+                u8_value(KEY_TRANSPORT_ID),
+                Value::Binary(transport_id.as_slice().to_vec()),
+            ),
+            (
+                u8_value(KEY_NAME),
+                Value::Binary("København 測試".as_bytes().to_vec()),
+            ),
+            (u8_value(KEY_LATITUDE), Value::Nil),
+            (u8_value(KEY_LONGITUDE), Value::Nil),
+            (u8_value(KEY_HEIGHT), Value::Nil),
+            (
+                u8_value(KEY_REACHABLE_ON),
+                Value::Binary(b"127.0.0.1".to_vec()),
+            ),
+            (u8_value(KEY_PORT), Value::from(4242u16)),
+        ];
+        let app_data = build_test_discovery_app_data(info);
+
+        let source = create_discovery_destination(PrivateIdentity::new_from_name("discovery")).desc;
+        let decoded = DiscoveredInterface::from_announce(source, 1, app_data.as_slice()).unwrap();
+        assert_eq!(decoded.interface_type, "TCPServerInterface");
+        assert_eq!(decoded.name, "København 測試");
+        assert_eq!(decoded.reachable_on.as_deref(), Some("127.0.0.1"));
+    }
+
+    fn build_test_discovery_app_data(info: Vec<(Value, Value)>) -> PacketDataBuffer {
+        let mut packed = Vec::new();
+        write_value(&mut packed, &Value::Map(info)).unwrap();
+        let infohash = Hash::new_from_slice(&packed);
+        let stamp = generate_stamp(
+            infohash.as_slice(),
+            DEFAULT_STAMP_COST,
+            WORKBLOCK_EXPAND_ROUNDS,
+        )
+        .unwrap();
+
+        let mut app_data = PacketDataBuffer::new();
+        app_data.write(&[0u8]).unwrap();
+        app_data.write(&packed).unwrap();
+        app_data.write(&stamp).unwrap();
+        app_data
     }
 }

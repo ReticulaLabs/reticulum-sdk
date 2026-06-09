@@ -71,7 +71,7 @@ async fn discovery_announce_roundtrip() {
     transport_a
         .register_discoverable_interface(
             server_iface_a,
-            DiscoveryInterfaceConfig::tcp_server("Rust Test Node", "127.0.0.1", port_a),
+            DiscoveryInterfaceConfig::tcp_server("Rust Test Nøde 測試", "127.0.0.1", port_a),
         )
         .await;
 
@@ -89,7 +89,7 @@ async fn discovery_announce_roundtrip() {
         .unwrap();
 
     assert_eq!(discovered.interface_type, "TCPServerInterface");
-    assert_eq!(discovered.name, "Rust Test Node");
+    assert_eq!(discovered.name, "Rust Test Nøde 測試");
     assert_eq!(discovered.reachable_on.as_deref(), Some("127.0.0.1"));
     assert_eq!(discovered.port, Some(port_a));
     assert!(discovered.stamp_value >= 14);
