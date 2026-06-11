@@ -52,7 +52,7 @@ impl AnnounceEntry {
             destination: self.packet.destination,
             transport: Some(transport_id.clone()),
             context,
-            data: self.packet.data,
+            data: self.packet.data.clone(),
         };
 
         let tx_type = match self.response_to_iface {

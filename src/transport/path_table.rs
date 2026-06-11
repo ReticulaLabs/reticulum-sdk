@@ -149,11 +149,11 @@ self_referential_transport={}",
 
         let entry = match self.map.get(&lookup) {
             Some(entry) => entry,
-            None => return (*original_packet, None),
+            None => return (original_packet.clone(), None),
         };
 
         let Some(hops) = original_packet.header.hops.checked_add(1) else {
-            return (*original_packet, None);
+            return (original_packet.clone(), None);
         };
 
         let (header_type, propagation_type, transport) = if entry.hops > 1 {
@@ -179,7 +179,7 @@ self_referential_transport={}",
                 destination: original_packet.destination,
                 transport,
                 context: original_packet.context,
-                data: original_packet.data,
+                data: original_packet.data.clone(),
             },
             Some(entry.iface),
         )
@@ -193,22 +193,22 @@ self_referential_transport={}",
 
     pub fn handle_packet(&self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
         if original_packet.header.header_type == HeaderType::Type2 {
-            return (*original_packet, None);
+            return (original_packet.clone(), None);
         }
 
         if original_packet.header.packet_type == PacketType::Announce {
-            return (*original_packet, None);
+            return (original_packet.clone(), None);
         }
 
         if original_packet.header.destination_type == DestinationType::Plain
             || original_packet.header.destination_type == DestinationType::Group
         {
-            return (*original_packet, None);
+            return (original_packet.clone(), None);
         }
 
         let entry = match self.map.get(&original_packet.destination) {
             Some(entry) => entry,
-            None => return (*original_packet, None),
+            None => return (original_packet.clone(), None),
         };
 
         (
@@ -222,7 +222,7 @@ self_referential_transport={}",
                 destination: original_packet.destination,
                 transport: Some(entry.received_from),
                 context: original_packet.context,
-                data: original_packet.data,
+                data: original_packet.data.clone(),
             },
             Some(entry.iface),
         )
@@ -326,10 +326,10 @@ fn timebase_from_random_blob(random_blob: RandomBlob) -> u64 {
 mod tests {
     use super::PathTable;
     use crate::{
-        buffer::StaticBuffer,
         hash::AddressHash,
         packet::{
-            DestinationType, Header, HeaderType, Packet, PacketContext, PacketType, PropagationType,
+            DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer,
+            PacketType, PropagationType,
         },
     };
 
@@ -482,7 +482,7 @@ mod tests {
         hops: u8,
         blob: [u8; super::RAND_HASH_LENGTH],
     ) -> Packet {
-        let mut data = StaticBuffer::new();
+        let mut data = PacketDataBuffer::new();
         data.resize(super::ANNOUNCE_RANDOM_BLOB_OFFSET);
         data.safe_write(&blob);
 

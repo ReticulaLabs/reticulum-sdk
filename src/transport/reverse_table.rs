@@ -21,7 +21,7 @@ fn send_backwards(packet: &Packet, entry: &ReverseEntry) -> (Packet, AddressHash
         destination: packet.destination,
         transport: packet.transport,
         context: packet.context,
-        data: packet.data,
+        data: packet.data.clone(),
     };
 
     (propagated, entry.received_from)

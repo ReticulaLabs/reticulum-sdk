@@ -1,8 +1,8 @@
 use crate::{
-    buffer::{InputBuffer, OutputBuffer, StaticBuffer},
+    buffer::{InputBuffer, OutputBuffer},
     error::RnsError,
     hash::AddressHash,
-    packet::{Header, HeaderType, Packet, PacketContext},
+    packet::{Header, HeaderType, Packet, PacketContext, PacketDataBuffer},
 };
 
 pub trait Serialize {
@@ -87,7 +87,7 @@ impl Packet {
             destination,
             transport,
             context,
-            data: StaticBuffer::new(),
+            data: PacketDataBuffer::new(),
         };
 
         let data_len = buffer.bytes_left();
@@ -102,12 +102,12 @@ mod tests {
     use rand_core::OsRng;
 
     use crate::{
-        buffer::{InputBuffer, OutputBuffer, StaticBuffer},
+        buffer::{InputBuffer, OutputBuffer},
         error::RnsError,
         hash::AddressHash,
         packet::{
             ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
-            PacketType, PropagationType, PACKET_DATA_BUFFER_SIZE, PACKET_MDU, RETICULUM_MTU,
+            PacketDataBuffer, PacketType, PropagationType, PACKET_MDU, RETICULUM_MTU,
         },
         test_vectors,
     };
@@ -247,7 +247,7 @@ mod tests {
             destination: AddressHash::new_from_rand(OsRng),
             transport: Some(AddressHash::new_from_rand(OsRng)),
             context: PacketContext::None,
-            data: StaticBuffer::new(),
+            data: PacketDataBuffer::new(),
         };
 
         packet.data.resize(PACKET_MDU);
@@ -277,7 +277,7 @@ mod tests {
             destination: AddressHash::new_from_rand(OsRng),
             transport: None,
             context: PacketContext::None,
-            data: StaticBuffer::new(),
+            data: PacketDataBuffer::new(),
         };
 
         let result = packet.serialize(&mut buffer);
@@ -286,16 +286,24 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_rejects_oversized_packet_data() {
+    fn deserialize_accepts_high_mtu_packet_data() {
         let mut packet_bytes = Vec::new();
         packet_bytes.extend_from_slice(&[Header::default().to_meta(), 0]);
         packet_bytes.extend_from_slice(AddressHash::new_empty().as_slice());
         packet_bytes.push(PacketContext::None as u8);
-        packet_bytes.resize(packet_bytes.len() + PACKET_DATA_BUFFER_SIZE + 1, 0);
+        let data_len = 2547;
+        packet_bytes.resize(packet_bytes.len() + data_len, 0x42);
 
         let mut input_buffer = InputBuffer::new(&packet_bytes);
-        let result = Packet::deserialize(&mut input_buffer);
+        let packet = Packet::deserialize(&mut input_buffer).expect("deserialized high-MTU packet");
 
-        assert!(matches!(result, Err(RnsError::OutOfMemory)));
+        assert_eq!(packet.data.len(), data_len);
+
+        let mut output_data = vec![0u8; packet_bytes.len()];
+        let mut output_buffer = OutputBuffer::new(&mut output_data);
+        packet
+            .serialize(&mut output_buffer)
+            .expect("reserialized high-MTU packet");
+        assert_eq!(output_buffer.as_slice(), packet_bytes.as_slice());
     }
 }

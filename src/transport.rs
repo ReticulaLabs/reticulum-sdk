@@ -478,7 +478,7 @@ impl Transport {
     }
 
     pub async fn outbound(&self, packet: &Packet) {
-        self.handler.lock().await.send_packet(*packet).await;
+        self.handler.lock().await.send_packet(packet.clone()).await;
     }
 
     pub fn iface_manager(&self) -> Arc<Mutex<InterfaceManager>> {
@@ -564,8 +564,9 @@ impl Transport {
             {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
+                    let packet_hash = packet.hash();
                     handler.send_packet(packet).await;
-                    sent_packets.push(packet.hash());
+                    sent_packets.push(packet_hash);
                 }
             }
         }
@@ -2046,7 +2047,7 @@ is_path_response={}",
                 destination: packet.destination,
                 transport: Some(transport_id),
                 context: PacketContext::PathResponse,
-                data: packet.data,
+                data: packet.data.clone(),
             };
 
             handler
@@ -2085,7 +2086,7 @@ is_path_response={}",
                 destination: packet.destination,
                 transport: Some(transport_id),
                 context: PacketContext::None,
-                data: packet.data,
+                data: packet.data.clone(),
             };
 
             handler
@@ -2485,7 +2486,7 @@ fn create_retransmit_packet(packet: &Packet) -> Packet {
         destination: packet.destination,
         transport: packet.transport,
         context: packet.context,
-        data: packet.data,
+        data: packet.data.clone(),
     }
 }
 
@@ -2524,7 +2525,7 @@ async fn manage_transport(
                         break;
                     },
                     Some(message) = rx_receiver.recv() => {
-                        let _ = iface_messages_tx.send(message);
+                        let _ = iface_messages_tx.send(message.clone());
 
                         let packet = message.packet;
 
@@ -2569,7 +2570,7 @@ async fn manage_transport(
                         if handler.config.broadcast && packet.header.packet_type != PacketType::Announce {
                             // TODO: remove seperate handling for announces in handle_announce.
                             // Send broadcast message expect current iface address
-                            handler.send(TxMessage { tx_type: TxMessageType::Broadcast(Some(message.address)), packet }).await;
+                            handler.send(TxMessage { tx_type: TxMessageType::Broadcast(Some(message.address)), packet: packet.clone() }).await;
                         }
 
                         match packet.header.packet_type {

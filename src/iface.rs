@@ -40,13 +40,13 @@ pub enum TxMessageType {
     Direct(AddressHash),
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct TxMessage {
     pub tx_type: TxMessageType,
     pub packet: Packet,
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct RxMessage {
     pub address: AddressHash, // Address of source interface
     pub packet: Packet,       // Received packet
@@ -419,9 +419,9 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::*;
-    use crate::buffer::StaticBuffer;
     use crate::packet::{
-        ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PacketContext, PropagationType,
+        ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PacketContext,
+        PacketDataBuffer, PropagationType,
     };
 
     fn announce(destination: u8, hops: u8, data: &[u8]) -> TxMessage {
@@ -441,7 +441,7 @@ mod tests {
                 destination: AddressHash::new([destination; 16]),
                 transport: None,
                 context: PacketContext::None,
-                data: StaticBuffer::new_from_slice(data),
+                data: PacketDataBuffer::new_from_slice(data),
             },
         }
     }

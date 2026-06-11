@@ -1,4 +1,5 @@
 use std::cmp;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,8 +9,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
-use crate::iface::{Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU};
-use crate::packet::Packet;
+use crate::iface::{
+    Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU, MAX_AUTOCONFIGURED_HW_MTU,
+};
+use crate::packet::{
+    Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
+};
 use crate::serde::Serialize;
 
 use tokio::io::AsyncReadExt;
@@ -22,6 +27,8 @@ use super::hdlc::Hdlc;
 const PACKET_TRACE: bool = false;
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+const DECODE_FAILURE_HEX_PREVIEW_LEN: usize = 96;
+const TCP_READ_BUFFER_SIZE: usize = 16 * 1024;
 
 pub struct TcpClient {
     addr: String,
@@ -118,19 +125,18 @@ impl TcpClient {
 
             log::info!("tcp_client connected to <{}>", addr);
 
-            const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 2;
-
             // Start receive task
             let rx_task = {
                 let cancel = cancel.clone();
                 let stop = stop.clone();
                 let mut stream = read_stream;
                 let rx_channel = rx_channel.clone();
+                let rx_addr = addr.clone();
 
                 tokio::spawn(async move {
-                    let mut hdlc_rx_buffer = [0u8; BUFFER_SIZE];
-                    let mut rx_buffer = [0u8; BUFFER_SIZE + (BUFFER_SIZE / 2)];
-                    let mut tcp_buffer = [0u8; (BUFFER_SIZE * 16)];
+                    let mut frame_buffer = Vec::with_capacity(DEFAULT_HW_MTU);
+                    let mut hdlc_rx_buffer = Vec::new();
+                    let mut tcp_buffer = [0u8; TCP_READ_BUFFER_SIZE];
 
                     loop {
                         tokio::select! {
@@ -148,36 +154,90 @@ impl TcpClient {
                                             break;
                                         }
                                         Ok(n) => {
-                                            // TCP stream may contain several or partial HDLC frames
-                                            for i in 0..n {
-                                                // Push new byte from the end of buffer
-                                                rx_buffer[BUFFER_SIZE-1] = tcp_buffer[i];
+                                            frame_buffer.extend_from_slice(&tcp_buffer[..n]);
 
-                                                // Check if it is contains a HDLC frame
-                                                let frame = Hdlc::find(&rx_buffer[..]);
-                                                if let Some(frame) = frame {
-                                                    // Decode HDLC frame and deserialize packet
-                                                    let frame_buffer = &mut rx_buffer[frame.0..frame.1+1];
-                                                    let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
-                                                    if let Ok(_) = Hdlc::decode(frame_buffer, &mut output) {
-                                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
-                                                            if PACKET_TRACE {
-                                                                log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
-                                                            }
-                                                            let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
-                                                        } else {
-                                                            log::warn!("tcp_client: couldn't decode packet");
+                                            while let Some(frame) = Hdlc::find(&frame_buffer[..]) {
+                                                let frame_bytes = frame_buffer[frame.0..frame.1 + 1].to_vec();
+                                                frame_buffer.drain(..frame.1 + 1);
+
+                                                hdlc_rx_buffer.resize(frame_bytes.len(), 0);
+                                                let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
+                                                match Hdlc::decode(&frame_bytes, &mut output) {
+                                                    Ok(decoded_len) => {
+                                                        let decoded = output.as_slice();
+                                                        let min_decoded_len = minimum_decoded_packet_len(decoded);
+                                                        if decoded_len < min_decoded_len {
+                                                            log::trace!(
+                                                                "tcp_client: ignored short hdlc frame iface={} peer=<{}> tcp_read_len={} hdlc_frame={}..{} hdlc_frame_len={} decoded_len={} min_decoded_len={} decoded_preview={}",
+                                                                iface_address,
+                                                                rx_addr,
+                                                                n,
+                                                                frame.0,
+                                                                frame.1,
+                                                                frame.1 - frame.0 + 1,
+                                                                decoded_len,
+                                                                min_decoded_len,
+                                                                hex_preview(decoded, DECODE_FAILURE_HEX_PREVIEW_LEN),
+                                                            );
+                                                            continue;
                                                         }
-                                                    } else {
-                                                        log::warn!("tcp_client: couldn't decode hdlc frame");
-                                                    }
 
-                                                    // Remove current HDLC frame data
-                                                    frame_buffer.fill(0);
-                                                } else {
-                                                    // Move data left
-                                                    rx_buffer.copy_within(1.., 0);
+                                                        match Packet::deserialize(&mut InputBuffer::new(decoded)) {
+                                                            Ok(packet) => {
+                                                                if PACKET_TRACE {
+                                                                    log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
+                                                                }
+                                                                let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                                            }
+                                                            Err(err) => {
+                                                                log::warn!(
+                                                                    "tcp_client: couldn't decode packet iface={} peer=<{}> tcp_read_len={} hdlc_frame={}..{} hdlc_frame_len={} decoded_len={} min_decoded_len={} first_byte={} header_hint={} decoded_preview={}",
+                                                                    iface_address,
+                                                                    rx_addr,
+                                                                    n,
+                                                                    frame.0,
+                                                                    frame.1,
+                                                                    frame.1 - frame.0 + 1,
+                                                                    decoded_len,
+                                                                    min_decoded_len,
+                                                                    first_byte_hex(decoded),
+                                                                    header_hint(decoded),
+                                                                    hex_preview(decoded, DECODE_FAILURE_HEX_PREVIEW_LEN),
+                                                                );
+                                                                log::trace!(
+                                                                    "tcp_client: packet decode error iface={} peer=<{}> error={:?}",
+                                                                    iface_address,
+                                                                    rx_addr,
+                                                                    err,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        log::warn!(
+                                                            "tcp_client: couldn't decode hdlc frame iface={} peer=<{}> tcp_read_len={} hdlc_frame={}..{} hdlc_frame_len={} error={:?} frame_preview={}",
+                                                            iface_address,
+                                                            rx_addr,
+                                                            n,
+                                                            frame.0,
+                                                            frame.1,
+                                                            frame.1 - frame.0 + 1,
+                                                            err,
+                                                            hex_preview(&frame_bytes, DECODE_FAILURE_HEX_PREVIEW_LEN),
+                                                        );
+                                                    }
                                                 }
+                                            }
+
+                                            if frame_buffer.len() > MAX_AUTOCONFIGURED_HW_MTU {
+                                                log::warn!(
+                                                    "tcp_client: dropping oversized partial hdlc frame iface={} peer=<{}> buffered_len={} max_len={}",
+                                                    iface_address,
+                                                    rx_addr,
+                                                    frame_buffer.len(),
+                                                    MAX_AUTOCONFIGURED_HW_MTU,
+                                                );
+                                                frame_buffer.clear();
                                             }
                                         }
                                         Err(e) => {
@@ -198,13 +258,13 @@ impl TcpClient {
                 let mut stream = write_stream;
 
                 tokio::spawn(async move {
+                    let mut hdlc_tx_buffer = vec![0u8; MAX_AUTOCONFIGURED_HW_MTU + 2];
+                    let mut tx_buffer = vec![0u8; MAX_AUTOCONFIGURED_HW_MTU];
+
                     loop {
                         if stop.is_cancelled() {
                             break;
                         }
-
-                        let mut hdlc_tx_buffer = [0u8; BUFFER_SIZE];
-                        let mut tx_buffer = [0u8; BUFFER_SIZE];
 
                         let mut tx_channel = tx_channel.lock().await;
 
@@ -220,7 +280,7 @@ impl TcpClient {
                                 if PACKET_TRACE {
                                     log::trace!("tcp_client: tx >> ({}) {}", iface_address, packet);
                                 }
-                                let mut output = OutputBuffer::new(&mut tx_buffer);
+                                let mut output = OutputBuffer::new(&mut tx_buffer[..]);
                                 if let Ok(_) = packet.serialize(&mut output) {
 
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
@@ -250,4 +310,51 @@ impl Interface for TcpClient {
     fn hw_mtu() -> usize {
         DEFAULT_HW_MTU
     }
+}
+
+fn first_byte_hex(data: &[u8]) -> String {
+    match data.first() {
+        Some(byte) => format!("0x{byte:02x}"),
+        None => "none".to_owned(),
+    }
+}
+
+fn header_hint(data: &[u8]) -> String {
+    match data.first() {
+        Some(byte) => {
+            let mut header = Header::from_meta(*byte);
+            if let Some(hops) = data.get(1) {
+                header.hops = *hops;
+            }
+            format!("{header:?}")
+        }
+        None => "none".to_owned(),
+    }
+}
+
+fn minimum_decoded_packet_len(data: &[u8]) -> usize {
+    match data.first() {
+        Some(byte) if Header::from_meta(*byte).header_type == HeaderType::Type2 => {
+            RETICULUM_MAX_HEADER_SIZE
+        }
+        _ => RETICULUM_HEADER_MINSIZE + 1,
+    }
+}
+
+fn hex_preview(data: &[u8], max_len: usize) -> String {
+    let preview_len = data.len().min(max_len);
+    let mut preview = String::with_capacity(preview_len.saturating_mul(3) + 24);
+
+    for (index, byte) in data.iter().take(preview_len).enumerate() {
+        if index > 0 {
+            preview.push(' ');
+        }
+        let _ = write!(&mut preview, "{byte:02x}");
+    }
+
+    if data.len() > preview_len {
+        let _ = write!(&mut preview, " ... +{} bytes", data.len() - preview_len);
+    }
+
+    preview
 }

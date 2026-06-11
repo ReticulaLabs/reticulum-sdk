@@ -2,7 +2,6 @@ use core::fmt;
 
 use sha2::Digest;
 
-use crate::buffer::StaticBuffer;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 
@@ -10,13 +9,13 @@ use crate::hash::Hash;
 // reference also reserves one byte for the minimum IFAC field size when
 // calculating MDU: MDU = MTU - HEADER_MAXSIZE - IFAC_MIN_SIZE.
 pub const RETICULUM_MTU: usize = 500usize;
+pub const RETICULUM_HEADER_MINSIZE: usize = 2 + 1 + 16;
 pub const RETICULUM_MAX_HEADER_SIZE: usize = 35usize;
 pub const RETICULUM_MIN_IFAC_SIZE: usize = 1usize;
 pub const PACKET_MDU: usize = RETICULUM_MTU - RETICULUM_MAX_HEADER_SIZE - RETICULUM_MIN_IFAC_SIZE;
-// Keep packet storage large enough to receive and forward announces with
-// interface-sized app data, while PACKET_MDU remains the conservative payload
-// size for packets that must fit in the fixed Reticulum MTU.
-pub const PACKET_DATA_BUFFER_SIZE: usize = 2048usize;
+// Default scratch capacity for locally-created packet payloads. Received packet
+// payloads are dynamically sized to match the decoded frame.
+pub const DEFAULT_PACKET_DATA_BUFFER_SIZE: usize = 2048usize;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -241,7 +240,87 @@ impl fmt::Display for Header {
     }
 }
 
-pub type PacketDataBuffer = StaticBuffer<PACKET_DATA_BUFFER_SIZE>;
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct PacketDataBuffer {
+    buffer: Vec<u8>,
+}
+
+impl PacketDataBuffer {
+    pub fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    pub fn new_from_slice(data: &[u8]) -> Self {
+        Self {
+            buffer: data.to_vec(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+    }
+
+    pub fn resize(&mut self, len: usize) {
+        self.buffer.resize(len, 0);
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn chain_write(&mut self, data: &[u8]) -> Result<&mut Self, crate::error::RnsError> {
+        self.write(data)?;
+        Ok(self)
+    }
+
+    pub fn finalize(&self) -> Self {
+        self.clone()
+    }
+
+    pub fn safe_write(&mut self, data: &[u8]) -> usize {
+        self.buffer.extend_from_slice(data);
+        data.len()
+    }
+
+    pub fn chain_safe_write(&mut self, data: &[u8]) -> &mut Self {
+        self.safe_write(data);
+        self
+    }
+
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, crate::error::RnsError> {
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer
+    }
+
+    pub fn accuire_buf(&mut self, len: usize) -> &mut [u8] {
+        self.resize(len);
+        self.as_mut_slice()
+    }
+
+    pub fn try_accuire_buf(&mut self, len: usize) -> Result<&mut [u8], crate::error::RnsError> {
+        self.resize(len);
+        Ok(self.as_mut_slice())
+    }
+
+    pub fn accuire_buf_max(&mut self) -> &mut [u8] {
+        self.resize(DEFAULT_PACKET_DATA_BUFFER_SIZE);
+        self.as_mut_slice()
+    }
+}
+
+impl Default for PacketDataBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct PacketIfac {
@@ -264,7 +343,7 @@ impl PacketIfac {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Packet {
     pub header: Header,
     pub ifac: Option<PacketIfac>,
