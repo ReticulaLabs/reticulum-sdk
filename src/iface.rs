@@ -108,6 +108,7 @@ struct LocalInterface {
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
     announce_pacer: Option<AnnouncePacer>,
+    shared_instance_client: bool,
 }
 
 #[derive(Clone)]
@@ -264,13 +265,14 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None)
+        self.new_channel_with_pacer(tx_cap, None, false)
     }
 
     fn new_channel_with_pacer(
         &mut self,
         tx_cap: usize,
         announce_pacer: Option<AnnouncePacer>,
+        shared_instance_client: bool,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -288,6 +290,7 @@ impl InterfaceManager {
             tx_send,
             stop: stop.clone(),
             announce_pacer,
+            shared_instance_client,
         });
 
         InterfaceChannel {
@@ -299,12 +302,20 @@ impl InterfaceManager {
     }
 
     pub fn new_context<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
+        self.new_context_with_options(inner, false)
+    }
+
+    fn new_context_with_options<T: Interface>(
+        &mut self,
+        inner: T,
+        shared_instance_client: bool,
+    ) -> InterfaceContext<T> {
         let bitrate = inner.bitrate();
         let announce_cap = inner.announce_cap();
         let announce_pacer = bitrate
             .filter(|bitrate| *bitrate > 0.0 && announce_cap > 0.0)
             .map(|bitrate| AnnouncePacer::new(bitrate, announce_cap));
-        let channel = self.new_channel_with_pacer(1, announce_pacer);
+        let channel = self.new_channel_with_pacer(1, announce_pacer, shared_instance_client);
 
         let inner = Arc::new(Mutex::new(inner));
 
@@ -331,12 +342,39 @@ impl InterfaceManager {
         address
     }
 
+    pub fn spawn_shared_instance_client<T: Interface, F, R>(
+        &mut self,
+        inner: T,
+        worker: F,
+    ) -> AddressHash
+    where
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+        R::Output: Send + 'static,
+    {
+        let context = self.new_context_with_options(inner, true);
+        let address = context.channel.address().clone();
+
+        task::spawn(worker(context));
+
+        address
+    }
+
     pub fn receiver(&self) -> Arc<tokio::sync::Mutex<InterfaceRxReceiver>> {
         self.rx_recv.clone()
     }
 
     pub fn cleanup(&mut self) {
         self.ifaces.retain(|iface| !iface.stop.is_cancelled());
+    }
+
+    pub fn shared_instance_clients_except(&self, address: AddressHash) -> Vec<AddressHash> {
+        self.ifaces
+            .iter()
+            .filter(|iface| iface.shared_instance_client && !iface.stop.is_cancelled())
+            .filter(|iface| iface.address != address)
+            .map(|iface| iface.address)
+            .collect()
     }
 
     pub async fn send(&self, message: TxMessage) {
@@ -412,7 +450,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer));
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -432,7 +470,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer));
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -457,7 +495,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer));
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;

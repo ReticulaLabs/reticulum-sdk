@@ -1041,7 +1041,7 @@ async fn handle_shared_data_client(
     iface_manager
         .lock()
         .await
-        .spawn(TcpClient::new_from_stream(remote, stream), TcpClient::spawn);
+        .spawn_shared_instance_client(TcpClient::new_from_stream(remote, stream), TcpClient::spawn);
 }
 
 async fn try_handle_shared_data_rpc(
@@ -2120,6 +2120,38 @@ is_path_response={}",
                 packet.destination,
                 response_iface
             );
+        }
+
+        let shared_instance_clients = handler
+            .iface_manager
+            .lock()
+            .await
+            .shared_instance_clients_except(iface);
+        let transport_id = handler.config.identity.address_hash().clone();
+        for local_iface in shared_instance_clients {
+            let local_announce = Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type2,
+                    context_flag: packet.header.context_flag,
+                    propagation_type: PropagationType::Transport,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Announce,
+                    hops: packet.header.hops,
+                },
+                ifac: None,
+                destination: packet.destination,
+                transport: Some(transport_id),
+                context: PacketContext::None,
+                data: packet.data,
+            };
+
+            handler
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(local_iface),
+                    packet: local_announce,
+                })
+                .await;
         }
 
         let retransmit = handler.config.retransmit;
