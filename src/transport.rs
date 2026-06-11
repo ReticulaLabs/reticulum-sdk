@@ -107,8 +107,6 @@ const PY_CONN_CHALLENGE: &[u8] = b"#CHALLENGE#";
 const PY_CONN_WELCOME: &[u8] = b"#WELCOME#";
 const PY_CONN_FAILURE: &[u8] = b"#FAILURE#";
 const PY_CONN_AUTH_MAX_FRAME: usize = 256;
-const SHARED_DATA_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
-const SHARED_DATA_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const PY_CONN_MUTUAL_AUTH_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
@@ -920,7 +918,6 @@ fn start_tcp_shared_instance(
                 listener,
                 iface_manager,
                 cancel.clone(),
-                config.rpc_key.clone(),
             );
             start_tcp_shared_rpc(config, cancel);
             log::debug!("tp({}): started shared instance on {}", config.name, addr);
@@ -959,7 +956,6 @@ fn start_tcp_shared_data_listener(
     listener: StdTcpListener,
     iface_manager: Arc<Mutex<InterfaceManager>>,
     cancel: CancellationToken,
-    auth_key: Option<Vec<u8>>,
 ) {
     tokio::spawn(async move {
         let listener = match listener
@@ -1000,9 +996,8 @@ fn start_tcp_shared_data_listener(
                                 addr
                             );
                             let iface_manager = iface_manager.clone();
-                            let auth_key = auth_key.clone();
                             tokio::spawn(async move {
-                                handle_shared_data_client(stream, remote.to_string(), iface_manager, auth_key.as_deref()).await;
+                                handle_shared_data_client(stream, remote.to_string(), iface_manager).await;
                             });
                         }
                         Err(error) => {
@@ -1020,67 +1015,14 @@ fn start_tcp_shared_data_listener(
 }
 
 async fn handle_shared_data_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     remote: String,
     iface_manager: Arc<Mutex<InterfaceManager>>,
-    auth_key: Option<&[u8]>,
 ) {
-    match try_handle_shared_data_rpc(&mut stream, auth_key).await {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            log::warn!(
-                "share_instance: data-port RPC client <{}> failed: {}",
-                remote,
-                error
-            );
-            return;
-        }
-    }
-
     iface_manager
         .lock()
         .await
         .spawn_shared_instance_client(TcpClient::new_from_stream(remote, stream), TcpClient::spawn);
-}
-
-async fn try_handle_shared_data_rpc(
-    stream: &mut TcpStream,
-    auth_key: Option<&[u8]>,
-) -> Result<bool, String> {
-    let challenge = shared_rpc_challenge();
-    write_py_connection_frame(stream, &challenge).await?;
-
-    let Some(response) = read_py_connection_frame_if_ready(
-        stream,
-        PY_CONN_AUTH_MAX_FRAME,
-        SHARED_DATA_AUTH_PROBE_TIMEOUT,
-    )
-    .await?
-    else {
-        return Ok(false);
-    };
-
-    if !shared_rpc_response_is_authenticated(&challenge, &response, auth_key)? {
-        let _ = write_py_connection_frame(stream, PY_CONN_FAILURE).await;
-        return Err("authentication failed".into());
-    }
-
-    write_py_connection_frame(stream, PY_CONN_WELCOME).await?;
-    shared_rpc_answer_peer_challenge(stream, auth_key).await?;
-
-    let request = time::timeout(
-        SHARED_DATA_RPC_TIMEOUT,
-        read_py_connection_frame(stream, 64 * 1024),
-    )
-    .await
-    .map_err(|_| "timed out waiting for data-port RPC request".to_string())??;
-    let request = read_python_pickle_value(&request)?;
-    let response = handle_shared_rpc_request(&request);
-
-    let encoded = write_python_pickle_value(&response)?;
-    write_py_connection_frame(stream, &encoded).await?;
-    Ok(true)
 }
 
 fn start_tcp_shared_rpc(config: &TransportConfig, cancel: CancellationToken) {
@@ -2956,18 +2898,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_data_port_accepts_python_connection_auth_probe() {
+    async fn shared_data_port_does_not_write_rpc_auth_probe_to_hdlc_clients() {
         let Some(ports) = free_local_ports(2) else {
-            eprintln!("skipping shared data-port auth test; TCP bind unavailable");
+            eprintln!("skipping shared data-port silence test; TCP bind unavailable");
             return;
         };
 
-        let rpc_key = b"test-rpc-key".to_vec();
         let mut config = TransportConfig::default();
         config.set_share_instance(true);
         config.set_shared_instance_port(ports[0]);
         config.set_instance_control_port(ports[1]);
-        config.set_rpc_key(rpc_key.clone());
         let _transport = Transport::new(config);
 
         let addr = format!("127.0.0.1:{}", ports[0]);
@@ -2983,39 +2923,9 @@ mod tests {
         }
         let mut stream = stream.expect("shared data listener accepts connection");
 
-        let challenge = read_py_connection_frame(&mut stream, PY_CONN_AUTH_MAX_FRAME)
-            .await
-            .expect("challenge frame");
-        assert!(challenge.starts_with(PY_CONN_CHALLENGE));
-        let response = shared_rpc_hmac_response(&rpc_key, &challenge[PY_CONN_CHALLENGE.len()..])
-            .expect("hmac response");
-        write_py_connection_frame(&mut stream, &response)
-            .await
-            .expect("response frame");
-
-        let welcome = read_py_connection_frame(&mut stream, PY_CONN_AUTH_MAX_FRAME)
-            .await
-            .expect("welcome frame");
-        assert_eq!(welcome.as_slice(), PY_CONN_WELCOME);
-        complete_client_side_mutual_auth(&mut stream, &rpc_key).await;
-
-        let request = Value::Map(vec![
-            (Value::from("get"), Value::from("first_hop_timeout")),
-            (
-                Value::from("destination_hash"),
-                Value::Binary(vec![0u8; crate::hash::ADDRESS_HASH_SIZE]),
-            ),
-        ]);
-        let encoded = write_python_pickle_value(&request).expect("encoded request");
-        write_py_connection_frame(&mut stream, &encoded)
-            .await
-            .expect("request frame");
-
-        let response = read_py_connection_frame(&mut stream, 256)
-            .await
-            .expect("response frame");
-        let response = read_python_pickle_value(&response).expect("decoded response");
-        assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
+        let mut buffer = [0u8; 1];
+        let read = time::timeout(Duration::from_millis(250), stream.read(&mut buffer)).await;
+        assert!(read.is_err(), "shared data port wrote non-HDLC bytes");
     }
 
     #[tokio::test]
