@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use ed25519_dalek::{Signature, SigningKey, Verifier, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use ed25519_dalek::{Signature, SigningKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use rand_core::OsRng;
 use rmpv::{decode::read_value, encode::write_value, Value};
 use sha2::Digest;
@@ -555,7 +555,7 @@ impl Link {
         }
 
         if self.status == LinkStatus::Active && packet.context == PacketContext::None {
-            if let Ok(hash) = validate_message_proof(&self.destination, packet.data.as_slice()) {
+            if let Ok(hash) = validate_message_proof(&self.peer_identity, packet.data.as_slice()) {
                 self.post_event(LinkEvent::Proof(hash));
             }
         }
@@ -968,7 +968,7 @@ fn validate_proof_packet(
     Ok(identity)
 }
 
-fn validate_message_proof(destination: &DestinationDesc, data: &[u8]) -> Result<Hash, RnsError> {
+fn validate_message_proof(peer_identity: &Identity, data: &[u8]) -> Result<Hash, RnsError> {
     if data.len() <= HASH_SIZE {
         return Err(RnsError::PacketError);
     }
@@ -981,12 +981,7 @@ fn validate_message_proof(destination: &DestinationDesc, data: &[u8]) -> Result<
 
     let hash_slice = &data[..HASH_SIZE];
 
-    if destination
-        .identity
-        .verifying_key
-        .verify(hash_slice, &signature)
-        .is_ok()
-    {
+    if peer_identity.verify(hash_slice, &signature).is_ok() {
         Ok(Hash::new(hash_slice.try_into().unwrap()))
     } else {
         Err(RnsError::IncorrectSignature)
@@ -1259,6 +1254,31 @@ mod tests {
             out_link.data_packet(&payload),
             Err(RnsError::OutOfMemory)
         ));
+    }
+
+    #[test]
+    fn destination_side_validates_initiator_signed_message_proofs() {
+        let (mut out_link, mut in_link, _out_events, mut in_events) = create_active_link_pair();
+        out_link.prove_messages(true);
+
+        let packet = in_link
+            .data_packet(b"message from destination")
+            .expect("link packet");
+        let expected_hash = packet.hash();
+        let proof = match out_link.handle_packet(&packet, true) {
+            LinkHandleResult::MessageReceived(Some(proof)) => proof,
+            _ => unreachable!("initiator should prove received message"),
+        };
+
+        assert!(matches!(
+            in_link.handle_packet(&proof, false),
+            LinkHandleResult::None
+        ));
+        let event = in_events.try_recv().expect("proof event");
+        match event.event {
+            LinkEvent::Proof(hash) => assert_eq!(hash, expected_hash),
+            _ => unreachable!("unexpected link event"),
+        }
     }
 
     #[test]
