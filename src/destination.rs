@@ -13,7 +13,7 @@ use crate::{
     identity::{EmptyIdentity, HashIdentity, Identity, PrivateIdentity, PUBLIC_KEY_LENGTH},
     packet::{
         self, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
-        PacketDataBuffer, PacketType, PropagationType,
+        PacketDataBuffer, PacketType, PropagationType, ENCRYPTED_PACKET_MDU,
     },
 };
 use sha2::Digest;
@@ -511,6 +511,10 @@ impl Destination<Identity, Output, Single> {
     }
 
     pub fn data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
+        if data.len() > ENCRYPTED_PACKET_MDU {
+            return Err(RnsError::OutOfMemory);
+        }
+
         let mut packet_data = PacketDataBuffer::new();
 
         let cipher_text_len = {
@@ -594,7 +598,9 @@ mod tests {
     use crate::buffer::OutputBuffer;
     use crate::hash::{AddressHash, Hash};
     use crate::identity::{PrivateIdentity, PUBLIC_KEY_LENGTH};
-    use crate::packet::{ContextFlag, PacketContext, PacketDataBuffer, PacketType};
+    use crate::packet::{
+        ContextFlag, PacketContext, PacketDataBuffer, PacketType, ENCRYPTED_PACKET_MDU,
+    };
     use crate::serde::Serialize;
     use crate::test_vectors;
 
@@ -936,5 +942,22 @@ mod tests {
             .expect("decrypted single packet");
 
         assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn single_packet_rejects_payload_over_encrypted_mdu() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let input_destination = SingleInputDestination::new(
+            identity,
+            DestinationName::new("example_utilities", "single.mdu"),
+        );
+        let output_destination =
+            super::SingleOutputDestination::new_from_desc(input_destination.desc);
+        let payload = vec![0x42u8; ENCRYPTED_PACKET_MDU + 1];
+
+        assert!(matches!(
+            output_destination.data_packet(&payload),
+            Err(crate::error::RnsError::OutOfMemory)
+        ));
     }
 }

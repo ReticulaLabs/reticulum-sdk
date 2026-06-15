@@ -13,10 +13,25 @@ pub const RETICULUM_HEADER_MINSIZE: usize = 2 + 1 + 16;
 pub const RETICULUM_MAX_HEADER_SIZE: usize = 35usize;
 pub const RETICULUM_MIN_IFAC_SIZE: usize = 1usize;
 pub const PACKET_MDU: usize = RETICULUM_MTU - RETICULUM_MAX_HEADER_SIZE - RETICULUM_MIN_IFAC_SIZE;
+pub const RETICULUM_TOKEN_OVERHEAD: usize = 48usize;
+pub const RETICULUM_AES_BLOCK_SIZE: usize = 16usize;
+pub const RETICULUM_EC_PUBLIC_KEY_SIZE: usize = 32usize;
+pub const ENCRYPTED_PACKET_MDU: usize =
+    encrypted_payload_mdu(RETICULUM_MAX_HEADER_SIZE, RETICULUM_EC_PUBLIC_KEY_SIZE);
+pub const LINK_PACKET_MDU: usize = encrypted_payload_mdu(RETICULUM_HEADER_MINSIZE, 0);
 // Default scratch capacity for locally-created packet payloads. Received packet
 // payloads are dynamically sized to match the decoded frame.
 pub const DEFAULT_PACKET_DATA_BUFFER_SIZE: usize = 2048usize;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
+
+const fn encrypted_payload_mdu(header_size: usize, cleartext_overhead: usize) -> usize {
+    let available = RETICULUM_MTU
+        - RETICULUM_MIN_IFAC_SIZE
+        - header_size
+        - RETICULUM_TOKEN_OVERHEAD
+        - cleartext_overhead;
+    (available / RETICULUM_AES_BLOCK_SIZE) * RETICULUM_AES_BLOCK_SIZE - 1
+}
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum IfacFlag {

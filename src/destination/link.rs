@@ -15,8 +15,8 @@ use crate::{
     hash::{AddressHash, Hash, ADDRESS_HASH_SIZE, HASH_SIZE},
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
-        DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
-        RETICULUM_MTU,
+        DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType,
+        LINK_PACKET_MDU, PACKET_MDU, RETICULUM_MTU,
     },
 };
 
@@ -568,7 +568,7 @@ impl Link {
     }
 
     pub fn channel_mdu(&self) -> usize {
-        PACKET_MDU.saturating_sub(CHANNEL_HEADER_SIZE)
+        LINK_PACKET_MDU.saturating_sub(CHANNEL_HEADER_SIZE)
     }
 
     pub fn channel_packet<M: ChannelMessage>(&mut self, message: &M) -> Result<Packet, RnsError> {
@@ -600,6 +600,9 @@ impl Link {
         if self.status != LinkStatus::Active && self.status != LinkStatus::Stale {
             log::warn!("link: can't create data packet for closed link");
             return Err(RnsError::LinkClosed);
+        }
+        if data.len() > LINK_PACKET_MDU {
+            return Err(RnsError::OutOfMemory);
         }
 
         let mut packet_data = PacketDataBuffer::new();
@@ -704,7 +707,7 @@ impl Link {
             data,
         ]);
         let packed_request = encode_msgpack(&request)?;
-        if packed_request.len() > PACKET_MDU {
+        if packed_request.len() > LINK_PACKET_MDU {
             return Err(RnsError::OutOfMemory);
         }
 
@@ -718,7 +721,7 @@ impl Link {
     ) -> Result<Packet, RnsError> {
         let response = Value::Array(vec![Value::Binary(request_id.as_slice().to_vec()), data]);
         let packed_response = encode_msgpack(&response)?;
-        if packed_response.len() > PACKET_MDU {
+        if packed_response.len() > LINK_PACKET_MDU {
             return Err(RnsError::OutOfMemory);
         }
 
@@ -1055,7 +1058,7 @@ mod tests {
     use crate::error::RnsError;
     use crate::hash::AddressHash;
     use crate::identity::PrivateIdentity;
-    use crate::packet::{DestinationType, PacketContext, PacketType};
+    use crate::packet::{DestinationType, PacketContext, PacketType, LINK_PACKET_MDU};
     use crate::serde::Serialize;
     use crate::test_vectors;
 
@@ -1245,6 +1248,27 @@ mod tests {
             }
             _ => unreachable!("unexpected link event"),
         }
+    }
+
+    #[test]
+    fn link_packets_reject_payloads_over_link_mdu() {
+        let (out_link, _in_link, _out_events, _in_events) = create_active_link_pair();
+        let payload = vec![0x42u8; LINK_PACKET_MDU + 1];
+
+        assert!(matches!(
+            out_link.data_packet(&payload),
+            Err(RnsError::OutOfMemory)
+        ));
+    }
+
+    #[test]
+    fn channel_mdu_reserves_channel_header_from_link_mdu() {
+        let (out_link, _in_link, _out_events, _in_events) = create_active_link_pair();
+
+        assert_eq!(
+            out_link.channel_mdu(),
+            LINK_PACKET_MDU - super::CHANNEL_HEADER_SIZE
+        );
     }
 
     #[test]
