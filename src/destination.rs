@@ -118,6 +118,10 @@ impl DestinationAnnounce {
             return Err(RnsError::PacketError);
         }
 
+        if packet.header.destination_type != DestinationType::Single {
+            return Err(RnsError::PacketError);
+        }
+
         let announce_data = packet.data.as_slice();
 
         if announce_data.len() < MIN_ANNOUNCE_DATA_LENGTH {
@@ -731,6 +735,26 @@ mod tests {
         assert!(matches!(
             DestinationAnnounce::validate(&announce),
             Err(crate::error::RnsError::IncorrectHash)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_announce_with_non_single_destination_type() {
+        let priv_identity = test_vectors::fixed_private_identity();
+
+        let destination = SingleInputDestination::new(
+            priv_identity,
+            DestinationName::new("example_utilities", "announcesample.fruits"),
+        );
+
+        let mut announce = destination
+            .announce_with_rand_hash(python_announce_rand_hash(), None)
+            .expect("valid announce packet");
+        announce.header.destination_type = crate::packet::DestinationType::Plain;
+
+        assert!(matches!(
+            DestinationAnnounce::validate(&announce),
+            Err(crate::error::RnsError::PacketError)
         ));
     }
 
