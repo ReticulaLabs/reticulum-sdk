@@ -33,6 +33,7 @@ pub type InterfaceRxReceiver = mpsc::Receiver<RxMessage>;
 pub const DEFAULT_HW_MTU: usize = 2048;
 pub const MAX_AUTOCONFIGURED_HW_MTU: usize = 524_288;
 const DEFAULT_ANNOUNCE_CAP: f64 = 0.02;
+const DEFAULT_INTERFACE_TX_QUEUE_CAP: usize = 128;
 const MAX_QUEUED_ANNOUNCES: usize = 16_384;
 const INTERFACE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -338,7 +339,11 @@ impl InterfaceManager {
         let announce_pacer = bitrate
             .filter(|bitrate| *bitrate > 0.0 && announce_cap > 0.0)
             .map(|bitrate| AnnouncePacer::new(bitrate, announce_cap));
-        let channel = self.new_channel_with_pacer(1, announce_pacer, shared_instance_client);
+        let channel = self.new_channel_with_pacer(
+            DEFAULT_INTERFACE_TX_QUEUE_CAP,
+            announce_pacer,
+            shared_instance_client,
+        );
 
         let inner = Arc::new(Mutex::new(inner));
 
@@ -512,6 +517,34 @@ mod tests {
         )
         .await
         .expect("send blocked behind a saturated interface queue");
+    }
+
+    #[tokio::test]
+    async fn spawned_interface_tx_queue_handles_short_bursts() {
+        struct TestInterface;
+
+        impl Interface for TestInterface {
+            fn hw_mtu() -> usize {
+                DEFAULT_HW_MTU
+            }
+        }
+
+        let mut manager = InterfaceManager::new(1);
+        let context = manager.new_context(TestInterface);
+        let mut receiver = context.channel.tx_channel;
+
+        for _ in 0..DEFAULT_INTERFACE_TX_QUEUE_CAP {
+            manager
+                .send(TxMessage {
+                    tx_type: TxMessageType::Broadcast(None),
+                    packet: Packet::default(),
+                })
+                .await;
+        }
+
+        for _ in 0..DEFAULT_INTERFACE_TX_QUEUE_CAP {
+            assert!(receiver.try_recv().is_ok());
+        }
     }
 
     #[tokio::test(start_paused = true)]
