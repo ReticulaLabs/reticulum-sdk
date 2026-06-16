@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task;
 use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +34,7 @@ pub const DEFAULT_HW_MTU: usize = 2048;
 pub const MAX_AUTOCONFIGURED_HW_MTU: usize = 524_288;
 const DEFAULT_ANNOUNCE_CAP: f64 = 0.02;
 const MAX_QUEUED_ANNOUNCES: usize = 16_384;
+const INTERFACE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TxMessageType {
@@ -161,7 +163,7 @@ impl AnnouncePacer {
 
     async fn send(&self, tx_send: InterfaceTxSender, stop: CancellationToken, message: TxMessage) {
         let Some(wait_time) = self.wait_time(&message.packet) else {
-            let _ = tx_send.send(message).await;
+            send_or_drop(&tx_send, message).await;
             return;
         };
 
@@ -171,7 +173,7 @@ impl AnnouncePacer {
             state.announce_allowed_at = now + wait_time;
             drop(state);
 
-            let _ = tx_send.send(message).await;
+            send_or_drop(&tx_send, message).await;
             return;
         }
 
@@ -232,7 +234,28 @@ async fn process_announce_queue(
             return;
         };
 
-        let _ = tx_send.send(message).await;
+        send_or_drop(&tx_send, message).await;
+    }
+}
+
+async fn send_or_drop(tx_send: &InterfaceTxSender, message: TxMessage) {
+    match tx_send.try_send(message) {
+        Ok(()) => {}
+        Err(TrySendError::Full(message)) => {
+            let tx_type = message.tx_type;
+            if time::timeout(INTERFACE_SEND_TIMEOUT, tx_send.send(message))
+                .await
+                .is_err()
+            {
+                log::warn!(
+                    "iface: dropping outbound packet for saturated interface queue tx_type={:?}",
+                    tx_type
+                );
+            }
+        }
+        Err(TrySendError::Closed(_)) => {
+            log::trace!("iface: dropping outbound packet for closed interface queue");
+        }
     }
 }
 
@@ -401,7 +424,7 @@ impl InterfaceManager {
                         .send(iface.tx_send.clone(), iface.stop.clone(), message.clone())
                         .await;
                 } else {
-                    let _ = iface.tx_send.send(message.clone()).await;
+                    send_or_drop(&iface.tx_send, message.clone()).await;
                 }
             }
         }
@@ -464,6 +487,31 @@ mod tests {
             receiver.try_recv().unwrap().packet.destination,
             AddressHash::new([2; 16])
         );
+    }
+
+    #[tokio::test]
+    async fn saturated_interface_queue_drops_instead_of_blocking() {
+        let mut manager = InterfaceManager::new(1);
+        let channel = manager.new_channel(1);
+        let iface = channel.address;
+        let _receiver = channel.tx_channel;
+
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(iface),
+                packet: Packet::default(),
+            })
+            .await;
+
+        time::timeout(
+            Duration::from_millis(500),
+            manager.send(TxMessage {
+                tx_type: TxMessageType::Direct(iface),
+                packet: Packet::default(),
+            }),
+        )
+        .await
+        .expect("send blocked behind a saturated interface queue");
     }
 
     #[tokio::test(start_paused = true)]
