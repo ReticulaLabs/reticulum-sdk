@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::error::RnsError;
-use crate::iface::DEFAULT_HW_MTU;
+use crate::iface::{configured_bitrate, DEFAULT_HW_MTU};
 
 use super::tcp_client::TcpClient;
 use super::{Interface, InterfaceContext, InterfaceManager};
@@ -15,6 +15,7 @@ pub struct TcpServer {
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     listener: Option<StdTcpListener>,
     accept_trace_label: Option<String>,
+    bitrate: Option<f64>,
 }
 
 impl TcpServer {
@@ -27,6 +28,7 @@ impl TcpServer {
             iface_manager,
             listener: None,
             accept_trace_label: None,
+            bitrate: None,
         }
     }
 
@@ -40,7 +42,13 @@ impl TcpServer {
             iface_manager,
             listener: Some(listener),
             accept_trace_label: None,
+            bitrate: None,
         }
+    }
+
+    pub fn with_bitrate(mut self, bitrate: f64) -> Self {
+        self.bitrate = configured_bitrate(bitrate);
+        self
     }
 
     pub fn with_accept_trace_label<T: Into<String>>(mut self, label: T) -> Self {
@@ -54,6 +62,7 @@ impl TcpServer {
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
         let mut listener = { context.inner.lock().unwrap().listener.take() };
         let accept_trace_label = { context.inner.lock().unwrap().accept_trace_label.clone() };
+        let bitrate = { context.inner.lock().unwrap().bitrate };
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -140,7 +149,8 @@ impl TcpServer {
                             let mut iface_manager = iface_manager.lock().await;
 
                             iface_manager.spawn(
-                                TcpClient::new_from_stream(client.1.to_string(), client.0),
+                                TcpClient::new_from_stream(client.1.to_string(), client.0)
+                                    .with_optional_bitrate(bitrate),
                                 TcpClient::spawn,
                             );
                         }
@@ -156,5 +166,33 @@ impl TcpServer {
 impl Interface for TcpServer {
     fn hw_mtu() -> usize {
         DEFAULT_HW_MTU
+    }
+
+    fn bitrate(&self) -> Option<f64> {
+        self.bitrate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn bitrate_defaults_to_unreported() {
+        let iface_manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(1)));
+        assert_eq!(TcpServer::new("127.0.0.1:0", iface_manager).bitrate(), None);
+    }
+
+    #[test]
+    fn bitrate_can_be_configured() {
+        let iface_manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(1)));
+        assert_eq!(
+            TcpServer::new("127.0.0.1:0", iface_manager)
+                .with_bitrate(2_000_000.0)
+                .bitrate(),
+            Some(2_000_000.0)
+        );
     }
 }

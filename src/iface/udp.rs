@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
-use crate::iface::{Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU};
+use crate::iface::{configured_bitrate, Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU};
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -15,6 +15,7 @@ const PACKET_TRACE: bool = true;
 pub struct UdpInterface {
     bind_addr: String,
     forward_addr: Option<String>,
+    bitrate: Option<f64>,
 }
 
 impl UdpInterface {
@@ -22,7 +23,13 @@ impl UdpInterface {
         Self {
             bind_addr: bind_addr.into(),
             forward_addr: forward_addr.map(Into::into),
+            bitrate: None,
         }
+    }
+
+    pub fn with_bitrate(mut self, bitrate: f64) -> Self {
+        self.bitrate = configured_bitrate(bitrate);
+        self
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -156,5 +163,29 @@ impl UdpInterface {
 impl Interface for UdpInterface {
     fn hw_mtu() -> usize {
         DEFAULT_HW_MTU
+    }
+
+    fn bitrate(&self) -> Option<f64> {
+        self.bitrate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitrate_defaults_to_unreported() {
+        assert_eq!(UdpInterface::new("127.0.0.1:0", None).bitrate(), None);
+    }
+
+    #[test]
+    fn bitrate_can_be_configured() {
+        assert_eq!(
+            UdpInterface::new("127.0.0.1:0", None)
+                .with_bitrate(10_000_000.0)
+                .bitrate(),
+            Some(10_000_000.0)
+        );
     }
 }

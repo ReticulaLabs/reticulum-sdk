@@ -244,6 +244,14 @@ impl Interface for KissInterface {
     fn hw_mtu() -> usize {
         HW_MTU
     }
+
+    fn bitrate(&self) -> Option<f64> {
+        if self.speed > 0 {
+            Some(self.speed as f64)
+        } else {
+            None
+        }
+    }
 }
 
 async fn configure_device<W>(serial: &mut W, config: &KissInterface) -> io::Result<()>
@@ -676,5 +684,26 @@ mod tests {
     fn clamps_ten_millisecond_config_values() {
         assert_eq!(scale_10ms(350), 35);
         assert_eq!(scale_10ms(3_000), 255);
+    }
+
+    #[test]
+    fn reports_serial_speed_as_bitrate() {
+        assert_eq!(KissInterface::new("/dev/null").bitrate(), Some(9_600.0));
+        assert_eq!(
+            KissInterface::new("/dev/null")
+                .with_serial_params(38_400, 8, KissParity::None, 1)
+                .bitrate(),
+            Some(38_400.0)
+        );
+    }
+
+    #[test]
+    fn zero_serial_speed_is_not_reported_as_bitrate() {
+        assert_eq!(
+            KissInterface::new("/dev/null")
+                .with_serial_params(0, 8, KissParity::None, 1)
+                .bitrate(),
+            None
+        );
     }
 }

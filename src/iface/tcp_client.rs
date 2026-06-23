@@ -10,7 +10,8 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
 use crate::iface::{
-    Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU, MAX_AUTOCONFIGURED_HW_MTU,
+    configured_bitrate, Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU,
+    MAX_AUTOCONFIGURED_HW_MTU,
 };
 use crate::packet::{
     Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
@@ -33,6 +34,7 @@ const TCP_READ_BUFFER_SIZE: usize = 16 * 1024;
 pub struct TcpClient {
     addr: String,
     stream: Option<TcpStream>,
+    bitrate: Option<f64>,
 }
 
 impl TcpClient {
@@ -40,6 +42,7 @@ impl TcpClient {
         Self {
             addr: addr.into(),
             stream: None,
+            bitrate: None,
         }
     }
 
@@ -47,7 +50,18 @@ impl TcpClient {
         Self {
             addr: addr.into(),
             stream: Some(stream),
+            bitrate: None,
         }
+    }
+
+    pub fn with_bitrate(mut self, bitrate: f64) -> Self {
+        self.bitrate = configured_bitrate(bitrate);
+        self
+    }
+
+    pub(crate) fn with_optional_bitrate(mut self, bitrate: Option<f64>) -> Self {
+        self.bitrate = bitrate;
+        self
     }
 
     pub async fn spawn(context: InterfaceContext<TcpClient>) {
@@ -310,6 +324,10 @@ impl Interface for TcpClient {
     fn hw_mtu() -> usize {
         DEFAULT_HW_MTU
     }
+
+    fn bitrate(&self) -> Option<f64> {
+        self.bitrate
+    }
 }
 
 fn first_byte_hex(data: &[u8]) -> String {
@@ -357,4 +375,38 @@ fn hex_preview(data: &[u8], max_len: usize) -> String {
     }
 
     preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitrate_defaults_to_unreported() {
+        assert_eq!(TcpClient::new("127.0.0.1:0").bitrate(), None);
+    }
+
+    #[test]
+    fn bitrate_can_be_configured() {
+        assert_eq!(
+            TcpClient::new("127.0.0.1:0")
+                .with_bitrate(1_000_000.0)
+                .bitrate(),
+            Some(1_000_000.0)
+        );
+    }
+
+    #[test]
+    fn invalid_bitrate_is_not_reported() {
+        assert_eq!(
+            TcpClient::new("127.0.0.1:0").with_bitrate(0.0).bitrate(),
+            None
+        );
+        assert_eq!(
+            TcpClient::new("127.0.0.1:0")
+                .with_bitrate(f64::INFINITY)
+                .bitrate(),
+            None
+        );
+    }
 }

@@ -107,6 +107,14 @@ pub trait Interface {
     }
 }
 
+pub(crate) fn configured_bitrate(bitrate: f64) -> Option<f64> {
+    if bitrate.is_finite() && bitrate > 0.0 {
+        Some(bitrate)
+    } else {
+        None
+    }
+}
+
 struct LocalInterface {
     address: AddressHash,
     tx_send: InterfaceTxSender,
