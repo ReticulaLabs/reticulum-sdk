@@ -390,6 +390,12 @@ impl Transport {
         let cancel = CancellationToken::new();
         start_shared_instance(&mut config, iface_manager.clone(), cancel.clone());
 
+        let start_shared_rpc = config.is_shared_instance
+            && matches!(config.shared_instance_type, SharedInstanceType::Tcp);
+        let rpc_name = config.name.clone();
+        let rpc_port = config.instance_control_port;
+        let rpc_key = config.rpc_key.clone();
+
         let transport_id = if config.retransmit {
             Some(config.identity.address_hash().clone())
         } else {
@@ -463,6 +469,10 @@ impl Transport {
                 iface_messages_tx.clone(),
             ))
         };
+
+        if start_shared_rpc {
+            start_tcp_shared_rpc(rpc_name, rpc_port, rpc_key, handler.clone(), cancel.clone());
+        }
 
         Self {
             name,
@@ -920,7 +930,6 @@ fn start_tcp_shared_instance(
                 iface_manager,
                 cancel.clone(),
             );
-            start_tcp_shared_rpc(config, cancel);
             log::debug!("tp({}): started shared instance on {}", config.name, addr);
         }
         Err(error) => {
@@ -1026,11 +1035,14 @@ async fn handle_shared_data_client(
         .spawn_shared_instance_client(TcpClient::new_from_stream(remote, stream), TcpClient::spawn);
 }
 
-fn start_tcp_shared_rpc(config: &TransportConfig, cancel: CancellationToken) {
-    let addr = format!("127.0.0.1:{}", config.instance_control_port);
-    let auth_key = config.rpc_key.clone();
-    let name = config.name.clone();
-
+fn start_tcp_shared_rpc(
+    name: String,
+    port: u16,
+    auth_key: Option<Vec<u8>>,
+    handler: Arc<Mutex<TransportHandler>>,
+    cancel: CancellationToken,
+) {
+    let addr = format!("127.0.0.1:{}", port);
     tokio::spawn(async move {
         let listener = match TcpListener::bind(&addr).await {
             Ok(listener) => listener,
@@ -1065,8 +1077,12 @@ fn start_tcp_shared_rpc(config: &TransportConfig, cancel: CancellationToken) {
                                 addr
                             );
                             let auth_key = auth_key.clone();
+                            let handler = handler.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_shared_rpc_client(stream, auth_key.as_deref()).await {
+                                if let Err(error) =
+                                    handle_shared_rpc_client(stream, auth_key.as_deref(), handler)
+                                        .await
+                                {
                                     log::warn!(
                                         "share_instance: RPC client <{}> failed: {}",
                                         remote,
@@ -1092,12 +1108,14 @@ fn start_tcp_shared_rpc(config: &TransportConfig, cancel: CancellationToken) {
 async fn handle_shared_rpc_client(
     mut stream: TcpStream,
     auth_key: Option<&[u8]>,
+    handler: Arc<Mutex<TransportHandler>>,
 ) -> Result<(), String> {
     shared_rpc_authenticate(&mut stream, auth_key).await?;
 
     let request = read_py_connection_frame(&mut stream, 64 * 1024).await?;
     let request = read_python_pickle_value(&request)?;
-    let response = handle_shared_rpc_request(&request);
+    let handler = handler.lock().await;
+    let response = handle_shared_rpc_request(&request, Some(&handler));
 
     let encoded = write_python_pickle_value(&response)?;
     write_py_connection_frame(&mut stream, &encoded).await
@@ -1201,7 +1219,7 @@ fn shared_rpc_hmac_response(auth_key: &[u8], message: &[u8]) -> Result<Vec<u8>, 
     Ok(response)
 }
 
-fn handle_shared_rpc_request(request: &Value) -> Value {
+fn handle_shared_rpc_request(request: &Value, handler: Option<&TransportHandler>) -> Value {
     let Some(map) = request.as_map() else {
         return Value::Boolean(false);
     };
@@ -1210,8 +1228,8 @@ fn handle_shared_rpc_request(request: &Value) -> Value {
         return match operation {
             "path_table" | "rate_table" => Value::Array(vec![]),
             "interface_stats" => shared_rpc_interface_stats(),
-            "next_hop_if_name" => Value::from(""),
-            "next_hop" => Value::Boolean(false),
+            "next_hop_if_name" => shared_rpc_next_hop_if_name(map, handler),
+            "next_hop" => shared_rpc_next_hop(map, handler),
             "packet_rssi" | "packet_snr" | "packet_q" => Value::Boolean(false),
             "first_hop_timeout" => Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
             "link_count" => Value::from(0),
@@ -1255,6 +1273,52 @@ fn handle_shared_rpc_request(request: &Value) -> Value {
 
     log::warn!("share_instance: unsupported RPC request {:?}", request);
     Value::Boolean(false)
+}
+
+fn shared_rpc_next_hop(map: &[(Value, Value)], handler: Option<&TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::Nil;
+    };
+    let Some(destination) = shared_rpc_destination_hash(map) else {
+        return Value::Nil;
+    };
+
+    handler
+        .path_table
+        .next_hop(&destination)
+        .map(|next_hop| Value::Binary(next_hop.as_slice().to_vec()))
+        .unwrap_or(Value::Nil)
+}
+
+fn shared_rpc_next_hop_if_name(
+    map: &[(Value, Value)],
+    handler: Option<&TransportHandler>,
+) -> Value {
+    let Some(handler) = handler else {
+        return Value::from("None");
+    };
+    let Some(destination) = shared_rpc_destination_hash(map) else {
+        return Value::from("None");
+    };
+
+    handler
+        .path_table
+        .next_hop_iface(&destination)
+        .map(|iface| iface.to_string())
+        .map(Value::from)
+        .unwrap_or_else(|| Value::from("None"))
+}
+
+fn shared_rpc_destination_hash(map: &[(Value, Value)]) -> Option<AddressHash> {
+    let value = shared_rpc_map_value(map, "destination_hash")?;
+    let bytes = value.as_slice()?;
+    if bytes.len() != crate::hash::ADDRESS_HASH_SIZE {
+        return None;
+    }
+
+    let mut hash = [0u8; crate::hash::ADDRESS_HASH_SIZE];
+    hash.copy_from_slice(bytes);
+    Some(AddressHash::new(hash))
 }
 
 fn shared_rpc_interface_stats() -> Value {
@@ -3053,8 +3117,8 @@ mod tests {
         let expected = [
             ("path_table", Value::Array(vec![])),
             ("rate_table", Value::Array(vec![])),
-            ("next_hop_if_name", Value::from("")),
-            ("next_hop", Value::Boolean(false)),
+            ("next_hop_if_name", Value::from("None")),
+            ("next_hop", Value::Nil),
             (
                 "first_hop_timeout",
                 Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
@@ -3069,7 +3133,7 @@ mod tests {
 
         for (operation, response) in expected {
             let request = Value::Map(vec![(Value::from("get"), Value::from(operation))]);
-            let actual = handle_shared_rpc_request(&request);
+            let actual = handle_shared_rpc_request(&request, None);
             assert_eq!(actual, response);
 
             let encoded = write_python_pickle_value(&actual).expect("encoded response");
@@ -3082,7 +3146,7 @@ mod tests {
         }
 
         let request = Value::Map(vec![(Value::from("get"), Value::from("interface_stats"))]);
-        let response = handle_shared_rpc_request(&request);
+        let response = handle_shared_rpc_request(&request, None);
         let stats = response.as_map().expect("interface stats dict");
         assert_eq!(
             shared_rpc_map_value(stats, "interfaces"),
@@ -3113,19 +3177,68 @@ mod tests {
             Value::from("destination_data"),
             Value::from("retain"),
         )]);
-        let response = handle_shared_rpc_request(&request);
+        let response = handle_shared_rpc_request(&request, None);
         assert_eq!(response, Value::Boolean(false));
 
         let request = Value::Map(vec![(Value::from("identity_data"), Value::from("retain"))]);
-        let response = handle_shared_rpc_request(&request);
+        let response = handle_shared_rpc_request(&request, None);
         assert_eq!(response, Value::Boolean(false));
 
         let unsupported = Value::Map(vec![(Value::from("get"), Value::from("unsupported"))]);
-        let response = handle_shared_rpc_request(&unsupported);
+        let response = handle_shared_rpc_request(&unsupported, None);
         assert_eq!(response, Value::Boolean(false));
 
         let encoded = write_python_pickle_value(&response).expect("encoded response");
         assert_eq!(encoded.first(), Some(&0x80));
+    }
+
+    #[tokio::test]
+    async fn shared_rpc_returns_known_next_hop_path_data() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let iface = {
+            let iface_manager = transport.iface_manager();
+            let mut iface_manager = iface_manager.lock().await;
+            *iface_manager.new_channel(4).address()
+        };
+
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("example_utilities", "shared.rpc.path"),
+        );
+        let mut announce = remote_destination
+            .announce(OsRng, None)
+            .expect("valid announce");
+        let destination = announce.destination;
+        let next_hop = AddressHash::new_from_slice(b"next-hop-transport");
+
+        announce.header.header_type = HeaderType::Type2;
+        announce.header.propagation_type = PropagationType::Transport;
+        announce.header.hops = 1;
+        announce.transport = Some(next_hop);
+
+        handle_announce(&announce, handler.lock().await, iface).await;
+
+        let request = Value::Map(vec![
+            (Value::from("get"), Value::from("next_hop")),
+            (
+                Value::from("destination_hash"),
+                Value::Binary(destination.as_slice().to_vec()),
+            ),
+        ]);
+        let guard = handler.lock().await;
+        let response = handle_shared_rpc_request(&request, Some(&guard));
+        assert_eq!(response, Value::Binary(next_hop.as_slice().to_vec()));
+
+        let request = Value::Map(vec![
+            (Value::from("get"), Value::from("next_hop_if_name")),
+            (
+                Value::from("destination_hash"),
+                Value::Binary(destination.as_slice().to_vec()),
+            ),
+        ]);
+        let response = handle_shared_rpc_request(&request, Some(&guard));
+        assert_eq!(response, Value::from(iface.to_string()));
     }
 
     #[test]
@@ -3140,7 +3253,7 @@ mod tests {
         ])
         .expect("Python pickle request");
 
-        let response = handle_shared_rpc_request(&request);
+        let response = handle_shared_rpc_request(&request, None);
         assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
 
         let encoded = write_python_pickle_value(&response).expect("pickle response");
