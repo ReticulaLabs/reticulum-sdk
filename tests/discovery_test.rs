@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, TcpListener};
+use std::net::TcpListener;
 use std::sync::Once;
 use std::time::Duration;
 
@@ -19,22 +19,18 @@ fn setup() {
     });
 }
 
-fn free_local_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners = (0..count)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect::<Vec<_>>();
-
-    listeners
-        .iter()
-        .map(|listener| listener.local_addr().unwrap())
-        .collect()
+fn local_tcp_listener() -> TcpListener {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    assert!(listener.local_addr().unwrap().port() >= 1024);
+    listener
 }
 
 async fn build_transport(
     name: &str,
-    server_addr: &str,
+    server_listener: TcpListener,
     client_addr: &[&str],
 ) -> (Transport, reticulum_sdk::hash::AddressHash) {
+    let server_addr = server_listener.local_addr().unwrap().to_string();
     let transport = Transport::new(TransportConfig::new(
         name,
         &PrivateIdentity::new_from_rand(OsRng),
@@ -42,7 +38,7 @@ async fn build_transport(
     ));
 
     let server_iface = transport.iface_manager().lock().await.spawn(
-        TcpServer::new(server_addr, transport.iface_manager()),
+        TcpServer::new_from_listener(server_addr, server_listener, transport.iface_manager()),
         TcpServer::spawn,
     );
 
@@ -61,13 +57,13 @@ async fn build_transport(
 async fn discovery_announce_roundtrip() {
     setup();
 
-    let addrs = free_local_addrs(2);
-    let addr_a = addrs[0].to_string();
-    let addr_b = addrs[1].to_string();
-    let port_a = addrs[0].port();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
+    let port_a = listener_a.local_addr().unwrap().port();
 
-    let (transport_a, server_iface_a) = build_transport("a", &addr_a, &[]).await;
-    let (transport_b, _server_iface_b) = build_transport("b", &addr_b, &[addr_a.as_str()]).await;
+    let (transport_a, server_iface_a) = build_transport("a", listener_a, &[]).await;
+    let (transport_b, _server_iface_b) = build_transport("b", listener_b, &[addr_a.as_str()]).await;
 
     transport_a
         .register_discoverable_interface(
@@ -101,12 +97,16 @@ async fn discovery_announce_roundtrip() {
 async fn shared_instance_client_receives_network_discovery_announces() {
     setup();
 
-    let addrs = free_local_addrs(4);
-    let shared_port = addrs[0].port();
-    let server_addr = addrs[1].to_string();
-    let remote_addr = addrs[2].to_string();
-    let remote_port = addrs[2].port();
-    let control_port = addrs[3].port();
+    let shared_listener = local_tcp_listener();
+    let server_listener = local_tcp_listener();
+    let remote_listener = local_tcp_listener();
+    let control_listener = local_tcp_listener();
+    let shared_port = shared_listener.local_addr().unwrap().port();
+    let server_addr = server_listener.local_addr().unwrap().to_string();
+    let remote_port = remote_listener.local_addr().unwrap().port();
+    let control_port = control_listener.local_addr().unwrap().port();
+    drop(shared_listener);
+    drop(control_listener);
 
     let mut server_config = TransportConfig::new(
         "shared-server",
@@ -118,7 +118,7 @@ async fn shared_instance_client_receives_network_discovery_announces() {
     server_config.set_instance_control_port(control_port);
     let server = Transport::new(server_config);
     server.iface_manager().lock().await.spawn(
-        TcpServer::new(&server_addr, server.iface_manager()),
+        TcpServer::new_from_listener(server_addr.clone(), server_listener, server.iface_manager()),
         TcpServer::spawn,
     );
 
@@ -133,7 +133,7 @@ async fn shared_instance_client_receives_network_discovery_announces() {
     let mut discovery_rx = client.recv_discovery();
 
     let (remote, remote_server_iface) =
-        build_transport("remote", &remote_addr, &[server_addr.as_str()]).await;
+        build_transport("remote", remote_listener, &[server_addr.as_str()]).await;
     remote
         .register_discoverable_interface(
             remote_server_iface,
@@ -161,11 +161,15 @@ async fn shared_instance_client_receives_network_discovery_announces() {
 async fn shared_instance_client_receives_passive_destination_announces() {
     setup();
 
-    let addrs = free_local_addrs(4);
-    let shared_port = addrs[0].port();
-    let server_addr = addrs[1].to_string();
-    let remote_addr = addrs[2].to_string();
-    let control_port = addrs[3].port();
+    let shared_listener = local_tcp_listener();
+    let server_listener = local_tcp_listener();
+    let remote_listener = local_tcp_listener();
+    let control_listener = local_tcp_listener();
+    let shared_port = shared_listener.local_addr().unwrap().port();
+    let server_addr = server_listener.local_addr().unwrap().to_string();
+    let control_port = control_listener.local_addr().unwrap().port();
+    drop(shared_listener);
+    drop(control_listener);
 
     let mut server_config = TransportConfig::new(
         "shared-server-passive",
@@ -177,7 +181,7 @@ async fn shared_instance_client_receives_passive_destination_announces() {
     server_config.set_instance_control_port(control_port);
     let server = Transport::new(server_config);
     server.iface_manager().lock().await.spawn(
-        TcpServer::new(&server_addr, server.iface_manager()),
+        TcpServer::new_from_listener(server_addr.clone(), server_listener, server.iface_manager()),
         TcpServer::spawn,
     );
 
@@ -192,7 +196,7 @@ async fn shared_instance_client_receives_passive_destination_announces() {
     let mut announce_rx = client.recv_announces().await;
 
     let (mut remote, _remote_server_iface) =
-        build_transport("remote-passive", &remote_addr, &[server_addr.as_str()]).await;
+        build_transport("remote-passive", remote_listener, &[server_addr.as_str()]).await;
     let destination = remote
         .add_destination(
             PrivateIdentity::new_from_rand(OsRng),

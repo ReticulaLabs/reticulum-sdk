@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, TcpListener};
+use std::net::TcpListener;
 use std::sync::Once;
 use std::time::Duration;
 
@@ -19,18 +19,18 @@ fn setup() {
     });
 }
 
-fn free_local_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners = (0..count)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect::<Vec<_>>();
-
-    listeners
-        .iter()
-        .map(|listener| listener.local_addr().unwrap())
-        .collect()
+fn local_tcp_listener() -> TcpListener {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    assert!(listener.local_addr().unwrap().port() >= 1024);
+    listener
 }
 
-async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) -> Transport {
+async fn build_transport(
+    name: &str,
+    server_listener: TcpListener,
+    client_addr: &[&str],
+) -> Transport {
+    let server_addr = server_listener.local_addr().unwrap().to_string();
     let transport = Transport::new(TransportConfig::new(
         name,
         &PrivateIdentity::new_from_rand(OsRng),
@@ -38,7 +38,7 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
     ));
 
     transport.iface_manager().lock().await.spawn(
-        TcpServer::new(server_addr, transport.iface_manager()),
+        TcpServer::new_from_listener(server_addr, server_listener, transport.iface_manager()),
         TcpServer::spawn,
     );
 
@@ -59,12 +59,12 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
 async fn packet_overload() {
     setup();
 
-    let addrs = free_local_addrs(2);
-    let addr_a = addrs[0].to_string();
-    let addr_b = addrs[1].to_string();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
 
-    let transport_a = build_transport("a", &addr_a, &[]).await;
-    let transport_b = build_transport("b", &addr_b, &[addr_a.as_str()]).await;
+    let transport_a = build_transport("a", listener_a, &[]).await;
+    let transport_b = build_transport("b", listener_b, &[addr_a.as_str()]).await;
 
     let stop = CancellationToken::new();
 
@@ -134,13 +134,15 @@ async fn packet_overload() {
 async fn unavailable_tcp_client_does_not_block_server_traffic() {
     setup();
 
-    let addrs = free_local_addrs(3);
-    let server_addr_a = addrs[0].to_string();
-    let server_addr_b = addrs[1].to_string();
-    let unavailable_addr = addrs[2].to_string();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let unavailable_listener = local_tcp_listener();
+    let server_addr_a = listener_a.local_addr().unwrap().to_string();
+    let unavailable_addr = unavailable_listener.local_addr().unwrap().to_string();
+    drop(unavailable_listener);
 
-    let transport_a = build_transport("a", &server_addr_a, &[&unavailable_addr]).await;
-    let transport_b = build_transport("b", &server_addr_b, &[&server_addr_a]).await;
+    let transport_a = build_transport("a", listener_a, &[&unavailable_addr]).await;
+    let transport_b = build_transport("b", listener_b, &[&server_addr_a]).await;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 

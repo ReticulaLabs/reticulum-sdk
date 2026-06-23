@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, TcpListener};
+use std::net::TcpListener;
 use std::sync::Once;
 use std::time::Duration;
 
@@ -25,23 +25,19 @@ fn setup() {
     });
 }
 
-fn free_local_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners = (0..count)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect::<Vec<_>>();
-
-    listeners
-        .iter()
-        .map(|listener| listener.local_addr().unwrap())
-        .collect()
+fn local_tcp_listener() -> TcpListener {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    assert!(listener.local_addr().unwrap().port() >= 1024);
+    listener
 }
 
 async fn build_transport_full(
     name: &str,
-    server_addr: &str,
+    server_listener: TcpListener,
     client_addr: &[&str],
     retransmit: bool,
 ) -> Transport {
+    let server_addr = server_listener.local_addr().unwrap().to_string();
     let mut config = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), true);
 
     if retransmit {
@@ -51,7 +47,7 @@ async fn build_transport_full(
     let transport = Transport::new(config);
 
     transport.iface_manager().lock().await.spawn(
-        TcpServer::new(server_addr, transport.iface_manager()),
+        TcpServer::new_from_listener(server_addr, server_listener, transport.iface_manager()),
         TcpServer::spawn,
     );
 
@@ -70,12 +66,13 @@ async fn build_transport_full(
 
 async fn build_transport_probe(
     name: &str,
-    server_addr: &str,
+    server_listener: TcpListener,
     client_addr: &[&str],
     broadcast: bool,
     retransmit: bool,
     respond_to_probes: bool,
 ) -> Transport {
+    let server_addr = server_listener.local_addr().unwrap().to_string();
     let mut config = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), broadcast);
 
     if retransmit {
@@ -89,7 +86,7 @@ async fn build_transport_probe(
     let transport = Transport::new(config);
 
     transport.iface_manager().lock().await.spawn(
-        TcpServer::new(server_addr, transport.iface_manager()),
+        TcpServer::new_from_listener(server_addr, server_listener, transport.iface_manager()),
         TcpServer::spawn,
     );
 
@@ -106,22 +103,27 @@ async fn build_transport_probe(
     transport
 }
 
-async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) -> Transport {
-    build_transport_full(name, server_addr, client_addr, false).await
+async fn build_transport(
+    name: &str,
+    server_listener: TcpListener,
+    client_addr: &[&str],
+) -> Transport {
+    build_transport_full(name, server_listener, client_addr, false).await
 }
 
 #[tokio::test]
 async fn calculate_hop_distance() {
     setup();
 
-    let addrs = free_local_addrs(3);
-    let addr_a = addrs[0].to_string();
-    let addr_b = addrs[1].to_string();
-    let addr_c = addrs[2].to_string();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let listener_c = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
+    let addr_b = listener_b.local_addr().unwrap().to_string();
 
-    let mut transport_a = build_transport("a", &addr_a, &[]).await;
-    let transport_b = build_transport("b", &addr_b, &[&addr_a]).await;
-    let transport_c = build_transport("c", &addr_c, &[&addr_a, &addr_b]).await;
+    let mut transport_a = build_transport("a", listener_a, &[]).await;
+    let transport_b = build_transport("b", listener_b, &[&addr_a]).await;
+    let transport_c = build_transport("c", listener_c, &[&addr_a, &addr_b]).await;
 
     let id_a = PrivateIdentity::new_from_name("a");
 
@@ -144,12 +146,12 @@ async fn calculate_hop_distance() {
 async fn direct_path_request_and_response() {
     setup();
 
-    let addrs = free_local_addrs(2);
-    let addr_a = addrs[0].to_string();
-    let addr_b = addrs[1].to_string();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
 
-    let transport_a = build_transport("a", &addr_a, &[]).await;
-    let mut transport_b = build_transport("b", &addr_b, &[&addr_a]).await;
+    let transport_a = build_transport("a", listener_a, &[]).await;
+    let mut transport_b = build_transport("b", listener_b, &[&addr_a]).await;
 
     let id_b = PrivateIdentity::new_from_name("b");
 
@@ -171,14 +173,15 @@ async fn direct_path_request_and_response() {
 async fn remote_path_request_and_response() {
     setup();
 
-    let addrs = free_local_addrs(3);
-    let addr_a = addrs[0].to_string();
-    let addr_b = addrs[1].to_string();
-    let addr_c = addrs[2].to_string();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let listener_c = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
+    let addr_b = listener_b.local_addr().unwrap().to_string();
 
-    let transport_a = build_transport("a", &addr_a, &[]).await;
-    let mut transport_b = build_transport_full("b", &addr_b, &[&addr_a], true).await;
-    let mut transport_c = build_transport("c", &addr_c, &[&addr_b]).await;
+    let transport_a = build_transport("a", listener_a, &[]).await;
+    let mut transport_b = build_transport_full("b", listener_b, &[&addr_a], true).await;
+    let mut transport_c = build_transport("c", listener_c, &[&addr_b]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
     let dest_c = transport_c
@@ -215,14 +218,15 @@ async fn remote_path_request_and_response() {
 async fn message_proof_over_remote_link() {
     setup();
 
-    let addrs = free_local_addrs(3);
-    let addr_a = addrs[0].to_string();
-    let addr_b = addrs[1].to_string();
-    let addr_c = addrs[2].to_string();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let listener_c = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
+    let addr_b = listener_b.local_addr().unwrap().to_string();
 
-    let transport_a = build_transport("a", &addr_a, &[]).await;
-    let _transport_b = build_transport_full("b", &addr_b, &[&addr_a], true).await;
-    let mut transport_c = build_transport("c", &addr_c, &[&addr_b]).await;
+    let transport_a = build_transport("a", listener_a, &[]).await;
+    let _transport_b = build_transport_full("b", listener_b, &[&addr_a], true).await;
+    let mut transport_c = build_transport("c", listener_c, &[&addr_b]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
     let dest_c = transport_c
@@ -313,12 +317,12 @@ async fn recv_expected_proof(
 async fn probe_destination_returns_direct_packet_proof() {
     setup();
 
-    let addrs = free_local_addrs(2);
-    let addr_a = addrs[0].to_string();
-    let addr_b = addrs[1].to_string();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
 
-    let transport_a = build_transport("a", &addr_a, &[]).await;
-    let transport_b = build_transport_probe("b", &addr_b, &[&addr_a], true, false, true).await;
+    let transport_a = build_transport("a", listener_a, &[]).await;
+    let transport_b = build_transport_probe("b", listener_b, &[&addr_a], true, false, true).await;
 
     let probe_destination = transport_b.probe_destination().await.unwrap();
     let probe_destination = probe_destination.lock().await;
@@ -351,14 +355,15 @@ async fn probe_destination_returns_direct_packet_proof() {
 async fn probe_destination_returns_multihop_packet_proof() {
     setup();
 
-    let addrs = free_local_addrs(3);
-    let addr_a = addrs[0].to_string();
-    let addr_b = addrs[1].to_string();
-    let addr_c = addrs[2].to_string();
+    let listener_a = local_tcp_listener();
+    let listener_b = local_tcp_listener();
+    let listener_c = local_tcp_listener();
+    let addr_a = listener_a.local_addr().unwrap().to_string();
+    let addr_b = listener_b.local_addr().unwrap().to_string();
 
-    let transport_a = build_transport("a", &addr_a, &[]).await;
-    let _transport_b = build_transport_probe("b", &addr_b, &[&addr_a], false, true, false).await;
-    let transport_c = build_transport_probe("c", &addr_c, &[&addr_b], false, false, true).await;
+    let transport_a = build_transport("a", listener_a, &[]).await;
+    let _transport_b = build_transport_probe("b", listener_b, &[&addr_a], false, true, false).await;
+    let transport_c = build_transport_probe("c", listener_c, &[&addr_b], false, false, true).await;
 
     let probe_destination = transport_c.probe_destination().await.unwrap();
     let probe_destination = probe_destination.lock().await;
