@@ -2214,6 +2214,14 @@ async fn handle_fixed_destinations<'a>(
     }
 }
 
+fn should_rebroadcast_inbound_packet(packet: &Packet) -> bool {
+    packet.header.header_type == HeaderType::Type1
+        && packet.header.propagation_type == PropagationType::Broadcast
+        && packet.header.packet_type == PacketType::Data
+        && packet.header.destination_type == DestinationType::Plain
+        && packet.header.hops == 0
+}
+
 async fn handle_link_request_as_destination<'a>(
     destination: Arc<Mutex<SingleInputDestination>>,
     packet: &Packet,
@@ -2568,9 +2576,9 @@ async fn manage_transport(
                             continue;
                         }
 
-                        if handler.config.broadcast && packet.header.packet_type != PacketType::Announce {
-                            // TODO: remove seperate handling for announces in handle_announce.
-                            // Send broadcast message expect current iface address
+                        if handler.config.broadcast && should_rebroadcast_inbound_packet(&packet) {
+                            // Plain first-hop broadcasts are not inserted into transport. Repeat
+                            // them locally, and leave routed traffic to the path/link tables.
                             handler.send(TxMessage { tx_type: TxMessageType::Broadcast(Some(message.address)), packet: packet.clone() }).await;
                         }
 
@@ -2808,6 +2816,53 @@ mod tests {
         assert_eq!(config.rpc_key(), Some([0xe5, 0xc0, 0x32, 0xd3].as_slice()));
         assert!(config.set_rpc_key_hex("not hex").is_err());
         assert!(config.set_rpc_key_hex("abc").is_err());
+    }
+
+    fn inbound_packet_for_rebroadcast() -> Packet {
+        let mut packet: Packet = Default::default();
+        packet.header.header_type = HeaderType::Type1;
+        packet.header.propagation_type = PropagationType::Broadcast;
+        packet.header.destination_type = DestinationType::Plain;
+        packet.header.packet_type = PacketType::Data;
+        packet.header.hops = 0;
+        packet
+    }
+
+    #[test]
+    fn repeats_only_first_hop_plain_broadcast_packets() {
+        let packet = inbound_packet_for_rebroadcast();
+        assert!(should_rebroadcast_inbound_packet(&packet));
+
+        let mut already_forwarded = packet.clone();
+        already_forwarded.header.hops = 1;
+        assert!(!should_rebroadcast_inbound_packet(&already_forwarded));
+
+        let mut transported = packet.clone();
+        transported.header.header_type = HeaderType::Type2;
+        transported.header.propagation_type = PropagationType::Transport;
+        transported.transport = Some(AddressHash::new_from_slice(b"next-hop"));
+        assert!(!should_rebroadcast_inbound_packet(&transported));
+    }
+
+    #[test]
+    fn routed_packet_types_are_not_blindly_rebroadcast() {
+        let mut packet = inbound_packet_for_rebroadcast();
+
+        packet.header.destination_type = DestinationType::Single;
+        assert!(!should_rebroadcast_inbound_packet(&packet));
+
+        packet.header.destination_type = DestinationType::Link;
+        assert!(!should_rebroadcast_inbound_packet(&packet));
+
+        packet.header.destination_type = DestinationType::Plain;
+        packet.header.packet_type = PacketType::Proof;
+        assert!(!should_rebroadcast_inbound_packet(&packet));
+
+        packet.header.packet_type = PacketType::LinkRequest;
+        assert!(!should_rebroadcast_inbound_packet(&packet));
+
+        packet.header.packet_type = PacketType::Announce;
+        assert!(!should_rebroadcast_inbound_packet(&packet));
     }
 
     #[tokio::test]
