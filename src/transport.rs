@@ -15,7 +15,7 @@ use path_table::PathTable;
 use rand_core::OsRng;
 use rand_core::RngCore;
 use reverse_table::ReverseTable;
-use rmpv::Value;
+use rmpv::{decode::read_value, encode::write_value, Value};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::TcpListener as StdTcpListener;
@@ -1143,11 +1143,11 @@ async fn handle_shared_rpc_client(
     shared_rpc_authenticate(&mut stream, auth_key).await?;
 
     let request = read_py_connection_frame(&mut stream, 64 * 1024).await?;
-    let request = read_python_pickle_value(&request)?;
+    let request = read_shared_rpc_value(&request)?;
     let handler = handler.lock().await;
     let response = handle_shared_rpc_request(&request, Some(&handler));
 
-    let encoded = write_python_pickle_value(&response)?;
+    let encoded = write_shared_rpc_value(&response)?;
     write_py_connection_frame(&mut stream, &encoded).await
 }
 
@@ -1369,6 +1369,31 @@ fn shared_rpc_map_str<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a s
 fn shared_rpc_map_value<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
     map.iter()
         .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
+}
+
+fn read_shared_rpc_value(data: &[u8]) -> Result<Value, String> {
+    read_msgpack_value(data).or_else(|msgpack_error| {
+        read_python_pickle_value(data).map_err(|pickle_error| {
+            format!(
+                "unsupported RPC payload: MessagePack decode failed: {msgpack_error}; pickle decode failed: {pickle_error}"
+            )
+        })
+    })
+}
+
+fn read_msgpack_value(data: &[u8]) -> Result<Value, String> {
+    let mut cursor = std::io::Cursor::new(data);
+    let value = read_value(&mut cursor).map_err(|error| error.to_string())?;
+    if cursor.position() as usize != data.len() {
+        return Err("MessagePack payload has trailing bytes".into());
+    }
+    Ok(value)
+}
+
+fn write_shared_rpc_value(value: &Value) -> Result<Vec<u8>, String> {
+    let mut encoded = Vec::new();
+    write_value(&mut encoded, value).map_err(|error| error.to_string())?;
+    Ok(encoded)
 }
 
 enum PickleStackItem {
@@ -3041,7 +3066,7 @@ mod tests {
         let response = read_py_connection_frame(&mut stream, 256)
             .await
             .expect("response frame");
-        let response = read_python_pickle_value(&response).expect("decoded response");
+        let response = read_shared_rpc_value(&response).expect("decoded response");
         assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
     }
 
@@ -3163,13 +3188,9 @@ mod tests {
             let actual = handle_shared_rpc_request(&request, None);
             assert_eq!(actual, response);
 
-            let encoded = write_python_pickle_value(&actual).expect("encoded response");
-            assert_eq!(encoded.first(), Some(&0x80));
-            assert_ne!(
-                encoded.first(),
-                Some(&0xc2),
-                "RPC response must not be MessagePack false"
-            );
+            let encoded = write_shared_rpc_value(&actual).expect("encoded response");
+            let decoded = read_msgpack_value(&encoded).expect("decoded response");
+            assert_eq!(decoded, response);
         }
 
         let request = Value::Map(vec![(Value::from("get"), Value::from("interface_stats"))]);
@@ -3196,8 +3217,8 @@ mod tests {
             Some(0)
         );
 
-        let encoded = write_python_pickle_value(&response).expect("encoded stats response");
-        let decoded = read_python_pickle_value(&encoded).expect("decoded stats response");
+        let encoded = write_shared_rpc_value(&response).expect("encoded stats response");
+        let decoded = read_msgpack_value(&encoded).expect("decoded stats response");
         assert_eq!(decoded, response);
 
         let request = Value::Map(vec![(
@@ -3215,8 +3236,8 @@ mod tests {
         let response = handle_shared_rpc_request(&unsupported, None);
         assert_eq!(response, Value::Boolean(false));
 
-        let encoded = write_python_pickle_value(&response).expect("encoded response");
-        assert_eq!(encoded.first(), Some(&0x80));
+        let encoded = write_shared_rpc_value(&response).expect("encoded response");
+        assert_eq!(encoded.first(), Some(&0xc2));
     }
 
     #[tokio::test]
@@ -3270,7 +3291,7 @@ mod tests {
 
     #[test]
     fn shared_rpc_decodes_python_pickled_request() {
-        let request = read_python_pickle_value(&[
+        let request = read_shared_rpc_value(&[
             0x80, 0x05, 0x95, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0x94, 0x28,
             0x8c, 0x03, b'g', b'e', b't', 0x94, 0x8c, 0x11, b'f', b'i', b'r', b's', b't', b'_',
             b'h', b'o', b'p', b'_', b't', b'i', b'm', b'e', b'o', b'u', b't', 0x94, 0x8c, 0x10,
@@ -3285,6 +3306,24 @@ mod tests {
 
         let encoded = write_python_pickle_value(&response).expect("pickle response");
         assert_eq!(encoded, vec![0x80, 0x05, b'K', 0x06, b'.']);
+    }
+
+    #[test]
+    fn shared_rpc_decodes_python_msgpack_request() {
+        let request = read_shared_rpc_value(&[
+            0x82, 0xa3, b'g', b'e', b't', 0xb1, b'f', b'i', b'r', b's', b't', b'_', b'h', b'o',
+            b'p', b'_', b't', b'i', b'm', b'e', b'o', b'u', b't', 0xb0, b'd', b'e', b's', b't',
+            b'i', b'n', b'a', b't', b'i', b'o', b'n', b'_', b'h', b'a', b's', b'h', 0xc4, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ])
+        .expect("Python MessagePack request");
+
+        let response = handle_shared_rpc_request(&request, None);
+        assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
+
+        let encoded = write_shared_rpc_value(&response).expect("MessagePack response");
+        assert_eq!(encoded, vec![0x06]);
     }
 
     #[tokio::test]
