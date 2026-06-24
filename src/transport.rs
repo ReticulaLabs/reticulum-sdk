@@ -49,6 +49,7 @@ use crate::identity::PrivateIdentity;
 
 use crate::iface::tcp_client::TcpClient;
 use crate::iface::InterfaceManager;
+use crate::iface::InterfaceQueueLengths;
 use crate::iface::InterfaceRxReceiver;
 use crate::iface::RxMessage;
 use crate::iface::TxMessage;
@@ -493,6 +494,10 @@ impl Transport {
 
     pub fn iface_manager(&self) -> Arc<Mutex<InterfaceManager>> {
         self.iface_manager.clone()
+    }
+
+    pub async fn interface_queue_lengths(&self) -> InterfaceQueueLengths {
+        self.iface_manager.lock().await.queue_lengths().await
     }
 
     pub fn iface_rx(&self) -> broadcast::Receiver<RxMessage> {

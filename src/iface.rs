@@ -57,6 +57,26 @@ pub struct RxMessage {
     pub packet: Packet,       // Received packet
 }
 
+/// Queue length snapshot for a single interface.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct InterfaceQueueLength {
+    /// Interface address the queue lengths belong to.
+    pub address: AddressHash,
+    /// Number of outbound packets currently queued for the interface worker.
+    pub tx: usize,
+    /// Number of forwarded announces waiting in the interface announce pacer.
+    pub announce: usize,
+}
+
+/// Queue length snapshot for the interface manager.
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub struct InterfaceQueueLengths {
+    /// Number of inbound packets queued from interface workers to transport.
+    pub rx: usize,
+    /// Per-interface outbound queue lengths.
+    pub interfaces: Vec<InterfaceQueueLength>,
+}
+
 pub struct InterfaceChannel {
     pub address: AddressHash,
     pub rx_channel: InterfaceRxSender,
@@ -223,6 +243,10 @@ impl AnnouncePacer {
 
     fn should_pace(message: &TxMessage) -> bool {
         message.packet.header.packet_type == PacketType::Announce && message.packet.header.hops > 0
+    }
+
+    async fn queue_len(&self) -> usize {
+        self.state.lock().await.announce_queue.len()
     }
 
     async fn send(
@@ -476,6 +500,31 @@ impl InterfaceManager {
         self.rx_recv.clone()
     }
 
+    /// Returns current interface queue lengths for metrics collection.
+    pub async fn queue_lengths(&self) -> InterfaceQueueLengths {
+        let mut interfaces = Vec::with_capacity(self.ifaces.len());
+
+        for iface in &self.ifaces {
+            if iface.stop.is_cancelled() {
+                continue;
+            }
+
+            interfaces.push(InterfaceQueueLength {
+                address: iface.address,
+                tx: channel_queue_len(&iface.tx_send),
+                announce: match &iface.announce_pacer {
+                    Some(pacer) => pacer.queue_len().await,
+                    None => 0,
+                },
+            });
+        }
+
+        InterfaceQueueLengths {
+            rx: channel_queue_len(&self.rx_send),
+            interfaces,
+        }
+    }
+
     pub fn cleanup(&mut self) {
         self.ifaces.retain(|iface| !iface.stop.is_cancelled());
     }
@@ -534,6 +583,10 @@ impl Drop for InterfaceManager {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
+}
+
+fn channel_queue_len<T>(sender: &mpsc::Sender<T>) -> usize {
+    sender.max_capacity().saturating_sub(sender.capacity())
 }
 
 #[cfg(test)]
@@ -614,6 +667,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_lengths_report_rx_and_per_interface_tx_depths() {
+        let mut manager = InterfaceManager::new(4);
+        let channel = manager.new_channel(4);
+        let iface = channel.address;
+        let rx_channel = channel.rx_channel.clone();
+        let _receiver = channel.tx_channel;
+
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(iface),
+                packet: Packet::default(),
+            })
+            .await;
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(iface),
+                packet: Packet::default(),
+            })
+            .await;
+        rx_channel
+            .send(RxMessage {
+                address: iface,
+                packet: Packet::default(),
+            })
+            .await
+            .expect("queued rx message");
+
+        let lengths = manager.queue_lengths().await;
+
+        assert_eq!(lengths.rx, 1);
+        assert_eq!(lengths.interfaces.len(), 1);
+        assert_eq!(lengths.interfaces[0].address, iface);
+        assert_eq!(lengths.interfaces[0].tx, 2);
+        assert_eq!(lengths.interfaces[0].announce, 0);
+    }
+
+    #[tokio::test]
     async fn spawned_interface_tx_queue_handles_short_bursts() {
         struct TestInterface;
 
@@ -678,6 +768,9 @@ mod tests {
 
         manager.send(announce(2, 1, &[1])).await;
         manager.send(announce(2, 1, &[2])).await;
+
+        let lengths = manager.queue_lengths().await;
+        assert_eq!(lengths.interfaces[0].announce, 1);
 
         time::advance(Duration::from_secs(1)).await;
         task::yield_now().await;
