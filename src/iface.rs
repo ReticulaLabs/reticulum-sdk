@@ -117,7 +117,7 @@ impl InterfaceChannel {
 }
 
 pub trait Interface {
-    fn hw_mtu() -> usize;
+    fn hw_mtu(&self) -> usize;
 
     fn bitrate(&self) -> Option<f64> {
         None
@@ -125,6 +125,18 @@ pub trait Interface {
 
     fn announce_cap(&self) -> f64 {
         DEFAULT_ANNOUNCE_CAP
+    }
+
+    /// Whether this interface should auto-size its HW_MTU from the bitrate
+    /// and participate in link MTU discovery / upgrades.
+    fn autoconfigure_mtu(&self) -> bool {
+        false
+    }
+
+    /// Whether this interface has a user-configured fixed MTU and should
+    /// participate in link MTU discovery / upgrades.
+    fn fixed_mtu(&self) -> bool {
+        false
     }
 }
 
@@ -143,6 +155,9 @@ struct LocalInterface {
     announce_pacer: Option<AnnouncePacer>,
     saturated_queue_logger: SaturatedQueueLogger,
     shared_instance_client: bool,
+    /// Hardware MTU reported by this interface. `None` means the interface
+    /// does not participate in link MTU discovery / upgrades.
+    hw_mtu: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -396,7 +411,7 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false)
+        self.new_channel_with_pacer(tx_cap, None, false, None)
     }
 
     fn new_channel_with_pacer(
@@ -404,6 +419,7 @@ impl InterfaceManager {
         tx_cap: usize,
         announce_pacer: Option<AnnouncePacer>,
         shared_instance_client: bool,
+        hw_mtu: Option<usize>,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -412,7 +428,7 @@ impl InterfaceManager {
 
         let (tx_send, tx_recv) = InterfaceChannel::make_tx_channel(tx_cap);
 
-        log::debug!("iface: create channel {}", address);
+        log::debug!("iface: create channel {} hw_mtu={:?}", address, hw_mtu);
 
         let stop = CancellationToken::new();
 
@@ -423,6 +439,7 @@ impl InterfaceManager {
             announce_pacer,
             saturated_queue_logger: SaturatedQueueLogger::new(address),
             shared_instance_client,
+            hw_mtu,
         });
 
         InterfaceChannel {
@@ -447,10 +464,16 @@ impl InterfaceManager {
         let announce_pacer = bitrate
             .filter(|bitrate| *bitrate > 0.0 && announce_cap > 0.0)
             .map(|bitrate| AnnouncePacer::new(bitrate, announce_cap));
+        let hw_mtu = if inner.autoconfigure_mtu() || inner.fixed_mtu() {
+            Some(inner.hw_mtu())
+        } else {
+            None
+        };
         let channel = self.new_channel_with_pacer(
             DEFAULT_INTERFACE_TX_QUEUE_CAP,
             announce_pacer,
             shared_instance_client,
+            hw_mtu,
         );
 
         let inner = Arc::new(Mutex::new(inner));
@@ -546,6 +569,16 @@ impl InterfaceManager {
             .collect()
     }
 
+    /// Return the hardware MTU registered for the interface at `address`,
+    /// or `None` if the interface does not participate in MTU upgrades or
+    /// is no longer active.
+    pub fn hw_mtu(&self, address: &AddressHash) -> Option<usize> {
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == *address && !iface.stop.is_cancelled())
+            .and_then(|iface| iface.hw_mtu)
+    }
+
     pub async fn send(&self, message: TxMessage) {
         for iface in &self.ifaces {
             let should_send = match message.tx_type {
@@ -633,7 +666,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -716,7 +749,7 @@ mod tests {
         struct TestInterface;
 
         impl Interface for TestInterface {
-            fn hw_mtu() -> usize {
+            fn hw_mtu(&self) -> usize {
                 DEFAULT_HW_MTU
             }
         }
@@ -743,7 +776,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -768,7 +801,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;

@@ -1,5 +1,4 @@
 use std::{
-    cmp::min,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,25 +14,35 @@ use crate::{
     hash::{AddressHash, Hash, ADDRESS_HASH_SIZE, HASH_SIZE},
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
-        DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType,
-        LINK_PACKET_MDU, PACKET_MDU, RETICULUM_MTU,
+        compute_link_mdu, DestinationType, Header, Packet, PacketContext, PacketDataBuffer,
+        PacketType, PACKET_MDU, RETICULUM_MTU,
     },
 };
 
 use super::DestinationDesc;
 
-const LINK_MTU_SIZE: usize = 3;
-const LINK_MODE_AES256_CBC: u8 = 0x01;
+pub(crate) const LINK_MTU_SIZE: usize = 3;
+pub(crate) const LINK_MODE_AES256_CBC: u8 = 0x01;
 const CHANNEL_HEADER_SIZE: usize = 6;
 const CHANNEL_SEQUENCE_MAX: u16 = u16::MAX;
 const CHANNEL_SEQUENCE_MODULUS: u32 = CHANNEL_SEQUENCE_MAX as u32 + 1;
 const CHANNEL_WINDOW_MAX: u16 = 48;
 
-fn link_signalling_bytes() -> [u8; LINK_MTU_SIZE] {
+fn link_signalling_bytes(mtu: usize) -> [u8; LINK_MTU_SIZE] {
     let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
-    let signalling_value = (RETICULUM_MTU as u32 & 0x1F_FFFF) + (mode_bits << 16);
+    let signalling_value = (mtu as u32 & 0x1F_FFFF) + (mode_bits << 16);
     let bytes = signalling_value.to_be_bytes();
     [bytes[1], bytes[2], bytes[3]]
+}
+
+/// Extract the signalled MTU from link request or proof signalling bytes.
+pub(crate) fn mtu_from_signalling_bytes(bytes: &[u8]) -> usize {
+    if bytes.len() < LINK_MTU_SIZE {
+        return RETICULUM_MTU;
+    }
+    let mut raw = [0u8; 4];
+    raw[1..4].copy_from_slice(&bytes[..LINK_MTU_SIZE]);
+    (u32::from_be_bytes(raw) & 0x1F_FFFF) as usize
 }
 
 fn channel_sequence_distance(base: u16, sequence: u16) -> u32 {
@@ -59,45 +68,34 @@ pub type LinkId = AddressHash;
 
 #[derive(Clone)]
 pub struct LinkPayload {
-    buffer: [u8; PACKET_MDU],
-    len: usize,
+    buffer: Vec<u8>,
 }
 
 impl LinkPayload {
     pub fn new() -> Self {
         Self {
-            buffer: [0u8; PACKET_MDU],
-            len: 0,
+            buffer: Vec::new(),
         }
     }
 
     pub fn new_from_slice(data: &[u8]) -> Self {
-        let mut buffer = [0u8; PACKET_MDU];
-
-        let len = min(data.len(), buffer.len());
-
-        buffer[..len].copy_from_slice(&data[..len]);
-
-        Self { buffer, len }
+        Self {
+            buffer: data.to_vec(),
+        }
     }
 
     pub fn new_from_vec(data: &Vec<u8>) -> Self {
-        let mut buffer = [0u8; PACKET_MDU];
-        let len = min(buffer.len(), data.len());
-
-        for i in 0..len {
-            buffer[i] = data[i];
+        Self {
+            buffer: data.clone(),
         }
-
-        Self { buffer, len }
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.buffer.len()
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.buffer[..self.len]
+        &self.buffer
     }
 }
 
@@ -232,6 +230,7 @@ pub struct Link {
     peer_identity: Identity,
     derived_key: DerivedKey,
     status: LinkStatus,
+    mtu: usize,
     request_time: Instant,
     rtt: Duration,
     event_tx: tokio::sync::broadcast::Sender<LinkEventData>,
@@ -253,6 +252,7 @@ impl Link {
             peer_identity: Identity::default(),
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
+            mtu: RETICULUM_MTU,
             request_time: Instant::now(),
             rtt: Duration::from_secs(0),
             event_tx,
@@ -285,6 +285,15 @@ impl Link {
         let link_id = LinkId::from(packet);
         log::debug!("link: create from request {}", link_id);
 
+        // Extract signalled MTU from the link request if present
+        let mtu = if packet.data.len() >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE {
+            let signalling = &packet.data.as_slice()
+                [PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
+            mtu_from_signalling_bytes(signalling)
+        } else {
+            RETICULUM_MTU
+        };
+
         let mut link = Self {
             id: link_id,
             destination,
@@ -292,6 +301,7 @@ impl Link {
             peer_identity,
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
+            mtu,
             request_time: Instant::now(),
             rtt: Duration::from_secs(0),
             event_tx,
@@ -306,9 +316,10 @@ impl Link {
         Ok(link)
     }
 
-    pub fn request(&mut self) -> Packet {
+    pub fn request(&mut self, path_mtu: Option<usize>) -> Packet {
+        let mtu = path_mtu.unwrap_or(RETICULUM_MTU);
         let mut packet_data = PacketDataBuffer::new();
-        let signalling = link_signalling_bytes();
+        let signalling = link_signalling_bytes(mtu);
 
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
         packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
@@ -328,6 +339,7 @@ impl Link {
 
         self.status = LinkStatus::Pending;
         self.id = LinkId::from(&packet);
+        self.mtu = mtu;
         self.request_time = Instant::now();
 
         packet
@@ -342,7 +354,7 @@ impl Link {
         }
 
         let mut packet_data = PacketDataBuffer::new();
-        let signalling = link_signalling_bytes();
+        let signalling = link_signalling_bytes(self.mtu);
 
         packet_data.safe_write(self.id.as_slice());
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
@@ -377,9 +389,10 @@ impl Link {
             log::warn!("link({}): handling data packet in inactive state", self.id);
         }
 
+        let decrypt_buf_len = self.mdu().max(PACKET_MDU);
         match packet.context {
             PacketContext::None => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = vec![0u8; decrypt_buf_len];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
@@ -400,7 +413,7 @@ impl Link {
             }
             PacketContext::LinkIdentify => {
                 if !out_link {
-                    let mut buffer = [0u8; PACKET_MDU];
+                    let mut buffer = vec![0u8; decrypt_buf_len];
                     if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                         match self.validate_link_identify(plain_text) {
                             Ok(identity) => {
@@ -420,7 +433,7 @@ impl Link {
                 }
             }
             PacketContext::Request => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = vec![0u8; decrypt_buf_len];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     let request_id = AddressHash::new_from_hash(&packet.hash());
                     match decode_link_request(plain_text, request_id) {
@@ -437,7 +450,7 @@ impl Link {
                 }
             }
             PacketContext::Response => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = vec![0u8; decrypt_buf_len];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     match decode_link_response(plain_text) {
                         Ok(response) => {
@@ -453,7 +466,7 @@ impl Link {
                 }
             }
             PacketContext::Channel => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = vec![0u8; decrypt_buf_len];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     match ChannelEnvelope::unpack(plain_text) {
                         Ok(envelope) => {
@@ -485,7 +498,7 @@ impl Link {
             }
             PacketContext::LinkRTT => {
                 if !out_link {
-                    let mut buffer = [0u8; PACKET_MDU];
+                    let mut buffer = vec![0u8; decrypt_buf_len];
                     if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                         if let Ok(rtt) = rmp::decode::read_f32(&mut &plain_text[..]) {
                             self.rtt = Duration::from_secs_f32(rtt);
@@ -498,7 +511,7 @@ impl Link {
                 }
             }
             PacketContext::LinkClose => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = vec![0u8; decrypt_buf_len];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     match plain_text[..].try_into() {
                         Err(err) => {
@@ -538,21 +551,25 @@ impl Link {
 
     fn handle_proof_packet(&mut self, packet: &Packet) -> LinkHandleResult {
         if self.status == LinkStatus::Pending && packet.context == PacketContext::LinkRequestProof {
-            if let Ok(identity) = validate_proof_packet(&self.destination, &self.id, packet) {
-                log::debug!("link({}): has been proved", self.id);
+            match validate_proof_packet(&self.destination, &self.id, packet) {
+                Ok((identity, confirmed_mtu)) => {
+                    log::debug!("link({}): has been proved mtu={}", self.id, confirmed_mtu);
 
-                self.handshake(identity);
+                    self.mtu = confirmed_mtu;
+                    self.handshake(identity);
 
-                self.status = LinkStatus::Active;
-                self.rtt = self.request_time.elapsed();
+                    self.status = LinkStatus::Active;
+                    self.rtt = self.request_time.elapsed();
 
-                log::debug!("link({}): activated", self.id);
+                    log::debug!("link({}): activated", self.id);
 
-                self.post_event(LinkEvent::Activated);
+                    self.post_event(LinkEvent::Activated);
 
-                return LinkHandleResult::Activated;
-            } else {
-                log::warn!("link({}): proof is not valid", self.id);
+                    return LinkHandleResult::Activated;
+                }
+                Err(_) => {
+                    log::warn!("link({}): proof is not valid", self.id);
+                }
             }
         }
 
@@ -569,8 +586,15 @@ impl Link {
         self.encrypted_data_packet(data, PacketContext::None)
     }
 
+    /// Maximum Data Unit for this link, computed from the negotiated path MTU.
+    /// This is the largest plaintext payload that can be encrypted into a single
+    /// link packet. Uses AES-block-aligned arithmetic like the Python reference.
+    pub fn mdu(&self) -> usize {
+        compute_link_mdu(self.mtu)
+    }
+
     pub fn channel_mdu(&self) -> usize {
-        LINK_PACKET_MDU.saturating_sub(CHANNEL_HEADER_SIZE)
+        self.mdu().saturating_sub(CHANNEL_HEADER_SIZE)
     }
 
     pub fn channel_packet<M: ChannelMessage>(&mut self, message: &M) -> Result<Packet, RnsError> {
@@ -603,7 +627,7 @@ impl Link {
             log::warn!("link: can't create data packet for closed link");
             return Err(RnsError::LinkClosed);
         }
-        if data.len() > LINK_PACKET_MDU {
+        if data.len() > self.mdu() {
             return Err(RnsError::OutOfMemory);
         }
 
@@ -709,7 +733,7 @@ impl Link {
             data,
         ]);
         let packed_request = encode_msgpack(&request)?;
-        if packed_request.len() > LINK_PACKET_MDU {
+        if packed_request.len() > self.mdu() {
             return Err(RnsError::OutOfMemory);
         }
 
@@ -723,7 +747,7 @@ impl Link {
     ) -> Result<Packet, RnsError> {
         let response = Value::Array(vec![Value::Binary(request_id.as_slice().to_vec()), data]);
         let packed_response = encode_msgpack(&response)?;
-        if packed_response.len() > LINK_PACKET_MDU {
+        if packed_response.len() > self.mdu() {
             return Err(RnsError::OutOfMemory);
         }
 
@@ -917,6 +941,11 @@ impl Link {
         &self.id
     }
 
+    /// The negotiated path MTU for this link.
+    pub fn mtu(&self) -> usize {
+        self.mtu
+    }
+
     pub fn rtt(&self) -> &Duration {
         &self.rtt
     }
@@ -926,7 +955,7 @@ fn validate_proof_packet(
     destination: &DestinationDesc,
     id: &LinkId,
     packet: &Packet,
-) -> Result<Identity, RnsError> {
+) -> Result<(Identity, usize), RnsError> {
     const MIN_PROOF_LEN: usize = SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH;
     const MTU_PROOF_LEN: usize = SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH + LINK_MTU_SIZE;
     const SIGN_DATA_LEN: usize = ADDRESS_HASH_SIZE + PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE;
@@ -967,7 +996,13 @@ fn validate_proof_packet(
         .verify(&proof_data[..sign_data_len], &signature)
         .map_err(|_| RnsError::IncorrectSignature)?;
 
-    Ok(identity)
+    let mtu = if packet.data.len() >= MTU_PROOF_LEN {
+        mtu_from_signalling_bytes(&packet.data.as_slice()[SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH..])
+    } else {
+        RETICULUM_MTU
+    };
+
+    Ok((identity, mtu))
 }
 
 fn validate_message_proof(
@@ -1131,7 +1166,7 @@ mod tests {
         let (in_event_tx, mut in_event_rx) = tokio::sync::broadcast::channel(8);
 
         let mut out_link = Link::new(destination.desc, out_event_tx);
-        let link_request = out_link.request();
+        let link_request = out_link.request(None);
         let mut in_link = Link::new_from_request(
             &link_request,
             destination.sign_key().clone(),

@@ -212,12 +212,16 @@ impl Modem73Interface {
 }
 
 impl Interface for Modem73Interface {
-    fn hw_mtu() -> usize {
-        RETICULUM_BASE_MTU
+    fn hw_mtu(&self) -> usize {
+        self.current_mtu.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn bitrate(&self) -> Option<f64> {
         self.bitrate
+    }
+
+    fn autoconfigure_mtu(&self) -> bool {
+        true
     }
 }
 

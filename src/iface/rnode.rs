@@ -317,7 +317,7 @@ impl RNodeInterface {
 }
 
 impl Interface for RNodeInterface {
-    fn hw_mtu() -> usize {
+    fn hw_mtu(&self) -> usize {
         RNODE_HW_MTU
     }
 

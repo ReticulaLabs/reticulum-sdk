@@ -161,7 +161,7 @@ impl UdpInterface {
 }
 
 impl Interface for UdpInterface {
-    fn hw_mtu() -> usize {
+    fn hw_mtu(&self) -> usize {
         DEFAULT_HW_MTU
     }
 

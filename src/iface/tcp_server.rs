@@ -164,12 +164,16 @@ impl TcpServer {
 }
 
 impl Interface for TcpServer {
-    fn hw_mtu() -> usize {
+    fn hw_mtu(&self) -> usize {
         DEFAULT_HW_MTU
     }
 
     fn bitrate(&self) -> Option<f64> {
         self.bitrate
+    }
+
+    fn autoconfigure_mtu(&self) -> bool {
+        true
     }
 }
 

@@ -241,7 +241,7 @@ impl KissInterface {
 }
 
 impl Interface for KissInterface {
-    fn hw_mtu() -> usize {
+    fn hw_mtu(&self) -> usize {
         HW_MTU
     }
 

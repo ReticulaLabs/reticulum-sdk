@@ -34,6 +34,17 @@ const fn encrypted_payload_mdu(header_size: usize, cleartext_overhead: usize) ->
     (available / RETICULUM_AES_BLOCK_SIZE) * RETICULUM_AES_BLOCK_SIZE - 1
 }
 
+/// Compute a link's per-packet Maximum Data Unit from a negotiated path MTU.
+/// For link-encrypted packets the header is `HEADER_MINSIZE` (no transport
+/// address) and there is no per-packet public key overhead.
+pub fn compute_link_mdu(mtu: usize) -> usize {
+    let available = mtu
+        .saturating_sub(RETICULUM_MIN_IFAC_SIZE)
+        .saturating_sub(RETICULUM_HEADER_MINSIZE)
+        .saturating_sub(RETICULUM_TOKEN_OVERHEAD);
+    (available / RETICULUM_AES_BLOCK_SIZE) * RETICULUM_AES_BLOCK_SIZE - 1
+}
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum IfacFlag {
     Open = 0b0,

@@ -36,17 +36,19 @@ use crate::destination::DestinationHandleStatus;
 use crate::destination::DestinationName;
 use crate::destination::SingleInputDestination;
 use crate::destination::SingleOutputDestination;
+use crate::destination::link::mtu_from_signalling_bytes;
 use crate::destination::link::Link;
 use crate::destination::link::LinkEventData;
 use crate::destination::link::LinkHandleResult;
 use crate::destination::link::LinkId;
 use crate::destination::link::LinkStatus;
+use crate::destination::link::{LINK_MODE_AES256_CBC, LINK_MTU_SIZE};
 
 use crate::error::RnsError;
 
 use crate::hash::AddressHash;
 use crate::hash::Hash;
-use crate::identity::PrivateIdentity;
+use crate::identity::{PrivateIdentity, PUBLIC_KEY_LENGTH};
 
 use crate::iface::InterfaceManager;
 use crate::iface::InterfaceQueueLengths;
@@ -140,6 +142,12 @@ pub struct TransportConfig {
     /// packet proofs for incoming probe packets.
     respond_to_probes: bool,
 
+    /// Whether to participate in link MTU discovery and upgrades.
+    /// When enabled, the initiator queries the next-hop interface HW_MTU and
+    /// signals it in the link request; intermediate transport nodes clamp the
+    /// value to the minimum of all interfaces along the path.
+    link_mtu_discovery: bool,
+
     /// Python-compatible shared instance mode. When enabled, this transport
     /// tries to become the local shared instance and falls back to connecting
     /// to an existing one.
@@ -232,6 +240,7 @@ impl TransportConfig {
             restart_outlinks: false,
             announce_forever: false,
             respond_to_probes: false,
+            link_mtu_discovery: true,
             share_instance: false,
             require_shared_instance: false,
             shared_instance_type: SharedInstanceType::Tcp,
@@ -267,6 +276,10 @@ impl TransportConfig {
 
     pub fn set_respond_to_probes(&mut self, respond_to_probes: bool) {
         self.respond_to_probes = respond_to_probes;
+    }
+
+    pub fn set_link_mtu_discovery(&mut self, link_mtu_discovery: bool) {
+        self.link_mtu_discovery = link_mtu_discovery;
     }
 
     pub fn set_share_instance(&mut self, share_instance: bool) {
@@ -370,6 +383,7 @@ impl Default for TransportConfig {
             restart_outlinks: false,
             announce_forever: false,
             respond_to_probes: false,
+            link_mtu_discovery: true,
             share_instance: false,
             require_shared_instance: false,
             shared_instance_type: SharedInstanceType::Tcp,
@@ -685,15 +699,35 @@ impl Transport {
             }
         }
 
+        // Query the path table for the next-hop interface, then look up its
+        // HW_MTU so the link initiator can signal the path capacity.
+        let path_mtu = {
+            let handler = self.handler.lock().await;
+            if handler.config.link_mtu_discovery {
+                let iface_addr = handler
+                    .path_table
+                    .next_hop_iface(&destination.address_hash);
+                drop(handler);
+                if let Some(iface) = iface_addr {
+                    self.iface_manager.lock().await.hw_mtu(&iface)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
         let mut link = Link::new(destination, self.link_out_event_tx.clone());
 
-        let packet = link.request();
+        let packet = link.request(path_mtu);
 
         log::debug!(
-            "tp({}): create new link {} for destination {}",
+            "tp({}): create new link {} for destination {} path_mtu={:?}",
             self.name,
             link.id(),
-            destination
+            destination,
+            path_mtu
         );
 
         let link = Arc::new(Mutex::new(link));
@@ -2400,7 +2434,55 @@ async fn handle_link_request_as_intermediate<'a>(
         remaining_hops,
     );
 
-    send_to_next_hop(packet, &handler, None).await;
+    // MTU clamping: intermediate transport nodes compare the signalled path
+    // MTU against the next-hop interface's HW_MTU and clamp or strip.
+    let forwarded = if handler.config.link_mtu_discovery && packet.data.len()
+        >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE
+    {
+        let signalling = &packet.data.as_slice()
+            [PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
+        let path_mtu = mtu_from_signalling_bytes(signalling);
+        let nh_hw_mtu = handler.iface_manager.lock().await.hw_mtu(&next_hop_iface);
+
+        match nh_hw_mtu {
+            Some(nh_mtu) => {
+                let clamped = path_mtu.min(nh_mtu);
+                if clamped < path_mtu {
+                    let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
+                    let signalling_value =
+                        (clamped as u32 & 0x1F_FFFF) + (mode_bits << 16);
+                    let mut clamped_bytes = [0u8; LINK_MTU_SIZE];
+                    let be = signalling_value.to_be_bytes();
+                    clamped_bytes.copy_from_slice(&be[1..4]);
+
+                    let mut data = packet.data.clone();
+                    let offset = data.len() - LINK_MTU_SIZE;
+                    data.as_mut_slice()[offset..].copy_from_slice(&clamped_bytes);
+
+                    Packet {
+                        data,
+                        ..packet.clone()
+                    }
+                } else {
+                    packet.clone()
+                }
+            }
+            None => {
+                // Next-hop interface does not support MTU upgrades; strip the
+                // signalling bytes so the destination falls back to 500.
+                let mut data = packet.data.clone();
+                data.resize(PUBLIC_KEY_LENGTH * 2);
+                Packet {
+                    data,
+                    ..packet.clone()
+                }
+            }
+        }
+    } else {
+        packet.clone()
+    };
+
+    send_to_next_hop(&forwarded, &handler, None).await;
 }
 
 async fn handle_link_request<'a>(
@@ -2512,7 +2594,8 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         handler.config.name,
                         link.id()
                     );
-                    handler.send_packet(link.request()).await;
+                    let current_mtu = link.mtu();
+                    handler.send_packet(link.request(Some(current_mtu))).await;
                 }
             }
             LinkStatus::Closed => {
