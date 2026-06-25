@@ -36,13 +36,14 @@ use crate::destination::DestinationHandleStatus;
 use crate::destination::DestinationName;
 use crate::destination::SingleInputDestination;
 use crate::destination::SingleOutputDestination;
+use crate::destination::link::link_signalling_bytes;
 use crate::destination::link::mtu_from_signalling_bytes;
 use crate::destination::link::Link;
 use crate::destination::link::LinkEventData;
 use crate::destination::link::LinkHandleResult;
 use crate::destination::link::LinkId;
 use crate::destination::link::LinkStatus;
-use crate::destination::link::{LINK_MODE_AES256_CBC, LINK_MTU_SIZE};
+use crate::destination::link::LINK_MTU_SIZE;
 
 use crate::error::RnsError;
 
@@ -2380,11 +2381,18 @@ async fn handle_link_request_as_destination<'a>(
     destination: Arc<Mutex<SingleInputDestination>>,
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
+    iface: AddressHash,
 ) {
+    let packet = if handler.config.link_mtu_discovery {
+        clamp_link_request_mtu(packet, &handler, Some(iface), None).await
+    } else {
+        packet.clone()
+    };
+
     let mut destination = destination.lock().await;
-    match destination.handle_packet(packet) {
+    match destination.handle_packet(&packet) {
         DestinationHandleStatus::LinkProof => {
-            let link_id = LinkId::from(packet);
+            let link_id = LinkId::from(&packet);
             if !handler.in_links.contains_key(&link_id) {
                 log::trace!(
                     "tp({}): send proof to {}",
@@ -2393,7 +2401,7 @@ async fn handle_link_request_as_destination<'a>(
                 );
 
                 let link = Link::new_from_request(
-                    packet,
+                    &packet,
                     destination.sign_key().clone(),
                     destination.desc,
                     handler.link_in_event_tx.clone(),
@@ -2434,50 +2442,8 @@ async fn handle_link_request_as_intermediate<'a>(
         remaining_hops,
     );
 
-    // MTU clamping: intermediate transport nodes compare the signalled path
-    // MTU against the next-hop interface's HW_MTU and clamp or strip.
-    let forwarded = if handler.config.link_mtu_discovery && packet.data.len()
-        >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE
-    {
-        let signalling = &packet.data.as_slice()
-            [PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
-        let path_mtu = mtu_from_signalling_bytes(signalling);
-        let nh_hw_mtu = handler.iface_manager.lock().await.hw_mtu(&next_hop_iface);
-
-        match nh_hw_mtu {
-            Some(nh_mtu) => {
-                let clamped = path_mtu.min(nh_mtu);
-                if clamped < path_mtu {
-                    let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
-                    let signalling_value =
-                        (clamped as u32 & 0x1F_FFFF) + (mode_bits << 16);
-                    let mut clamped_bytes = [0u8; LINK_MTU_SIZE];
-                    let be = signalling_value.to_be_bytes();
-                    clamped_bytes.copy_from_slice(&be[1..4]);
-
-                    let mut data = packet.data.clone();
-                    let offset = data.len() - LINK_MTU_SIZE;
-                    data.as_mut_slice()[offset..].copy_from_slice(&clamped_bytes);
-
-                    Packet {
-                        data,
-                        ..packet.clone()
-                    }
-                } else {
-                    packet.clone()
-                }
-            }
-            None => {
-                // Next-hop interface does not support MTU upgrades; strip the
-                // signalling bytes so the destination falls back to 500.
-                let mut data = packet.data.clone();
-                data.resize(PUBLIC_KEY_LENGTH * 2);
-                Packet {
-                    data,
-                    ..packet.clone()
-                }
-            }
-        }
+    let forwarded = if handler.config.link_mtu_discovery {
+        clamp_link_request_mtu(packet, &handler, Some(received_from), Some(next_hop_iface)).await
     } else {
         packet.clone()
     };
@@ -2485,10 +2451,69 @@ async fn handle_link_request_as_intermediate<'a>(
     send_to_next_hop(&forwarded, &handler, None).await;
 }
 
+async fn clamp_link_request_mtu<'a>(
+    packet: &Packet,
+    handler: &MutexGuard<'a, TransportHandler>,
+    inbound_iface: Option<AddressHash>,
+    outbound_iface: Option<AddressHash>,
+) -> Packet {
+    if packet.data.len() != PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE {
+        return packet.clone();
+    }
+
+    let signalling =
+        &packet.data.as_slice()[PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
+    let path_mtu = mtu_from_signalling_bytes(signalling);
+    let iface_manager = handler.iface_manager.lock().await;
+    let inbound_mtu = inbound_iface.and_then(|iface| iface_manager.hw_mtu(&iface));
+    let outbound_mtu = outbound_iface.and_then(|iface| iface_manager.hw_mtu(&iface));
+    drop(iface_manager);
+
+    let mut clamped = path_mtu;
+    if let Some(mtu) = inbound_mtu {
+        clamped = clamped.min(mtu);
+    }
+
+    match outbound_iface {
+        Some(_) => match outbound_mtu {
+            Some(mtu) => clamped = clamped.min(mtu),
+            None => return strip_link_mtu_signalling(packet),
+        },
+        None => {
+            if let Some(mtu) = inbound_mtu {
+                clamped = clamped.min(mtu);
+            } else {
+                return strip_link_mtu_signalling(packet);
+            }
+        }
+    }
+
+    if clamped < path_mtu {
+        let mut data = packet.data.clone();
+        let offset = data.len() - LINK_MTU_SIZE;
+        data.as_mut_slice()[offset..].copy_from_slice(&link_signalling_bytes(clamped));
+        Packet {
+            data,
+            ..packet.clone()
+        }
+    } else {
+        packet.clone()
+    }
+}
+
+fn strip_link_mtu_signalling(packet: &Packet) -> Packet {
+    let mut data = packet.data.clone();
+    data.resize(PUBLIC_KEY_LENGTH * 2);
+    Packet {
+        data,
+        ..packet.clone()
+    }
+}
+
 async fn handle_link_request<'a>(
     packet: &Packet,
     iface: AddressHash,
-    mut handler: MutexGuard<'a, TransportHandler>,
+    handler: MutexGuard<'a, TransportHandler>,
 ) {
     if let Some(destination) = handler
         .single_in_destinations
@@ -2501,7 +2526,7 @@ async fn handle_link_request<'a>(
             packet.destination
         );
 
-        handle_link_request_as_destination(destination, packet, handler).await;
+        handle_link_request_as_destination(destination, packet, handler, iface).await;
     } else if let Some(entry) = handler.path_table.next_hop_route(&packet.destination) {
         log::trace!(
             "tp({}): handle link request for remote destination {}",

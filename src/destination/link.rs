@@ -29,7 +29,7 @@ const CHANNEL_SEQUENCE_MAX: u16 = u16::MAX;
 const CHANNEL_SEQUENCE_MODULUS: u32 = CHANNEL_SEQUENCE_MAX as u32 + 1;
 const CHANNEL_WINDOW_MAX: u16 = 48;
 
-fn link_signalling_bytes(mtu: usize) -> [u8; LINK_MTU_SIZE] {
+pub(crate) fn link_signalling_bytes(mtu: usize) -> [u8; LINK_MTU_SIZE] {
     let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
     let signalling_value = (mtu as u32 & 0x1F_FFFF) + (mode_bits << 16);
     let bytes = signalling_value.to_be_bytes();
@@ -44,6 +44,13 @@ pub(crate) fn mtu_from_signalling_bytes(bytes: &[u8]) -> usize {
     let mut raw = [0u8; 4];
     raw[1..4].copy_from_slice(&bytes[..LINK_MTU_SIZE]);
     (u32::from_be_bytes(raw) & 0x1F_FFFF) as usize
+}
+
+pub(crate) fn mode_from_signalling_bytes(bytes: &[u8]) -> u8 {
+    if bytes.len() < LINK_MTU_SIZE {
+        return LINK_MODE_AES256_CBC;
+    }
+    (bytes[0] & 0xE0) >> 5
 }
 
 fn channel_sequence_distance(base: u16, sequence: u16) -> u32 {
@@ -274,7 +281,9 @@ impl Link {
         destination: DestinationDesc,
         event_tx: tokio::sync::broadcast::Sender<LinkEventData>,
     ) -> Result<Self, RnsError> {
-        if packet.data.len() < PUBLIC_KEY_LENGTH * 2 {
+        if packet.data.len() != PUBLIC_KEY_LENGTH * 2
+            && packet.data.len() != PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE
+        {
             return Err(RnsError::InvalidArgument);
         }
 
@@ -290,6 +299,9 @@ impl Link {
         let mtu = if packet.data.len() >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE {
             let signalling = &packet.data.as_slice()
                 [PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
+            if mode_from_signalling_bytes(signalling) != LINK_MODE_AES256_CBC {
+                return Err(RnsError::InvalidArgument);
+            }
             mtu_from_signalling_bytes(signalling)
         } else {
             RETICULUM_MTU
@@ -971,7 +983,7 @@ fn validate_proof_packet(
     const MTU_PROOF_LEN: usize = SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH + LINK_MTU_SIZE;
     const SIGN_DATA_LEN: usize = ADDRESS_HASH_SIZE + PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE;
 
-    if packet.data.len() < MIN_PROOF_LEN {
+    if packet.data.len() != MIN_PROOF_LEN && packet.data.len() != MTU_PROOF_LEN {
         return Err(RnsError::PacketError);
     }
 
@@ -989,6 +1001,9 @@ fn validate_proof_packet(
 
         if packet.data.len() >= MTU_PROOF_LEN {
             let mtu_bytes = &packet.data.as_slice()[SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH..];
+            if mode_from_signalling_bytes(mtu_bytes) != LINK_MODE_AES256_CBC {
+                return Err(RnsError::InvalidArgument);
+            }
             output.write(mtu_bytes)?;
         }
 
@@ -1113,7 +1128,9 @@ mod tests {
     use crate::serde::Serialize;
     use crate::test_vectors;
 
-    use super::{ChannelEnvelope, ChannelMessage, Link, LinkEvent, LinkHandleResult};
+    use super::{
+        ChannelEnvelope, ChannelMessage, Link, LinkEvent, LinkHandleResult, LINK_MTU_SIZE,
+    };
 
     struct TestChannelMessage(Vec<u8>);
 
@@ -1194,6 +1211,51 @@ mod tests {
         let _ = out_event_rx.try_recv();
 
         (out_link, in_link, out_event_rx, in_event_rx)
+    }
+
+    #[test]
+    fn link_request_rejects_python_incompatible_payload_lengths() {
+        let identity = PrivateIdentity::new_from_name("invalid request owner");
+        let destination = SingleInputDestination::new(
+            identity,
+            DestinationName::new("example_utilities", "link.invalid_request"),
+        );
+        let (event_tx, _) = tokio::sync::broadcast::channel(1);
+        let mut out_link = Link::new(destination.desc, event_tx.clone());
+        let mut request = out_link.request(None);
+        request.data.safe_write(&[0x00]);
+
+        let result = Link::new_from_request(
+            &request,
+            destination.sign_key().clone(),
+            destination.desc,
+            event_tx,
+        );
+
+        assert!(matches!(result, Err(RnsError::InvalidArgument)));
+    }
+
+    #[test]
+    fn link_request_rejects_unsupported_signalled_mode() {
+        let identity = PrivateIdentity::new_from_name("invalid mode owner");
+        let destination = SingleInputDestination::new(
+            identity,
+            DestinationName::new("example_utilities", "link.invalid_mode"),
+        );
+        let (event_tx, _) = tokio::sync::broadcast::channel(1);
+        let mut out_link = Link::new(destination.desc, event_tx.clone());
+        let mut request = out_link.request(None);
+        let offset = request.data.len() - LINK_MTU_SIZE;
+        request.data.as_mut_slice()[offset] = 0x40;
+
+        let result = Link::new_from_request(
+            &request,
+            destination.sign_key().clone(),
+            destination.desc,
+            event_tx,
+        );
+
+        assert!(matches!(result, Err(RnsError::InvalidArgument)));
     }
 
     #[test]
