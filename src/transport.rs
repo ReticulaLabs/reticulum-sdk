@@ -1735,7 +1735,7 @@ impl Drop for Transport {
 
 impl TransportHandler {
     async fn send_packet(&self, packet: Packet) {
-        let (packet, maybe_iface) = self.path_table.handle_packet(&packet);
+        let (packet, maybe_iface) = self.path_table.handle_packet(packet);
         let tx_type = if let Some(iface) = maybe_iface {
             log::trace!(
                 "tp({}): outbound routed packet to {} over {}",

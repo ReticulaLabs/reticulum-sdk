@@ -224,24 +224,24 @@ self_referential_transport={}",
         }
     }
 
-    pub fn handle_packet(&self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
-        if original_packet.header.header_type == HeaderType::Type2 {
-            return (original_packet.clone(), None);
+    pub fn handle_packet(&self, packet: Packet) -> (Packet, Option<AddressHash>) {
+        if packet.header.header_type == HeaderType::Type2 {
+            return (packet, None);
         }
 
-        if original_packet.header.packet_type == PacketType::Announce {
-            return (original_packet.clone(), None);
+        if packet.header.packet_type == PacketType::Announce {
+            return (packet, None);
         }
 
-        if original_packet.header.destination_type == DestinationType::Plain
-            || original_packet.header.destination_type == DestinationType::Group
+        if packet.header.destination_type == DestinationType::Plain
+            || packet.header.destination_type == DestinationType::Group
         {
-            return (original_packet.clone(), None);
+            return (packet, None);
         }
 
-        let entry = match self.map.get(&original_packet.destination) {
+        let entry = match self.map.get(&packet.destination) {
             Some(entry) => entry,
-            None => return (original_packet.clone(), None),
+            None => return (packet, None),
         };
 
         (
@@ -249,13 +249,13 @@ self_referential_transport={}",
                 header: Header {
                     header_type: HeaderType::Type2,
                     propagation_type: PropagationType::Transport,
-                    ..original_packet.header
+                    ..packet.header
                 },
-                ifac: original_packet.ifac,
-                destination: original_packet.destination,
+                ifac: packet.ifac,
+                destination: packet.destination,
                 transport: Some(entry.received_from),
-                context: original_packet.context,
-                data: original_packet.data.clone(),
+                context: packet.context,
+                data: packet.data.clone(),
             },
             Some(entry.iface),
         )
