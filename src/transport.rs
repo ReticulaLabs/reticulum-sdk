@@ -2620,9 +2620,11 @@ async fn manage_transport(
     rx_receiver: Arc<Mutex<InterfaceRxReceiver>>,
     iface_messages_tx: broadcast::Sender<RxMessage>,
 ) {
-    let cancel = handler.lock().await.cancel.clone();
-    let retransmit = handler.lock().await.config.retransmit;
-    let mut last_retransmit_old = if handler.lock().await.config.announce_forever {
+    let (cancel, retransmit, announce_forever, tp_name) = {
+        let h = handler.lock().await;
+        (h.cancel.clone(), h.config.retransmit, h.config.announce_forever, h.config.name.clone())
+    };
+    let mut last_retransmit_old = if announce_forever {
         Some(time::Instant::now() - INTERVAL_OLD_ANNOUNCES_RETRANSMIT)
     } else {
         None
@@ -2632,10 +2634,7 @@ async fn manage_transport(
         let handler = handler.clone();
         let cancel = cancel.clone();
 
-        log::trace!(
-            "tp({}): start packet task",
-            handler.lock().await.config.name
-        );
+        log::trace!("tp({}): start packet task", tp_name);
 
         tokio::spawn(async move {
             loop {
@@ -2670,42 +2669,30 @@ async fn manage_transport(
                     );
                 }
 
-                let handled_fixed_destination = {
-                    let mut handler = handler.lock().await;
-                    handle_fixed_destinations(&packet, &mut handler, message.address).await
-                };
-                if handled_fixed_destination {
+                // Single lock acquisition for the entire packet processing pipeline,
+                // eliminating 4-6 redundant lock/unlock cycles per packet.
+                let mut handler = handler.lock().await;
+
+                if handle_fixed_destinations(&packet, &mut handler, message.address).await {
                     continue;
                 }
 
-                let accepting_transport = {
-                    let handler = handler.lock().await;
-                    handler.accepts_transport_packet(&packet)
-                };
-                if !accepting_transport {
-                    let transport = packet
-                        .transport
-                        .map(|transport| transport.to_string())
-                        .unwrap_or_else(|| "None".to_owned());
-                    let name = handler.lock().await.config.name.clone();
+                if !handler.accepts_transport_packet(&packet) {
                     log::trace!(
                         "tp({}): dropping packet for other transport: dst={}, transport={}",
-                        name,
+                        tp_name,
                         packet.destination,
-                        transport,
+                        packet.transport
+                            .map(|transport| transport.to_string())
+                            .unwrap_or_else(|| "None".to_owned()),
                     );
                     continue;
                 }
 
-                let new_or_allowed_duplicate = {
-                    let handler = handler.lock().await;
-                    handler.filter_duplicate_packets(&packet).await
-                };
-                if !new_or_allowed_duplicate {
-                    let name = handler.lock().await.config.name.clone();
+                if !handler.filter_duplicate_packets(&packet).await {
                     log::debug!(
                         "tp({}): dropping duplicate packet: dst={}, ctx={:?}, type={:?}",
-                        name,
+                        tp_name,
                         packet.destination,
                         packet.context,
                         packet.header.packet_type
@@ -2713,14 +2700,9 @@ async fn manage_transport(
                     continue;
                 }
 
-                let should_rebroadcast = {
-                    let handler = handler.lock().await;
-                    handler.config.broadcast && should_rebroadcast_inbound_packet(&packet)
-                };
-                if should_rebroadcast {
+                if handler.config.broadcast && should_rebroadcast_inbound_packet(&packet) {
                     // Plain first-hop broadcasts are not inserted into transport. Repeat
                     // them locally, and leave routed traffic to the path/link tables.
-                    let handler = handler.lock().await;
                     handler
                         .send(TxMessage {
                             tx_type: TxMessageType::Broadcast(Some(message.address)),
@@ -2731,14 +2713,14 @@ async fn manage_transport(
 
                 match packet.header.packet_type {
                     PacketType::Announce => {
-                        handle_announce(&packet, handler.lock().await, message.address).await
+                        handle_announce(&packet, handler, message.address).await
                     }
                     PacketType::LinkRequest => {
-                        handle_link_request(&packet, message.address, handler.lock().await).await
+                        handle_link_request(&packet, message.address, handler).await
                     }
-                    PacketType::Proof => handle_proof(&packet, handler.lock().await).await,
+                    PacketType::Proof => handle_proof(&packet, handler).await,
                     PacketType::Data => {
-                        handle_data(&packet, message.address, handler.lock().await).await
+                        handle_data(&packet, message.address, handler).await
                     }
                 }
             }
