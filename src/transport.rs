@@ -19,6 +19,7 @@ use rmpv::{Value, decode::read_value, encode::write_value};
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener as StdTcpListener;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -196,7 +197,7 @@ struct TransportHandler {
     out_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
     in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
 
-    packet_cache: Mutex<PacketCache>,
+    packet_cache: StdMutex<PacketCache>,
 
     path_requests: PathRequests,
 
@@ -461,7 +462,7 @@ impl Transport {
             announce_limits: AnnounceLimits::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
-            packet_cache: Mutex::new(PacketCache::new()),
+            packet_cache: StdMutex::new(PacketCache::new()),
             path_requests,
             announce_tx,
             discovery_tx: discovery_tx.clone(),
@@ -1751,7 +1752,7 @@ impl TransportHandler {
     }
 
     async fn send(&self, message: TxMessage) {
-        self.packet_cache.lock().await.update(&message.packet);
+        self.packet_cache.lock().unwrap().update(&message.packet);
         self.iface_manager.lock().await.send(message).await;
     }
 
@@ -1796,7 +1797,7 @@ impl TransportHandler {
             }
         }
 
-        let is_new = self.packet_cache.lock().await.update(packet);
+        let is_new = self.packet_cache.lock().unwrap().update(packet);
 
         is_new || allow_duplicate
     }
@@ -2838,7 +2839,7 @@ async fn manage_transport(
                         handler
                             .packet_cache
                             .lock()
-                            .await
+                            .unwrap()
                             .release(INTERVAL_KEEP_PACKET_CACHED);
 
                         handler.link_table.remove_stale();
@@ -3419,7 +3420,7 @@ mod tests {
             .await
             .packet_cache
             .lock()
-            .await
+            .unwrap()
             .release(Duration::from_secs(1));
 
         // Packet should have been removed from cache (stale)
