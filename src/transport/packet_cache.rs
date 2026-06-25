@@ -13,29 +13,17 @@ pub struct PacketTrack {
 
 pub struct PacketCache {
     map: HashMap<Hash, PacketTrack>,
-    remove_cache: Vec<Hash>,
 }
 
 impl PacketCache {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
-            remove_cache: Vec::new(),
         }
     }
 
     pub fn release(&mut self, duration: Duration) {
-        for entry in &self.map {
-            if entry.1.time.elapsed() > duration {
-                self.remove_cache.push(*entry.0);
-            }
-        }
-
-        for hash in &self.remove_cache {
-            self.map.remove(hash);
-        }
-
-        self.remove_cache.clear();
+        self.map.retain(|_, track| track.time.elapsed() <= duration);
     }
 
     pub fn update(&mut self, packet: &Packet) -> bool {
