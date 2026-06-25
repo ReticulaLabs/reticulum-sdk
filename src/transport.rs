@@ -2088,25 +2088,28 @@ async fn handle_announce<'a>(
         }
     }
 
-    log::trace!(
-        "tp({}): rx announce dst={} iface={} header={:?} context_flag={:?} propagation={:?} \
+    if log::log_enabled!(log::Level::Trace) {
+        let hash = packet.hash();
+        log::trace!(
+            "tp({}): rx announce dst={} iface={} header={:?} context_flag={:?} propagation={:?} \
 dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destination={} hash={}",
-        handler.config.name,
-        packet.destination,
-        iface,
-        packet.header.header_type,
-        packet.header.context_flag,
-        packet.header.propagation_type,
-        packet.header.destination_type,
-        packet.context,
-        packet.header.hops,
-        packet
-            .transport
-            .map(|transport| transport.to_string())
-            .unwrap_or_else(|| "None".to_owned()),
-        packet.transport == Some(packet.destination),
-        packet.hash(),
-    );
+            handler.config.name,
+            packet.destination,
+            iface,
+            packet.header.header_type,
+            packet.header.context_flag,
+            packet.header.propagation_type,
+            packet.header.destination_type,
+            packet.context,
+            packet.header.hops,
+            packet
+                .transport
+                .map(|transport| transport.to_string())
+                .unwrap_or_else(|| "None".to_owned()),
+            packet.transport == Some(packet.destination),
+            hash,
+        );
+    }
 
     if let Ok(result) = DestinationAnnounce::validate(packet) {
         let destination = result.0;
