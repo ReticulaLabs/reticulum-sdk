@@ -14,6 +14,7 @@ use crate::{
     packet::{
         self, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
         PacketDataBuffer, PacketType, PropagationType, ENCRYPTED_PACKET_MDU,
+        RETICULUM_AES_BLOCK_SIZE, RETICULUM_EC_PUBLIC_KEY_SIZE, RETICULUM_TOKEN_OVERHEAD,
     },
 };
 use sha2::Digest;
@@ -560,14 +561,20 @@ impl Destination<Identity, Output, Single> {
                     &PublicKey::from(ratchet_public_key),
                     data,
                     Some(self.identity.as_address_hash_slice()),
-                    packet_data.accuire_buf_max(),
+                    packet_data.accuire_buf(
+                        data.len() + RETICULUM_EC_PUBLIC_KEY_SIZE + RETICULUM_TOKEN_OVERHEAD
+                            + RETICULUM_AES_BLOCK_SIZE,
+                    ),
                 )?
             } else {
                 self.identity.encrypt_packet(
                     OsRng,
                     data,
                     Some(self.identity.as_address_hash_slice()),
-                    packet_data.accuire_buf_max(),
+                    packet_data.accuire_buf(
+                        data.len() + RETICULUM_EC_PUBLIC_KEY_SIZE + RETICULUM_TOKEN_OVERHEAD
+                            + RETICULUM_AES_BLOCK_SIZE,
+                    ),
                 )?
             };
             cipher_text.len()

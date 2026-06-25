@@ -2032,7 +2032,7 @@ async fn handle_data<'a>(
             let mut proof = None;
             let decrypted_len = {
                 let destination = destination.lock().await;
-                match destination.decrypt(packet.data.as_slice(), plain_data.accuire_buf_max()) {
+                match destination.decrypt(packet.data.as_slice(), plain_data.accuire_buf(packet.data.len())) {
                     Ok(data) => {
                         if destination.prove_packets() {
                             proof = Some(destination.proof_packet(&packet.hash()));

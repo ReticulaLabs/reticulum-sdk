@@ -15,7 +15,8 @@ use crate::{
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
         compute_link_mdu, DestinationType, Header, Packet, PacketContext, PacketDataBuffer,
-        PacketType, PACKET_MDU, RETICULUM_MTU,
+        PacketType, PACKET_MDU, RETICULUM_AES_BLOCK_SIZE, RETICULUM_MTU,
+        RETICULUM_TOKEN_OVERHEAD,
     },
 };
 
@@ -634,7 +635,12 @@ impl Link {
         let mut packet_data = PacketDataBuffer::new();
 
         let cipher_text_len = {
-            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
+            let cipher_text = self.encrypt(
+                data,
+                packet_data.accuire_buf(
+                    data.len() + RETICULUM_TOKEN_OVERHEAD + RETICULUM_AES_BLOCK_SIZE,
+                ),
+            )?;
             cipher_text.len()
         };
 
@@ -827,7 +833,12 @@ impl Link {
 
         let token_len = {
             let token = self
-                .encrypt(buf.as_slice(), packet_data.accuire_buf_max())
+                .encrypt(
+                    buf.as_slice(),
+                    packet_data.accuire_buf(
+                        buf.len() + RETICULUM_TOKEN_OVERHEAD + RETICULUM_AES_BLOCK_SIZE,
+                    ),
+                )
                 .expect("encrypted data");
             token.len()
         };
