@@ -134,7 +134,7 @@ pub enum LinkHandleResult {
 #[derive(Clone)]
 pub enum LinkEvent {
     Activated,
-    Data(LinkPayload),
+    Data(Box<LinkPayload>),
     RemoteIdentified(Identity),
     Request(LinkRequest),
     Response(LinkResponse),
@@ -383,7 +383,9 @@ impl Link {
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
-                    self.post_event(LinkEvent::Data(LinkPayload::new_from_slice(plain_text)));
+                    self.post_event(LinkEvent::Data(Box::new(LinkPayload::new_from_slice(
+                        plain_text,
+                    ))));
 
                     let proof = if self.proves_messages {
                         Some(self.message_proof(packet.hash()))
