@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use core::fmt;
 
 use sha2::Digest;
@@ -255,28 +256,38 @@ impl fmt::Display for Header {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct PacketDataBuffer {
-    buffer: Vec<u8>,
+    buffer: Arc<Vec<u8>>,
+}
+
+impl Clone for PacketDataBuffer {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
 }
 
 impl PacketDataBuffer {
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self {
+            buffer: Arc::new(Vec::new()),
+        }
     }
 
     pub fn new_from_slice(data: &[u8]) -> Self {
         Self {
-            buffer: data.to_vec(),
+            buffer: Arc::new(data.to_vec()),
         }
     }
 
     pub fn reset(&mut self) {
-        self.buffer.clear();
+        Arc::make_mut(&mut self.buffer).clear();
     }
 
     pub fn resize(&mut self, len: usize) {
-        self.buffer.resize(len, 0);
+        Arc::make_mut(&mut self.buffer).resize(len, 0);
     }
 
     pub fn len(&self) -> usize {
@@ -293,7 +304,7 @@ impl PacketDataBuffer {
     }
 
     pub fn safe_write(&mut self, data: &[u8]) -> usize {
-        self.buffer.extend_from_slice(data);
+        Arc::make_mut(&mut self.buffer).extend_from_slice(data);
         data.len()
     }
 
@@ -303,7 +314,7 @@ impl PacketDataBuffer {
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<usize, crate::error::RnsError> {
-        self.buffer.extend_from_slice(data);
+        Arc::make_mut(&mut self.buffer).extend_from_slice(data);
         Ok(data.len())
     }
 
@@ -312,22 +323,25 @@ impl PacketDataBuffer {
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buffer
+        Arc::make_mut(&mut self.buffer).as_mut_slice()
     }
 
     pub fn accuire_buf(&mut self, len: usize) -> &mut [u8] {
-        self.resize(len);
-        self.as_mut_slice()
+        let buf = Arc::make_mut(&mut self.buffer);
+        buf.resize(len, 0);
+        buf.as_mut_slice()
     }
 
     pub fn try_accuire_buf(&mut self, len: usize) -> Result<&mut [u8], crate::error::RnsError> {
-        self.resize(len);
-        Ok(self.as_mut_slice())
+        let buf = Arc::make_mut(&mut self.buffer);
+        buf.resize(len, 0);
+        Ok(buf.as_mut_slice())
     }
 
     pub fn accuire_buf_max(&mut self) -> &mut [u8] {
-        self.resize(DEFAULT_PACKET_DATA_BUFFER_SIZE);
-        self.as_mut_slice()
+        let buf = Arc::make_mut(&mut self.buffer);
+        buf.resize(DEFAULT_PACKET_DATA_BUFFER_SIZE, 0);
+        buf.as_mut_slice()
     }
 }
 
