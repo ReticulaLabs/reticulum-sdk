@@ -8,6 +8,7 @@ pub mod udp;
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
@@ -138,6 +139,15 @@ pub trait Interface {
     fn fixed_mtu(&self) -> bool {
         false
     }
+
+    /// Returns a shared MTU atomic for live updates. If the interface
+    /// updates its HW_MTU at runtime (e.g. Modem73), it should return
+    /// `Some(arc)` pointing to the same `Arc<AtomicUsize>` used by
+    /// `hw_mtu()`. The default returns `None`, causing the registration
+    /// path to snapshot the value returned by `hw_mtu()`.
+    fn hw_mtu_source(&self) -> Option<Arc<AtomicUsize>> {
+        None
+    }
 }
 
 pub(crate) fn configured_bitrate(bitrate: f64) -> Option<f64> {
@@ -155,9 +165,10 @@ struct LocalInterface {
     announce_pacer: Option<AnnouncePacer>,
     saturated_queue_logger: SaturatedQueueLogger,
     shared_instance_client: bool,
-    /// Hardware MTU reported by this interface. `None` means the interface
-    /// does not participate in link MTU discovery / upgrades.
-    hw_mtu: Option<usize>,
+    /// Hardware MTU atomic, shared with the interface for live updates.
+    /// `None` means the interface does not participate in link MTU
+    /// discovery / upgrades.
+    hw_mtu: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Clone)]
@@ -419,7 +430,7 @@ impl InterfaceManager {
         tx_cap: usize,
         announce_pacer: Option<AnnouncePacer>,
         shared_instance_client: bool,
-        hw_mtu: Option<usize>,
+        hw_mtu: Option<Arc<AtomicUsize>>,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -428,7 +439,11 @@ impl InterfaceManager {
 
         let (tx_send, tx_recv) = InterfaceChannel::make_tx_channel(tx_cap);
 
-        log::debug!("iface: create channel {} hw_mtu={:?}", address, hw_mtu);
+        log::debug!(
+            "iface: create channel {} hw_mtu={:?}",
+            address,
+            hw_mtu.as_ref().map(|m| m.load(Ordering::Relaxed))
+        );
 
         let stop = CancellationToken::new();
 
@@ -465,7 +480,11 @@ impl InterfaceManager {
             .filter(|bitrate| *bitrate > 0.0 && announce_cap > 0.0)
             .map(|bitrate| AnnouncePacer::new(bitrate, announce_cap));
         let hw_mtu = if inner.autoconfigure_mtu() || inner.fixed_mtu() {
-            Some(inner.hw_mtu())
+            Some(
+                inner
+                    .hw_mtu_source()
+                    .unwrap_or_else(|| Arc::new(AtomicUsize::new(inner.hw_mtu()))),
+            )
         } else {
             None
         };
@@ -576,7 +595,7 @@ impl InterfaceManager {
         self.ifaces
             .iter()
             .find(|iface| iface.address == *address && !iface.stop.is_cancelled())
-            .and_then(|iface| iface.hw_mtu)
+            .and_then(|iface| iface.hw_mtu.as_ref().map(|mtu| mtu.load(Ordering::Relaxed)))
     }
 
     pub async fn send(&self, message: TxMessage) {

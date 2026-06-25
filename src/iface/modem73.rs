@@ -223,6 +223,10 @@ impl Interface for Modem73Interface {
     fn autoconfigure_mtu(&self) -> bool {
         true
     }
+
+    fn hw_mtu_source(&self) -> Option<Arc<AtomicUsize>> {
+        Some(self.current_mtu.clone())
+    }
 }
 
 async fn query_initial_mtu(config: &Modem73Interface) -> Option<usize> {
