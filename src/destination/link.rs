@@ -557,7 +557,7 @@ impl Link {
         }
 
         if self.status == LinkStatus::Active && packet.context == PacketContext::None {
-            if let Ok(hash) = validate_message_proof(&self.peer_identity, packet.data.as_slice()) {
+            if let Ok(hash) = validate_message_proof(&self.peer_identity, packet.data.as_slice(), None) {
                 self.post_event(LinkEvent::Proof(hash));
             }
         }
@@ -970,23 +970,31 @@ fn validate_proof_packet(
     Ok(identity)
 }
 
-fn validate_message_proof(peer_identity: &Identity, data: &[u8]) -> Result<Hash, RnsError> {
-    if data.len() <= HASH_SIZE {
-        return Err(RnsError::PacketError);
-    }
-
-    let maybe_signature = Signature::from_slice(&data[HASH_SIZE..]);
-    let signature = match maybe_signature {
-        Ok(s) => s,
-        Err(_) => return Err(RnsError::PacketError),
-    };
-
-    let hash_slice = &data[..HASH_SIZE];
-
-    if peer_identity.verify(hash_slice, &signature).is_ok() {
+fn validate_message_proof(
+    peer_identity: &Identity,
+    data: &[u8],
+    expected_hash: Option<&Hash>,
+) -> Result<Hash, RnsError> {
+    if data.len() == HASH_SIZE + SIGNATURE_LENGTH {
+        // Explicit proof: first HASH_SIZE bytes are the hash, rest is the signature
+        let hash_slice = &data[..HASH_SIZE];
+        let signature =
+            Signature::from_slice(&data[HASH_SIZE..]).map_err(|_| RnsError::PacketError)?;
+        peer_identity
+            .verify(hash_slice, &signature)
+            .map_err(|_| RnsError::IncorrectSignature)?;
         Ok(Hash::new(hash_slice.try_into().unwrap()))
+    } else if data.len() == SIGNATURE_LENGTH {
+        // Implicit proof: entire data is the signature, hash must be provided externally
+        let hash = expected_hash.ok_or(RnsError::PacketError)?;
+        let signature =
+            Signature::from_slice(data).map_err(|_| RnsError::PacketError)?;
+        peer_identity
+            .verify(hash.as_slice(), &signature)
+            .map_err(|_| RnsError::IncorrectSignature)?;
+        Ok(*hash)
     } else {
-        Err(RnsError::IncorrectSignature)
+        Err(RnsError::PacketError)
     }
 }
 
