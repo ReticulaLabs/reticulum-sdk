@@ -2639,81 +2639,108 @@ async fn manage_transport(
 
         tokio::spawn(async move {
             loop {
-                let mut rx_receiver = rx_receiver.lock().await;
-
                 if cancel.is_cancelled() {
                     break;
                 }
 
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        break;
-                    },
-                    Some(message) = rx_receiver.recv() => {
-                        let _ = iface_messages_tx.send(message.clone());
-
-                        let packet = message.packet;
-
-                        let mut handler = handler.lock().await;
-
-                        if PACKET_TRACE {
-                            log::debug!("tp: << rx({}) = {} {}", message.address, packet, packet.hash());
-                        }
-
-                        if handle_fixed_destinations(
-                            &packet,
-                            &mut handler,
-                            message.address
-                        ).await {
-                            continue;
-                        }
-
-                        if !handler.accepts_transport_packet(&packet) {
-                            log::trace!(
-                                "tp({}): dropping packet for other transport: dst={}, transport={}",
-                                handler.config.name,
-                                packet.destination,
-                                packet
-                                    .transport
-                                    .map(|transport| transport.to_string())
-                                    .unwrap_or_else(|| "None".to_owned()),
-                            );
-                            continue;
-                        }
-
-                        if !handler.filter_duplicate_packets(&packet).await {
-                            log::debug!(
-                                "tp({}): dropping duplicate packet: dst={}, ctx={:?}, type={:?}",
-                                handler.config.name,
-                                packet.destination,
-                                packet.context,
-                                packet.header.packet_type
-                            );
-                            continue;
-                        }
-
-                        if handler.config.broadcast && should_rebroadcast_inbound_packet(&packet) {
-                            // Plain first-hop broadcasts are not inserted into transport. Repeat
-                            // them locally, and leave routed traffic to the path/link tables.
-                            handler.send(TxMessage { tx_type: TxMessageType::Broadcast(Some(message.address)), packet: packet.clone() }).await;
-                        }
-
-                        match packet.header.packet_type {
-                            PacketType::Announce => handle_announce(
-                                &packet,
-                                handler,
-                                message.address
-                            ).await,
-                            PacketType::LinkRequest => handle_link_request(
-                                &packet,
-                                message.address,
-                                handler
-                            ).await,
-                            PacketType::Proof => handle_proof(&packet, handler).await,
-                            PacketType::Data => handle_data(&packet, message.address, handler).await,
-                        }
+                let message = {
+                    let mut rx_receiver = rx_receiver.lock().await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            break;
+                        },
+                        message = rx_receiver.recv() => message,
                     }
                 };
+
+                let Some(message) = message else {
+                    break;
+                };
+
+                let _ = iface_messages_tx.send(message.clone());
+
+                let packet = message.packet;
+
+                if PACKET_TRACE {
+                    log::debug!(
+                        "tp: << rx({}) = {} {}",
+                        message.address,
+                        packet,
+                        packet.hash()
+                    );
+                }
+
+                let handled_fixed_destination = {
+                    let mut handler = handler.lock().await;
+                    handle_fixed_destinations(&packet, &mut handler, message.address).await
+                };
+                if handled_fixed_destination {
+                    continue;
+                }
+
+                let accepting_transport = {
+                    let handler = handler.lock().await;
+                    handler.accepts_transport_packet(&packet)
+                };
+                if !accepting_transport {
+                    let transport = packet
+                        .transport
+                        .map(|transport| transport.to_string())
+                        .unwrap_or_else(|| "None".to_owned());
+                    let name = handler.lock().await.config.name.clone();
+                    log::trace!(
+                        "tp({}): dropping packet for other transport: dst={}, transport={}",
+                        name,
+                        packet.destination,
+                        transport,
+                    );
+                    continue;
+                }
+
+                let new_or_allowed_duplicate = {
+                    let handler = handler.lock().await;
+                    handler.filter_duplicate_packets(&packet).await
+                };
+                if !new_or_allowed_duplicate {
+                    let name = handler.lock().await.config.name.clone();
+                    log::debug!(
+                        "tp({}): dropping duplicate packet: dst={}, ctx={:?}, type={:?}",
+                        name,
+                        packet.destination,
+                        packet.context,
+                        packet.header.packet_type
+                    );
+                    continue;
+                }
+
+                let should_rebroadcast = {
+                    let handler = handler.lock().await;
+                    handler.config.broadcast && should_rebroadcast_inbound_packet(&packet)
+                };
+                if should_rebroadcast {
+                    // Plain first-hop broadcasts are not inserted into transport. Repeat
+                    // them locally, and leave routed traffic to the path/link tables.
+                    let handler = handler.lock().await;
+                    handler
+                        .send(TxMessage {
+                            tx_type: TxMessageType::Broadcast(Some(message.address)),
+                            packet: packet.clone(),
+                        })
+                        .await;
+                }
+
+                match packet.header.packet_type {
+                    PacketType::Announce => {
+                        handle_announce(&packet, handler.lock().await, message.address).await
+                    }
+                    PacketType::LinkRequest => {
+                        handle_link_request(&packet, message.address, handler.lock().await).await
+                    }
+                    PacketType::Proof => handle_proof(&packet, handler.lock().await).await,
+                    PacketType::Data => {
+                        handle_data(&packet, message.address, handler.lock().await).await
+                    }
+                }
             }
         })
     };
