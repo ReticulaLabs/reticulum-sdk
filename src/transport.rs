@@ -99,6 +99,7 @@ const INTERVAL_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(1);
 const INTERVAL_OLD_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(60);
 const INTERVAL_KEEP_PACKET_CACHED: Duration = Duration::from_secs(180);
 const INTERVAL_PACKET_CACHE_CLEANUP: Duration = Duration::from_secs(90);
+const INTERVAL_LINK_TABLE_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_KEEP_REVERSE_PATH: Duration = Duration::from_secs(8 * 60);
 
 // Other constants
@@ -1952,7 +1953,7 @@ async fn send_to_next_hop<'a>(
 
 async fn handle_keepalive_response<'a>(
     packet: &Packet,
-    handler: &MutexGuard<'a, TransportHandler>,
+    handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
     if packet.context == PacketContext::KeepAlive {
         if packet.data.as_slice()[0] == KEEP_ALIVE_RESPONSE {
@@ -2046,7 +2047,7 @@ async fn handle_data<'a>(
             data_handled = true;
         }
 
-        if handle_keepalive_response(packet, &handler).await {
+        if handle_keepalive_response(packet, &mut handler).await {
             return;
         }
 
@@ -3067,7 +3068,7 @@ async fn manage_transport(
                             .unwrap()
                             .release(INTERVAL_KEEP_PACKET_CACHED);
 
-                        handler.link_table.remove_stale();
+                        handler.link_table.remove_stale(INTERVAL_LINK_TABLE_STALE);
                         handler.reverse_table.remove_stale(INTERVAL_KEEP_REVERSE_PATH);
 
                         let active_ifaces: HashSet<AddressHash> = handler

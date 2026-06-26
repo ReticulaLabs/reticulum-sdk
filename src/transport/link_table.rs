@@ -77,13 +77,14 @@ impl LinkTable {
             .map(|e| e.original_destination)
     }
 
-    pub fn handle_keepalive(&self, packet: &Packet) -> Option<(Packet, AddressHash)> {
-        let result = self.0.get(&packet.destination).map(|entry| {
+    pub fn handle_keepalive(&mut self, packet: &Packet) -> Option<(Packet, AddressHash)> {
+        let result = self.0.get_mut(&packet.destination).map(|entry| {
             log::trace!(
                 "link_table: forward keepalive for link {} to {}",
                 packet.destination,
                 entry.received_from,
             );
+            entry.timestamp = Instant::now();
             propagate(packet, entry.received_from)
         });
         if result.is_none() {
@@ -203,13 +204,20 @@ impl LinkTable {
         }
     }
 
-    pub fn remove_stale(&mut self) {
+    pub fn remove_stale(&mut self, max_age: Duration) {
         let mut stale = vec![];
         let now = Instant::now();
 
         for (link_id, entry) in &self.0 {
             if entry.validated {
-                // TODO remove active timed out links
+                if entry.timestamp + max_age <= now {
+                    log::info!(
+                        "link_table: remove stale validated entry for link {} (idle for {}s)",
+                        link_id,
+                        now.duration_since(entry.timestamp).as_secs(),
+                    );
+                    stale.push(link_id.clone());
+                }
             } else {
                 if entry.proof_timeout <= now {
                     log::trace!(
