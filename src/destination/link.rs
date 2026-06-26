@@ -513,8 +513,8 @@ impl Link {
                 if !out_link {
                     let mut buffer = vec![0u8; decrypt_buf_len];
                     if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
-                        if let Ok(rtt) = rmp::decode::read_f32(&mut &plain_text[..]) {
-                            self.rtt = Duration::from_secs_f32(rtt);
+                        if let Ok(rtt) = rmp::decode::read_f64(&mut &plain_text[..]) {
+                            self.rtt = Duration::from_secs_f64(rtt);
                         } else {
                             log::error!("link({}): failed to decode rtt", self.id);
                         }
@@ -834,11 +834,11 @@ impl Link {
     }
 
     pub fn create_rtt(&self) -> Packet {
-        let rtt = self.rtt.as_secs_f32();
+        let rtt = self.rtt.as_secs_f64();
         let mut buf = Vec::new();
         {
-            buf.reserve(4);
-            rmp::encode::write_f32(&mut buf, rtt).unwrap();
+            buf.reserve(9);
+            rmp::encode::write_f64(&mut buf, rtt).unwrap();
         }
 
         let mut packet_data = PacketDataBuffer::new();
