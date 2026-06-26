@@ -1773,13 +1773,21 @@ impl TransportHandler {
         let (packet, maybe_iface) = self.path_table.handle_packet(packet);
         let tx_type = if let Some(iface) = maybe_iface {
             log::trace!(
-                "tp({}): outbound routed packet to {} over {}",
+                "tp({}): outbound packet dst={} ctx={:?} over iface={}",
                 self.config.name,
                 packet.destination,
+                packet.context,
                 iface,
             );
             TxMessageType::Direct(iface)
         } else {
+            log::trace!(
+                "tp({}): outbound broadcast dst={} ctx={:?} type={:?}",
+                self.config.name,
+                packet.destination,
+                packet.context,
+                packet.header.packet_type,
+            );
             TxMessageType::Broadcast(None)
         };
 
@@ -1882,6 +1890,11 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         let mut link = link.lock().await;
         match link.handle_packet(packet, true) {
             LinkHandleResult::Activated => {
+                log::info!(
+                    "tp({}): out-link {} activated by proof, sending RTT",
+                    handler.config.name,
+                    link.id(),
+                );
                 let rtt_packet = link.create_rtt();
                 handler.send_packet(rtt_packet).await;
             }
@@ -1926,6 +1939,12 @@ async fn send_to_next_hop<'a>(
                 packet,
             })
             .await;
+    } else {
+        log::trace!(
+            "tp({}): no next-hop for dst={}, dropping forwarded packet",
+            handler.config.name,
+            packet.destination,
+        );
     }
 
     maybe_iface.is_some()
@@ -1937,6 +1956,12 @@ async fn handle_keepalive_response<'a>(
 ) -> bool {
     if packet.context == PacketContext::KeepAlive {
         if packet.data.as_slice()[0] == KEEP_ALIVE_RESPONSE {
+            log::trace!(
+                "tp({}): keepalive response for link {}",
+                handler.config.name,
+                packet.destination,
+            );
+
             let lookup = handler.link_table.handle_keepalive(packet);
 
             if let Some((propagated, iface)) = lookup {
@@ -1968,19 +1993,56 @@ async fn handle_data<'a>(
             let result = link.handle_packet(packet, false);
             match result {
                 LinkHandleResult::KeepAlive => {
+                    log::trace!(
+                        "tp({}): received keepalive on in-link {}, sending response",
+                        handler.config.name,
+                        link.id(),
+                    );
                     let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
                     handler.send_packet(packet).await;
                 }
                 LinkHandleResult::MessageReceived(Some(proof)) => {
+                    log::trace!(
+                        "tp({}): received data on in-link {}, sending proof",
+                        handler.config.name,
+                        link.id(),
+                    );
                     handler.send_packet(proof).await;
                 }
-                _ => {}
+                LinkHandleResult::MessageReceived(None) => {
+                    log::trace!(
+                        "tp({}): received data on in-link {} (no proof)",
+                        handler.config.name,
+                        link.id(),
+                    );
+                }
+                LinkHandleResult::None => {
+                    log::trace!(
+                        "tp({}): received packet on in-link {} (no action)",
+                        handler.config.name,
+                        link.id(),
+                    );
+                }
+                LinkHandleResult::Activated => {
+                    log::trace!(
+                        "tp({}): in-link {} activated",
+                        handler.config.name,
+                        link.id(),
+                    );
+                }
             }
         }
 
         for link in handler.out_links.values() {
             let mut link = link.lock().await;
-            let _ = link.handle_packet(packet, true);
+            let result = link.handle_packet(packet, true);
+            if matches!(result, LinkHandleResult::KeepAlive) {
+                log::trace!(
+                    "tp({}): received keepalive response on out-link {}",
+                    handler.config.name,
+                    link.id(),
+                );
+            }
             data_handled = true;
         }
 
@@ -1998,9 +2060,10 @@ async fn handle_data<'a>(
                 .await;
 
             log::trace!(
-                "tp({}): forwarded packet for remote link {}",
+                "tp({}): forwarded packet for remote link {} via iface {}",
                 handler.config.name,
-                destination
+                destination,
+                iface,
             );
 
             return;
@@ -2434,6 +2497,15 @@ async fn handle_link_request_as_intermediate<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
+    log::trace!(
+        "tp({}): forward link request dst={} from={} to_iface={} ({} hops remaining)",
+        handler.config.name,
+        packet.destination,
+        received_from,
+        next_hop_iface,
+        remaining_hops,
+    );
+
     handler.link_table.add(
         packet,
         packet.destination,
@@ -2448,7 +2520,15 @@ async fn handle_link_request_as_intermediate<'a>(
         packet.clone()
     };
 
-    send_to_next_hop(&forwarded, &handler, None).await;
+    let sent = send_to_next_hop(&forwarded, &handler, None).await;
+    if !sent {
+        log::warn!(
+            "tp({}): failed to forward link request dst={} to_iface={}",
+            handler.config.name,
+            packet.destination,
+            next_hop_iface,
+        );
+    }
 }
 
 async fn clamp_link_request_mtu<'a>(
@@ -2556,11 +2636,23 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         match link.status() {
             LinkStatus::Active => {
                 if link.elapsed() > INTERVAL_INPUT_LINK_STALE {
+                    log::info!(
+                        "tp({}): in-link {} stale after {}s",
+                        handler.config.name,
+                        link.id(),
+                        link.elapsed().as_secs(),
+                    );
                     link.stale();
                 }
             }
             LinkStatus::Stale => {
                 if link.elapsed() > INTERVAL_INPUT_LINK_STALE + INTERVAL_INPUT_LINK_CLOSE {
+                    log::info!(
+                        "tp({}): teardown stale in-link {} after {}s",
+                        handler.config.name,
+                        link.id(),
+                        link.elapsed().as_secs(),
+                    );
                     if let Some(packet) = link.teardown().unwrap_or_else(|err| {
                         log::error!(
                             "tp({}): teardown stale in-link error: {err:?}",
@@ -2589,16 +2681,34 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         match link.status() {
             LinkStatus::Active => {
                 if link.elapsed() > INTERVAL_OUTPUT_LINK_STALE {
+                    log::info!(
+                        "tp({}): out-link {} stale after {}s",
+                        handler.config.name,
+                        link.id(),
+                        link.elapsed().as_secs(),
+                    );
                     link.stale();
                 }
             }
             LinkStatus::Stale => {
                 if handler.config.restart_outlinks {
                     if link.elapsed() > INTERVAL_OUTPUT_LINK_RESTART {
+                        log::info!(
+                            "tp({}): restart out-link {} after {}s",
+                            handler.config.name,
+                            link.id(),
+                            link.elapsed().as_secs(),
+                        );
                         link.restart();
                     }
                 } else {
                     if link.elapsed() > INTERVAL_OUTPUT_LINK_STALE + INTERVAL_OUTPUT_LINK_CLOSE {
+                        log::info!(
+                            "tp({}): teardown out-link {} after {}s",
+                            handler.config.name,
+                            link.id(),
+                            link.elapsed().as_secs(),
+                        );
                         if let Some(packet) = link.teardown().unwrap_or_else(|err| {
                             log::error!(
                                 "tp({}): teardown stale out-link error: {err:?}",
@@ -2641,6 +2751,12 @@ async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
         let mut link = link.lock().await;
 
         if link.status() == LinkStatus::Active {
+            log::trace!(
+                "tp({}): send keepalive for link {}",
+                handler.config.name,
+                link.id(),
+            );
+
             handler
                 .send_packet(link.keep_alive_packet(KEEP_ALIVE_REQUEST))
                 .await;

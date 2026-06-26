@@ -226,6 +226,10 @@ self_referential_transport={}",
 
     pub fn handle_packet(&self, packet: Packet) -> (Packet, Option<AddressHash>) {
         if packet.header.header_type == HeaderType::Type2 {
+            log::trace!(
+                "path_table: skip Type2 packet dst={}",
+                packet.destination
+            );
             return (packet, None);
         }
 
@@ -241,16 +245,34 @@ self_referential_transport={}",
 
         let entry = match self.map.get(&packet.destination) {
             Some(entry) => entry,
-            None => return (packet, None),
+            None => {
+                log::trace!(
+                    "path_table: no path for dst={}, falling back to broadcast",
+                    packet.destination
+                );
+                return (packet, None);
+            }
         };
 
         let (header_type, propagation_type, transport) = if entry.hops > 1 {
+            log::trace!(
+                "path_table: route dst={} via next-hop={} iface={} ({} hops)",
+                packet.destination,
+                entry.received_from,
+                entry.iface,
+                entry.hops,
+            );
             (
                 HeaderType::Type2,
                 PropagationType::Transport,
                 Some(entry.received_from),
             )
         } else {
+            log::trace!(
+                "path_table: direct dst={} on iface={} (1 hop)",
+                packet.destination,
+                entry.iface,
+            );
             (HeaderType::Type1, PropagationType::Broadcast, None)
         };
 

@@ -355,6 +355,13 @@ impl Link {
         self.mtu = mtu;
         self.request_time = Instant::now();
 
+        log::debug!(
+            "link({}): link request created dst={} mtu={}",
+            self.id,
+            self.destination.address_hash,
+            mtu,
+        );
+
         packet
     }
 

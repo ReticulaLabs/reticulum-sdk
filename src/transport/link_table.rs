@@ -78,9 +78,21 @@ impl LinkTable {
     }
 
     pub fn handle_keepalive(&self, packet: &Packet) -> Option<(Packet, AddressHash)> {
-        self.0
-            .get(&packet.destination)
-            .map(|entry| propagate(packet, entry.received_from))
+        let result = self.0.get(&packet.destination).map(|entry| {
+            log::trace!(
+                "link_table: forward keepalive for link {} to {}",
+                packet.destination,
+                entry.received_from,
+            );
+            propagate(packet, entry.received_from)
+        });
+        if result.is_none() {
+            log::trace!(
+                "link_table: no entry for keepalive dst={}",
+                packet.destination,
+            );
+        }
+        result
     }
 
     pub fn handle_packet(
@@ -91,6 +103,11 @@ impl LinkTable {
         let entry = self.0.get_mut(&packet.destination)?;
 
         if !entry.validated {
+            log::trace!(
+                "link_table: unvalidated entry for link {} on iface {}, dropping",
+                packet.destination,
+                received_on,
+            );
             return None;
         }
 
@@ -99,25 +116,63 @@ impl LinkTable {
             {
                 Some(entry.next_hop_iface)
             } else {
+                log::trace!(
+                    "link_table: hop mismatch for link {} on iface {}: \
+                     packet_hops={} remaining_hops={} taken_hops={}",
+                    packet.destination,
+                    received_on,
+                    packet.header.hops,
+                    entry.remaining_hops,
+                    entry.taken_hops,
+                );
                 None
             }
         } else if received_on == entry.next_hop_iface {
             if packet.header.hops == entry.remaining_hops {
                 Some(entry.received_from)
             } else {
+                log::trace!(
+                    "link_table: hop mismatch for link {} from next-hop iface {}: \
+                     packet_hops={} remaining_hops={}",
+                    packet.destination,
+                    received_on,
+                    packet.header.hops,
+                    entry.remaining_hops,
+                );
                 None
             }
         } else if received_on == entry.received_from {
             if packet.header.hops == entry.taken_hops {
                 Some(entry.next_hop_iface)
             } else {
+                log::trace!(
+                    "link_table: hop mismatch for link {} from received-from iface {}: \
+                     packet_hops={} taken_hops={}",
+                    packet.destination,
+                    received_on,
+                    packet.header.hops,
+                    entry.taken_hops,
+                );
                 None
             }
         } else {
+            log::trace!(
+                "link_table: no matching interface for link {} (received_on={}, \
+                 next_hop={}, received_from={})",
+                packet.destination,
+                received_on,
+                entry.next_hop_iface,
+                entry.received_from,
+            );
             None
         };
 
         outbound_iface.map(|iface| {
+            log::trace!(
+                "link_table: forward link data {} to iface {}",
+                packet.destination,
+                iface,
+            );
             entry.timestamp = Instant::now();
             propagate(packet, iface)
         })
@@ -126,12 +181,25 @@ impl LinkTable {
     pub fn handle_proof(&mut self, proof: &Packet) -> Option<(Packet, AddressHash)> {
         match self.0.get_mut(&proof.destination) {
             Some(entry) => {
+                log::trace!(
+                    "link_table: forward proof for link {} ({} hops) to {}",
+                    proof.destination,
+                    proof.header.hops,
+                    entry.received_from,
+                );
+
                 entry.remaining_hops = proof.header.hops;
                 entry.validated = true;
 
                 Some(propagate(proof, entry.received_from))
             }
-            None => None,
+            None => {
+                log::trace!(
+                    "link_table: no entry for proof dst={}",
+                    proof.destination,
+                );
+                None
+            }
         }
     }
 
@@ -144,6 +212,10 @@ impl LinkTable {
                 // TODO remove active timed out links
             } else {
                 if entry.proof_timeout <= now {
+                    log::trace!(
+                        "link_table: remove stale entry for link {} (proof timeout)",
+                        link_id,
+                    );
                     stale.push(link_id.clone());
                 }
             }
