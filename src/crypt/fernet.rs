@@ -11,6 +11,7 @@ use crypto_common::{IvSizeUser, KeySizeUser, OutputSizeUser};
 use hmac::{Hmac, Mac};
 use rand_core::CryptoRngCore;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use crate::error::RnsError;
 
@@ -170,15 +171,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let actual_tag = hmac.finalize().into_bytes();
 
-        let valid = expected_tag
-            .iter()
-            .zip(actual_tag.as_slice())
-            .map(|(x, y)| x.cmp(y))
-            .find(|&ord| ord != cmp::Ordering::Equal)
-            .unwrap_or(actual_tag.len().cmp(&expected_tag.len()))
-            == cmp::Ordering::Equal;
-
-        if valid {
+        if expected_tag.ct_eq(actual_tag.as_slice()).into() {
             Ok(VerifiedToken { 0: token_data })
         } else {
             Err(RnsError::IncorrectSignature)
