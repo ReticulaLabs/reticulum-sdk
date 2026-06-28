@@ -70,7 +70,7 @@ impl Identity {
         }
     }
 
-    pub fn new_from_slices(public_key: &[u8], verifying_key: &[u8]) -> Self {
+    pub fn new_from_slices(public_key: &[u8], verifying_key: &[u8]) -> Result<Self, RnsError> {
         let public_key = {
             let mut key_data = [0u8; PUBLIC_KEY_LENGTH];
             key_data.copy_from_slice(&public_key);
@@ -80,10 +80,10 @@ impl Identity {
         let verifying_key = {
             let mut key_data = [0u8; PUBLIC_KEY_LENGTH];
             key_data.copy_from_slice(&verifying_key);
-            VerifyingKey::from_bytes(&key_data).unwrap_or_default()
+            VerifyingKey::from_bytes(&key_data).map_err(|_| RnsError::CryptoError)?
         };
 
-        Self::new(public_key, verifying_key)
+        Ok(Self::new(public_key, verifying_key))
     }
 
     pub fn new_from_hex_string(hex_string: &str) -> Result<Self, RnsError> {
@@ -103,10 +103,10 @@ impl Identity {
             .unwrap();
         }
 
-        Ok(Self::new_from_slices(
+        Self::new_from_slices(
             &public_key_bytes[..],
             &verifying_key_bytes[..],
-        ))
+        )
     }
 
     pub fn to_hex_string(&self) -> String {

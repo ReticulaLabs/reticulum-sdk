@@ -290,7 +290,7 @@ impl Link {
         let peer_identity = Identity::new_from_slices(
             &packet.data.as_slice()[..PUBLIC_KEY_LENGTH],
             &packet.data.as_slice()[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2],
-        );
+        )?;
 
         let link_id = LinkId::from(packet);
         log::debug!("link: create from request {}", link_id);
@@ -914,7 +914,7 @@ impl Link {
         let identity = Identity::new_from_slices(
             &plaintext[..PUBLIC_KEY_LENGTH],
             &plaintext[PUBLIC_KEY_LENGTH..PUBLIC_IDENTITY_LEN],
-        );
+        )?;
         let signature = Signature::from_slice(&plaintext[PUBLIC_IDENTITY_LEN..IDENTIFY_LEN])
             .map_err(|_| RnsError::PacketError)?;
 
@@ -1025,7 +1025,7 @@ fn validate_proof_packet(
     let identity = Identity::new_from_slices(
         &proof_data[ADDRESS_HASH_SIZE..ADDRESS_HASH_SIZE + PUBLIC_KEY_LENGTH],
         verifying_key,
-    );
+    )?;
 
     let signature = Signature::from_slice(&packet.data.as_slice()[..SIGNATURE_LENGTH])
         .map_err(|_| RnsError::CryptoError)?;
