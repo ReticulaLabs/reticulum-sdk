@@ -1956,6 +1956,14 @@ async fn handle_keepalive_response<'a>(
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
     if packet.context == PacketContext::KeepAlive {
+        if packet.data.len() == 0 {
+            log::trace!(
+                "tp({}): keepalive with empty data for link {}, ignoring",
+                handler.config.name,
+                packet.destination,
+            );
+            return true;
+        }
         if packet.data.as_slice()[0] == KEEP_ALIVE_RESPONSE {
             log::trace!(
                 "tp({}): keepalive response for link {}",
