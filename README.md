@@ -69,7 +69,7 @@ reticulum-sdk = "2.0"
 
 ## Implementations
 
-* Used by the [Rust reticulum-router daemon](https://github.com/GhostMeshLabs/reticulum-router)
+* Used by the [Rust reticulum-router daemon](https://github.com/ReticulaLabs/reticulum-router)
 
 ## License
 

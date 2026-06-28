@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use ed25519_dalek::Signature;
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use rmpv::{decode::read_value, encode::write_value, Value};
@@ -223,21 +224,48 @@ impl DiscoveredInterface {
         hops: u8,
         app_data: &[u8],
     ) -> Result<Self, RnsError> {
-        if app_data.len() <= HASH_SIZE + 1 {
+        if app_data.is_empty() {
             return Err(RnsError::PacketError);
         }
 
         let flags = app_data[0];
-        if flags & FLAG_SIGNED != 0 {
-            return Err(RnsError::PacketError);
-        }
         if flags & FLAG_ENCRYPTED != 0 {
             return Err(RnsError::PacketError);
         }
 
-        let stamp_start = app_data.len() - HASH_SIZE;
+        let is_signed = flags & FLAG_SIGNED != 0;
+
+        let min_len = if is_signed {
+            1 + HASH_SIZE + ed25519_dalek::SIGNATURE_LENGTH
+        } else {
+            1 + HASH_SIZE
+        };
+        if app_data.len() <= min_len {
+            return Err(RnsError::PacketError);
+        }
+
+        let stamp_start = if is_signed {
+            app_data.len() - HASH_SIZE - ed25519_dalek::SIGNATURE_LENGTH
+        } else {
+            app_data.len() - HASH_SIZE
+        };
         let packed = &app_data[1..stamp_start];
-        let stamp = &app_data[stamp_start..];
+        let stamp = &app_data[stamp_start..stamp_start + HASH_SIZE];
+
+        if is_signed {
+            let sig_start = stamp_start + HASH_SIZE;
+            let sig_bytes = &app_data[sig_start..sig_start + ed25519_dalek::SIGNATURE_LENGTH];
+            let signature =
+                Signature::from_slice(sig_bytes).map_err(|_| RnsError::IncorrectSignature)?;
+
+            let mut signed_data = Vec::with_capacity(packed.len() + HASH_SIZE);
+            signed_data.extend_from_slice(packed);
+            signed_data.extend_from_slice(stamp);
+
+            source
+                .identity
+                .verify(&signed_data, &signature)?;
+        }
 
         let infohash = Hash::new_from_slice(packed);
         let workblock = stamp_workblock(infohash.as_slice(), WORKBLOCK_EXPAND_ROUNDS)?;
@@ -262,6 +290,10 @@ impl DiscoveredInterface {
         let height = get_f64(map, KEY_HEIGHT)?;
         let ifac_netname = get_string(map, KEY_IFAC_NETNAME)?;
         let ifac_netkey = get_string(map, KEY_IFAC_NETKEY)?;
+
+        if transport_id != source.identity.address_hash {
+            return Err(RnsError::IncorrectHash);
+        }
 
         let config_entry = match (interface_type.as_str(), reachable_on.as_deref(), port) {
             ("TCPServerInterface", Some(reachable_on), Some(port)) => {
@@ -466,14 +498,17 @@ mod tests {
 
     #[test]
     fn discovery_payload_roundtrip() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
         let config = DiscoveryInterfaceConfig::tcp_server("Rust Node", "127.0.0.1", 4242)
             .with_position(Some(55.0), Some(12.0), Some(10.0))
             .with_ifac("mesh", "shared-secret");
-        let transport_id = AddressHash::new_from_slice(b"transport-id");
         let app_data = config.build_app_data(true, &transport_id).unwrap();
 
-        let source = create_discovery_destination(PrivateIdentity::new_from_name("discovery")).desc;
-        let decoded = DiscoveredInterface::from_announce(source, 1, app_data.as_slice()).unwrap();
+        let decoded =
+            DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
 
         assert_eq!(decoded.interface_type, "TCPServerInterface");
         assert_eq!(decoded.name, "Rust Node");
@@ -488,13 +523,16 @@ mod tests {
 
     #[test]
     fn discovery_payload_accepts_unicode_names() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
         let config = DiscoveryInterfaceConfig::tcp_server("København 測試", "127.0.0.1", 4242)
             .with_ifac("møøse-net", "nøgle");
-        let transport_id = AddressHash::new_from_slice(b"transport-id");
         let app_data = config.build_app_data(true, &transport_id).unwrap();
 
-        let source = create_discovery_destination(PrivateIdentity::new_from_name("discovery")).desc;
-        let decoded = DiscoveredInterface::from_announce(source, 1, app_data.as_slice()).unwrap();
+        let decoded =
+            DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
 
         assert_eq!(decoded.name, "København 測試");
         assert_eq!(decoded.ifac_netname.as_deref(), Some("møøse-net"));
@@ -508,7 +546,10 @@ mod tests {
 
     #[test]
     fn discovery_payload_accepts_utf8_binary_names_from_python() {
-        let transport_id = AddressHash::new_from_slice(b"transport-id");
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
         let info = vec![
             (
                 u8_value(KEY_INTERFACE_TYPE),
@@ -534,8 +575,8 @@ mod tests {
         ];
         let app_data = build_test_discovery_app_data(info);
 
-        let source = create_discovery_destination(PrivateIdentity::new_from_name("discovery")).desc;
-        let decoded = DiscoveredInterface::from_announce(source, 1, app_data.as_slice()).unwrap();
+        let decoded =
+            DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
         assert_eq!(decoded.interface_type, "TCPServerInterface");
         assert_eq!(decoded.name, "København 測試");
         assert_eq!(decoded.reachable_on.as_deref(), Some("127.0.0.1"));
