@@ -172,6 +172,10 @@ impl AnnounceTable {
         false
     }
 
+    pub fn entries_len(&self) -> usize {
+        self.map.len() + self.responses.len()
+    }
+
     pub fn clear(&mut self) {
         self.map.clear();
         self.responses.clear();

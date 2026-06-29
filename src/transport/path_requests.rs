@@ -234,6 +234,10 @@ impl PathRequests {
         }
     }
 
+    pub fn pending_discovery_len(&self) -> usize {
+        self.discovery.len()
+    }
+
     pub fn generate_recursive(
         &mut self,
         destination: &AddressHash,

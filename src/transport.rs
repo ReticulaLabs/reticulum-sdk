@@ -176,6 +176,15 @@ pub enum SharedInstanceType {
     Unix,
 }
 
+/// Per-type counters for received packets.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct PacketTypeCounters {
+    pub announce: u64,
+    pub link_request: u64,
+    pub proof: u64,
+    pub data: u64,
+}
+
 /// Snapshot of transport metrics intended for external collection.
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct TransportMetrics {
@@ -183,6 +192,34 @@ pub struct TransportMetrics {
     pub interface_queues: InterfaceQueueLengths,
     /// Number of entries currently known in the path table.
     pub path_table_entries: usize,
+    /// Count of received packets by type since transport creation.
+    pub packets_received_by_type: PacketTypeCounters,
+    /// Number of duplicate inbound packets dropped.
+    pub packets_dropped_duplicate: u64,
+    /// Number of announces blocked by the rate limiter.
+    pub announces_rate_limited: u64,
+    /// Number of packets that failed decryption.
+    pub decryption_failures: u64,
+    /// Number of entries in the announce retransmit table.
+    pub announce_table_entries: usize,
+    /// Number of entries in the link forwarding table.
+    pub link_table_entries: usize,
+    /// Number of entries in the reverse path table.
+    pub reverse_table_entries: usize,
+    /// Number of entries in the duplicate packet cache.
+    pub packet_cache_entries: usize,
+    /// Number of outbound links currently in Active state.
+    pub active_out_links: usize,
+    /// Number of inbound links currently in Active state.
+    pub active_in_links: usize,
+    /// Total number of outbound link entries.
+    pub total_out_links: usize,
+    /// Total number of inbound link entries.
+    pub total_in_links: usize,
+    /// Number of non-cancelled interfaces registered with the manager.
+    pub active_interfaces: usize,
+    /// Number of pending discovery path requests.
+    pub pending_path_requests: usize,
 }
 
 /// Shared sending context: independently-locked resources used for
@@ -258,6 +295,15 @@ struct TransportHandler {
     fixed_dest_path_requests: AddressHash,
 
     cancel: CancellationToken,
+
+    /// Packet type counters incremented during inbound processing.
+    packets_received_by_type: PacketTypeCounters,
+    /// Number of duplicate inbound packets dropped.
+    packets_dropped_duplicate: u64,
+    /// Number of announces blocked by the rate limiter.
+    announces_rate_limited: u64,
+    /// Number of packets that failed decryption.
+    decryption_failures: u64,
 }
 
 pub struct Transport {
@@ -530,6 +576,10 @@ impl Transport {
             received_data_tx: received_data_tx.clone(),
             fixed_dest_path_requests: path_request_dest,
             cancel: cancel.clone(),
+            packets_received_by_type: PacketTypeCounters::default(),
+            packets_dropped_duplicate: 0,
+            announces_rate_limited: 0,
+            decryption_failures: 0,
         }));
 
         {
@@ -582,10 +632,47 @@ impl Transport {
     pub async fn metrics(&self) -> TransportMetrics {
         let path_table_entries = self.path_table_len().await;
         let interface_queues = self.interface_queue_lengths().await;
+        let packet_cache_entries = self.send_ctx.packet_cache.lock().unwrap().len();
+
+        let handler = self.handler.lock().await;
+
+        let mut active_out_links: usize = 0;
+        let mut active_in_links: usize = 0;
+        for link in handler.out_links.values() {
+            if link.lock().await.status() == LinkStatus::Active {
+                active_out_links += 1;
+            }
+        }
+        for link in handler.in_links.values() {
+            if link.lock().await.status() == LinkStatus::Active {
+                active_in_links += 1;
+            }
+        }
+
+        let active_interfaces = self
+            .iface_manager
+            .lock()
+            .await
+            .active_interface_addresses()
+            .len();
 
         TransportMetrics {
             interface_queues,
             path_table_entries,
+            packets_received_by_type: handler.packets_received_by_type,
+            packets_dropped_duplicate: handler.packets_dropped_duplicate,
+            announces_rate_limited: handler.announces_rate_limited,
+            decryption_failures: handler.decryption_failures,
+            announce_table_entries: handler.announce_table.entries_len(),
+            link_table_entries: handler.link_table.len(),
+            reverse_table_entries: handler.reverse_table.len(),
+            packet_cache_entries,
+            active_out_links,
+            active_in_links,
+            total_out_links: handler.out_links.len(),
+            total_in_links: handler.in_links.len(),
+            active_interfaces,
+            pending_path_requests: handler.path_requests.pending_discovery_len(),
         }
     }
 
@@ -1858,7 +1945,7 @@ impl TransportHandler {
         }
     }
 
-    async fn filter_duplicate_packets(&self, packet: &Packet) -> bool {
+    async fn filter_duplicate_packets(&mut self, packet: &Packet) -> bool {
         let mut allow_duplicate = false;
 
         match packet.header.packet_type {
@@ -1881,6 +1968,10 @@ impl TransportHandler {
         }
 
         let is_new = self.send_ctx.packet_cache.lock().unwrap().update(packet);
+
+        if !is_new && !allow_duplicate {
+            self.packets_dropped_duplicate += 1;
+        }
 
         is_new || allow_duplicate
     }
@@ -2155,6 +2246,7 @@ async fn handle_data<'a>(
                         Some(data.len())
                     }
                     Err(err) => {
+                        handler.decryption_failures += 1;
                         log::warn!(
                             "tp({}): failed to decrypt packet for {}: {err:?}",
                             handler.config.name,
@@ -2231,6 +2323,7 @@ async fn handle_announce<'a>(
 
     if packet.context != PacketContext::PathResponse {
         if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
+            handler.announces_rate_limited += 1;
             log::info!(
                 "tp({}): too many announces from {}, blocked for {} seconds",
                 handler.config.name,
@@ -3010,13 +3103,19 @@ async fn manage_transport(
 
                 match packet.header.packet_type {
                     PacketType::Announce => {
+                        handler.packets_received_by_type.announce += 1;
                         handle_announce(&packet, handler, message.address).await
                     }
                     PacketType::LinkRequest => {
+                        handler.packets_received_by_type.link_request += 1;
                         handle_link_request(&packet, message.address, handler).await
                     }
-                    PacketType::Proof => handle_proof(&packet, handler).await,
+                    PacketType::Proof => {
+                        handler.packets_received_by_type.proof += 1;
+                        handle_proof(&packet, handler).await
+                    }
                     PacketType::Data => {
+                        handler.packets_received_by_type.data += 1;
                         handle_data(&packet, message.address, handler).await
                     }
                 }
@@ -3907,7 +4006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_report_path_table_entry_count() {
+    async fn metrics_snapshot_reflects_transport_state() {
         let transport = Transport::new(Default::default());
         let handler = transport.get_handler();
         let remote_destination = SingleInputDestination::new(
@@ -3919,12 +4018,60 @@ mod tests {
             .expect("valid announce");
         let iface = AddressHash::new_from_rand(OsRng);
 
-        assert_eq!(transport.path_table_len().await, 0);
+        // Before any traffic
+        let m = transport.metrics().await;
+        assert_eq!(m.path_table_entries, 0);
+        assert_eq!(m.announce_table_entries, 0);
+        assert_eq!(m.packets_dropped_duplicate, 0);
+        assert_eq!(m.announces_rate_limited, 0);
+        assert_eq!(m.decryption_failures, 0);
+        assert_eq!(m.link_table_entries, 0);
+        assert_eq!(m.reverse_table_entries, 0);
+        assert_eq!(m.active_out_links, 0);
+        assert_eq!(m.active_in_links, 0);
+        assert_eq!(m.total_out_links, 0);
+        assert_eq!(m.total_in_links, 0);
+        assert_eq!(m.pending_path_requests, 0);
+        assert_eq!(m.active_interfaces, 0);
+
+        // Process an announce
+        handle_announce(&announce, handler.lock().await, iface).await;
+
+        let m = transport.metrics().await;
+        assert_eq!(m.path_table_entries, 1);
+        // announce_table should have one entry after handle_announce
+        assert_eq!(m.announce_table_entries, 1);
+        // packet cache is updated in the main processing loop, not inside handle_announce,
+        // so we don't check it here
+    }
+
+    #[tokio::test]
+    async fn metrics_track_rate_limited_announces() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("example_utilities", "metrics.limit"),
+        );
+        let announce = remote_destination
+            .announce(OsRng, None)
+            .expect("valid announce");
+        let iface = AddressHash::new_from_rand(OsRng);
+
+        // Force-block the destination so the next announce is rate-limited
+        {
+            let mut guard = handler.lock().await;
+            guard
+                .announce_limits
+                .force_block(announce.destination, Duration::from_secs(60));
+        }
 
         handle_announce(&announce, handler.lock().await, iface).await;
 
-        assert_eq!(transport.path_table_len().await, 1);
-        assert_eq!(transport.metrics().await.path_table_entries, 1);
+        let m = transport.metrics().await;
+        assert_eq!(m.announces_rate_limited, 1);
+        // The announnce should NOT have populated the path table
+        assert_eq!(m.path_table_entries, 0);
     }
 
     #[tokio::test]

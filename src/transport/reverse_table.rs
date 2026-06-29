@@ -51,6 +51,10 @@ impl ReverseTable {
         })
     }
 
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn remove_stale(&mut self, max_age: Duration) {
         self.0
             .retain(|_, entry| entry.timestamp.elapsed() <= max_age);

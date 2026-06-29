@@ -26,6 +26,10 @@ impl PacketCache {
         self.map.retain(|_, track| track.time.elapsed() <= duration);
     }
 
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
     pub fn update(&mut self, packet: &Packet) -> bool {
         let hash = packet.hash();
 

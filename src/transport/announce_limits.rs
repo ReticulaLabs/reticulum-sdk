@@ -98,7 +98,7 @@ impl AnnounceLimits {
 
     #[cfg(test)]
     pub(crate) fn force_block(&mut self, destination: AddressHash, duration: Duration) {
-        let mut entry = AnnounceLimitEntry::new(Default::default());
+        let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit::default()));
         entry.blocked_until = Instant::now() + duration;
         self.limits.insert(destination, entry);
     }

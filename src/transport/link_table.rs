@@ -39,6 +39,10 @@ impl LinkTable {
         Self(HashMap::new())
     }
 
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn add(
         &mut self,
         link_request: &Packet,
