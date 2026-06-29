@@ -64,7 +64,7 @@ cargo test
 Cargo.toml
 ```toml
 [dependencies]
-reticulum-sdk = "2.0"
+reticulum-sdk = "2.1"
 ```
 
 ## Implementations
