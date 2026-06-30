@@ -1,4 +1,5 @@
 pub mod hdlc;
+pub mod ifac;
 pub mod kiss;
 pub mod modem73;
 pub mod rnode;
@@ -18,9 +19,11 @@ use tokio::task;
 use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+use crate::buffer::InputBuffer;
 use crate::hash::ADDRESS_HASH_SIZE;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
+use crate::iface::ifac::IfacConfig;
 use crate::packet::{HeaderType, Packet, PacketType};
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
@@ -88,6 +91,7 @@ pub struct InterfaceChannel {
     pub rx_channel: InterfaceRxSender,
     pub tx_channel: InterfaceTxReceiver,
     pub stop: CancellationToken,
+    pub ifac_config: Option<IfacConfig>,
 }
 
 impl InterfaceChannel {
@@ -110,7 +114,32 @@ impl InterfaceChannel {
             rx_channel,
             tx_channel,
             stop,
+            ifac_config: None,
         }
+    }
+
+    /// Deserialize a received packet buffer and verify the IFAC if this
+    /// channel has IFAC configured.
+    ///
+    /// Returns the parsed `Packet` with the IFAC field still attached
+    /// (the transport layer does not inspect the IFAC, so it can be
+    /// forwarded as-is).
+    pub fn receive(&self, data: &[u8]) -> Result<Packet, crate::error::RnsError> {
+        match &self.ifac_config {
+            Some(config) => {
+                let packet = Packet::deserialize_with_ifac_len(
+                    &mut InputBuffer::new(data),
+                    config.ifac_len(),
+                )?;
+                config.verify_packet(&packet)?;
+                Ok(packet)
+            }
+            None => Packet::deserialize(&mut InputBuffer::new(data)),
+        }
+    }
+
+    pub fn set_ifac_config(&mut self, config: Option<IfacConfig>) {
+        self.ifac_config = config;
     }
 
     pub fn address(&self) -> &AddressHash {
@@ -174,6 +203,9 @@ struct LocalInterface {
     /// `None` means the interface does not participate in link MTU
     /// discovery / upgrades.
     hw_mtu: Option<Arc<AtomicUsize>>,
+    /// Interface Access Code configuration. When set, outbound packets
+    /// will have an Ed25519 IFAC signature attached before transmission.
+    ifac_config: Option<IfacConfig>,
 }
 
 #[derive(Clone)]
@@ -427,7 +459,7 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false, None)
+        self.new_channel_with_pacer(tx_cap, None, false, None, None)
     }
 
     fn new_channel_with_pacer(
@@ -436,6 +468,7 @@ impl InterfaceManager {
         announce_pacer: Option<AnnouncePacer>,
         shared_instance_client: bool,
         hw_mtu: Option<Arc<AtomicUsize>>,
+        ifac_config: Option<IfacConfig>,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -460,6 +493,7 @@ impl InterfaceManager {
             saturated_queue_logger: SaturatedQueueLogger::new(address),
             shared_instance_client,
             hw_mtu,
+            ifac_config: ifac_config.clone(),
         });
 
         InterfaceChannel {
@@ -467,6 +501,7 @@ impl InterfaceManager {
             tx_channel: tx_recv,
             address,
             stop,
+            ifac_config,
         }
     }
 
@@ -498,6 +533,7 @@ impl InterfaceManager {
             announce_pacer,
             shared_instance_client,
             hw_mtu,
+            None,
         );
 
         let inner = Arc::new(Mutex::new(inner));
@@ -618,6 +654,20 @@ impl InterfaceManager {
             };
 
             if should_send && !iface.stop.is_cancelled() {
+                let mut message = message.clone();
+
+                // Apply IFAC if configured for this interface
+                if let Some(ifac_config) = &iface.ifac_config {
+                    if let Err(err) = ifac_config.attach(&mut message.packet) {
+                        log::warn!(
+                            "iface: failed to attach IFAC for iface={} err={:?}",
+                            iface.address,
+                            err,
+                        );
+                        continue;
+                    }
+                }
+
                 if let Some(pacer) = iface
                     .announce_pacer
                     .as_ref()
@@ -628,19 +678,40 @@ impl InterfaceManager {
                             iface.tx_send.clone(),
                             iface.stop.clone(),
                             iface.saturated_queue_logger.clone(),
-                            message.clone(),
+                            message,
                         )
                         .await;
                 } else {
                     send_or_drop(
                         &iface.tx_send,
-                        message.clone(),
+                        message,
                         Some(&iface.saturated_queue_logger),
                     )
                     .await;
                 }
             }
         }
+    }
+
+    /// Set or clear the IFAC configuration for a specific interface.
+    ///
+    /// When set, outbound packets sent through this interface will have an
+    /// Ed25519 signature attached as an Interface Access Code.
+    pub fn set_ifac_config(&mut self, address: &AddressHash, config: Option<IfacConfig>) {
+        for iface in &mut self.ifaces {
+            if iface.address == *address {
+                iface.ifac_config = config;
+                return;
+            }
+        }
+    }
+
+    /// Return the IFAC configuration for a specific interface, if set.
+    pub fn get_ifac_config(&self, address: &AddressHash) -> Option<&IfacConfig> {
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == *address)
+            .and_then(|iface| iface.ifac_config.as_ref())
     }
 }
 
@@ -690,7 +761,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -800,7 +871,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -825,7 +896,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;

@@ -405,6 +405,27 @@ impl Packet {
                 .into(),
         )
     }
+
+    /// Returns the bytes that an IFAC signature covers:
+    /// header (with IFAC flag forced to 0) + addresses + context + data.
+    /// This is the entire packet on the wire minus the IFAC field itself.
+    pub fn signed_data(&self) -> Result<Vec<u8>, crate::error::RnsError> {
+        let mut buf = Vec::with_capacity(512);
+
+        let meta = self.header.to_meta() & 0b0111_1111;
+        buf.push(meta);
+        buf.push(self.header.hops);
+
+        if self.header.header_type == HeaderType::Type2 {
+            let transport = self.transport.as_ref().ok_or(crate::error::RnsError::PacketError)?;
+            buf.extend_from_slice(transport.as_slice());
+        }
+        buf.extend_from_slice(self.destination.as_slice());
+        buf.push(self.context as u8);
+        buf.extend_from_slice(self.data.as_slice());
+
+        Ok(buf)
+    }
 }
 
 impl Default for Packet {
