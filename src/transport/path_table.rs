@@ -22,7 +22,7 @@ pub struct PathEntry {
     pub hops: u8,
     pub iface: AddressHash,
     pub packet_hash: Hash,
-    expires: Instant,
+    pub expires: Instant,
     random_blobs: Vec<RandomBlob>,
 }
 
@@ -96,6 +96,10 @@ impl PathTable {
 
     pub fn next_hop(&self, destination: &AddressHash) -> Option<AddressHash> {
         self.map.get(destination).map(|entry| entry.received_from)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&AddressHash, &PathEntry)> {
+        self.map.iter()
     }
 
     pub fn handle_announce(
@@ -176,6 +180,14 @@ self_referential_transport={}",
     /// Returns `true` if the entry existed.
     pub fn remove(&mut self, destination: &AddressHash) -> bool {
         self.map.remove(destination).is_some()
+    }
+
+    /// Remove all paths whose next hop matches `via`.
+    /// Returns the number of removed entries.
+    pub fn drop_all_via(&mut self, via: &AddressHash) -> usize {
+        let before = self.map.len();
+        self.map.retain(|_, entry| entry.received_from != *via);
+        before - self.map.len()
     }
 
     pub fn handle_inbound_packet(

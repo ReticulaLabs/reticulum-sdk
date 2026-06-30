@@ -1449,8 +1449,8 @@ async fn handle_shared_rpc_client(
 
     let request = read_py_connection_frame(&mut stream, 64 * 1024).await?;
     let request = read_shared_rpc_value(&request)?;
-    let handler = handler.lock().await;
-    let response = handle_shared_rpc_request(&request, Some(&handler));
+    let mut handler = handler.lock().await;
+    let response = handle_shared_rpc_request(&request, Some(&mut handler));
 
     let encoded = write_shared_rpc_value(&response)?;
     write_py_connection_frame(&mut stream, &encoded).await
@@ -1554,41 +1554,23 @@ fn shared_rpc_hmac_response(auth_key: &[u8], message: &[u8]) -> Result<Vec<u8>, 
     Ok(response)
 }
 
-fn handle_shared_rpc_request(request: &Value, handler: Option<&TransportHandler>) -> Value {
+fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut TransportHandler>) -> Value {
     let Some(map) = request.as_map() else {
         return Value::Boolean(false);
     };
 
     if let Some(operation) = shared_rpc_map_str(map, "get") {
         return match operation {
-            "path_table" | "rate_table" => Value::Array(vec![]),
+            "path_table" => shared_rpc_path_table(handler.as_deref_mut()),
+            "rate_table" => shared_rpc_rate_table(handler.as_deref_mut()),
             "interface_stats" => shared_rpc_interface_stats(),
-            "next_hop_if_name" => shared_rpc_next_hop_if_name(map, handler),
-            "next_hop" => shared_rpc_next_hop(map, handler),
+            "next_hop_if_name" => shared_rpc_next_hop_if_name(map, handler.as_deref()),
+            "next_hop" => shared_rpc_next_hop(map, handler.as_deref()),
             "packet_rssi" | "packet_snr" | "packet_q" => Value::Boolean(false),
             "first_hop_timeout" => Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
             "link_count" => Value::from(0),
-            "blackholed_identities" => {
-                if let Some(handler) = handler {
-                    handler.blackhole_table.to_msgpack()
-                } else {
-                    Value::Map(vec![])
-                }
-            }
-            "is_blackholed" => {
-                if let Some(handler) = handler {
-                    if let Some(identity_bytes) = shared_rpc_map_value(map, "identity_hash")
-                        .and_then(|v| v.as_slice())
-                    {
-                        let identity_hash = AddressHash::new_from_slice(identity_bytes);
-                        Value::Boolean(handler.blackhole_table.contains(&identity_hash))
-                    } else {
-                        Value::Boolean(false)
-                    }
-                } else {
-                    Value::Boolean(false)
-                }
-            }
+            "blackholed_identities" => shared_rpc_blackholed_identities(handler.as_deref_mut()),
+            "is_blackholed" => shared_rpc_is_blackholed(map, handler.as_deref_mut()),
             _ => {
                 log::warn!(
                     "share_instance: unsupported RPC get operation <{}>",
@@ -1601,8 +1583,9 @@ fn handle_shared_rpc_request(request: &Value, handler: Option<&TransportHandler>
 
     if let Some(operation) = shared_rpc_map_str(map, "drop") {
         return match operation {
-            "path" => Value::Boolean(false),
-            "all_via" | "announce_queues" => Value::from(0),
+            "path" => shared_rpc_drop_path(map, handler.as_deref_mut()),
+            "all_via" => shared_rpc_drop_all_via(map, handler.as_deref_mut()),
+            "announce_queues" => shared_rpc_drop_announce_queues(handler.as_deref_mut()),
             _ => {
                 log::warn!(
                     "share_instance: unsupported RPC drop operation <{}>",
@@ -1613,37 +1596,190 @@ fn handle_shared_rpc_request(request: &Value, handler: Option<&TransportHandler>
         };
     }
 
+    if let Some(identity_bytes) = shared_rpc_map_value(map, "blackhole_identity")
+        .and_then(|v| v.as_slice())
+    {
+        return shared_rpc_blackhole_identity(identity_bytes, map, handler.as_deref_mut());
+    }
+
+    if let Some(identity_bytes) = shared_rpc_map_value(map, "unblackhole_identity")
+        .and_then(|v| v.as_slice())
+    {
+        return shared_rpc_unblackhole_identity(identity_bytes, handler.as_deref_mut());
+    }
+
     if shared_rpc_map_value(map, "destination_data").is_some()
         || shared_rpc_map_value(map, "identity_data").is_some()
     {
         return Value::Boolean(false);
     }
 
-    if shared_rpc_map_value(map, "blackhole_identity")
-        .and_then(|v| v.as_slice())
-        .is_some()
-    {
-        // RPC blackhole mutation requires &mut access to TransportHandler.
-        // Currently not supported over shared instance RPC; the Python client
-        // connected to a Rust shared instance should manage blackholes locally.
-        log::warn!(
-            "share_instance: blackhole_identity RPC not supported over shared instance",
-        );
-        return Value::Boolean(false);
-    }
-
-    if shared_rpc_map_value(map, "unblackhole_identity")
-        .and_then(|v| v.as_slice())
-        .is_some()
-    {
-        log::warn!(
-            "share_instance: unblackhole_identity RPC not supported over shared instance",
-        );
-        return Value::Boolean(false);
-    }
-
     log::warn!("share_instance: unsupported RPC request {:?}", request);
     Value::Boolean(false)
+}
+
+fn shared_rpc_path_table(handler: Option<&mut TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::Array(vec![]);
+    };
+    let path_table = handler.send_ctx.path_table.read().unwrap();
+    let now = std::time::Instant::now();
+    let entries: Vec<Value> = path_table
+        .entries()
+        .map(|(hash, entry)| {
+            let expires_secs = if entry.expires > now {
+                (entry.expires - now).as_secs_f64()
+            } else {
+                0.0
+            };
+            Value::Map(vec![
+                (Value::from("hash"), Value::Binary(hash.as_slice().to_vec())),
+                (Value::from("hops"), Value::from(entry.hops as u64)),
+                (Value::from("via"), Value::Binary(entry.received_from.as_slice().to_vec())),
+                (Value::from("interface"), Value::Binary(entry.iface.as_slice().to_vec())),
+                (Value::from("expires"), Value::from(expires_secs)),
+            ])
+        })
+        .collect();
+    Value::Array(entries)
+}
+
+fn shared_rpc_rate_table(handler: Option<&mut TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::Array(vec![]);
+    };
+    let tok_now = time::Instant::now();
+    let entries: Vec<Value> = handler
+        .announce_limits
+        .entries()
+        .map(|(hash, entry)| {
+            let last_secs = if tok_now > entry.last_announce {
+                (tok_now - entry.last_announce).as_secs_f64()
+            } else {
+                0.0
+            };
+            let blocked_secs = if entry.blocked_until > tok_now {
+                (entry.blocked_until - tok_now).as_secs_f64()
+            } else {
+                0.0
+            };
+            Value::Map(vec![
+                (Value::from("hash"), Value::Binary(hash.as_slice().to_vec())),
+                (Value::from("last"), Value::from(last_secs)),
+                (Value::from("rate_violations"), Value::from(entry.violations as u64)),
+                (Value::from("blocked_until"), Value::from(blocked_secs)),
+            ])
+        })
+        .collect();
+    Value::Array(entries)
+}
+
+fn shared_rpc_blackholed_identities(handler: Option<&mut TransportHandler>) -> Value {
+    match handler {
+        Some(handler) => handler.blackhole_table.to_msgpack(),
+        None => Value::Map(vec![]),
+    }
+}
+
+fn shared_rpc_is_blackholed(map: &[(Value, Value)], handler: Option<&mut TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::Boolean(false);
+    };
+    if let Some(identity_bytes) = shared_rpc_map_value(map, "identity_hash")
+        .and_then(|v| v.as_slice())
+    {
+        let identity_hash = AddressHash::new_from_slice(identity_bytes);
+        Value::Boolean(handler.blackhole_table.contains(&identity_hash))
+    } else {
+        Value::Boolean(false)
+    }
+}
+
+fn shared_rpc_drop_path(map: &[(Value, Value)], handler: Option<&mut TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::Boolean(false);
+    };
+    let Some(destination) = shared_rpc_destination_hash(map) else {
+        return Value::Boolean(false);
+    };
+    let removed = handler.send_ctx.path_table.write().unwrap().remove(&destination);
+    Value::Boolean(removed)
+}
+
+fn shared_rpc_drop_all_via(map: &[(Value, Value)], handler: Option<&mut TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::from(0);
+    };
+    let Some(via) = shared_rpc_destination_hash(map) else {
+        return Value::from(0);
+    };
+    let count = handler.send_ctx.path_table.write().unwrap().drop_all_via(&via);
+    Value::from(count as u64)
+}
+
+fn shared_rpc_drop_announce_queues(handler: Option<&mut TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::from(0);
+    };
+    handler.announce_table.clear();
+    Value::from(0)
+}
+
+fn shared_rpc_blackhole_identity(
+    identity_bytes: &[u8],
+    map: &[(Value, Value)],
+    handler: Option<&mut TransportHandler>,
+) -> Value {
+    let Some(handler) = handler else {
+        return Value::Boolean(false);
+    };
+    if identity_bytes.len() != crate::hash::ADDRESS_HASH_SIZE {
+        return Value::Boolean(false);
+    }
+    let mut hash = [0u8; crate::hash::ADDRESS_HASH_SIZE];
+    hash.copy_from_slice(identity_bytes);
+    let identity_hash = AddressHash::new(hash);
+
+    let until = shared_rpc_map_value(map, "duration")
+        .and_then(|v| v.as_f64())
+        .map(|secs| time::Instant::now() + time::Duration::from_secs_f64(secs));
+    let reason = shared_rpc_map_value(map, "reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+
+    let source = *handler.config.identity.address_hash();
+    let added = handler.blackhole_table.add(identity_hash, source, until, reason);
+    let removed = handler.remove_blackholed_paths();
+    log::info!(
+        "share_instance: blackholed identity {}, removed {} path{}",
+        identity_hash,
+        removed,
+        if removed == 1 { "" } else { "s" },
+    );
+    Value::Boolean(added)
+}
+
+fn shared_rpc_unblackhole_identity(
+    identity_bytes: &[u8],
+    handler: Option<&mut TransportHandler>,
+) -> Value {
+    let Some(handler) = handler else {
+        return Value::Boolean(false);
+    };
+    if identity_bytes.len() != crate::hash::ADDRESS_HASH_SIZE {
+        return Value::Boolean(false);
+    }
+    let mut hash = [0u8; crate::hash::ADDRESS_HASH_SIZE];
+    hash.copy_from_slice(identity_bytes);
+    let identity_hash = AddressHash::new(hash);
+    let removed = handler.blackhole_table.remove(&identity_hash);
+    if removed {
+        log::info!(
+            "share_instance: lifted blackhole for identity {}",
+            identity_hash,
+        );
+    }
+    Value::Boolean(removed)
 }
 
 fn shared_rpc_next_hop(map: &[(Value, Value)], handler: Option<&TransportHandler>) -> Value {
@@ -4291,8 +4427,8 @@ mod tests {
                 Value::Binary(destination.as_slice().to_vec()),
             ),
         ]);
-        let guard = handler.lock().await;
-        let response = handle_shared_rpc_request(&request, Some(&guard));
+        let mut guard = handler.lock().await;
+        let response = handle_shared_rpc_request(&request, Some(&mut *guard));
         assert_eq!(response, Value::Binary(next_hop.as_slice().to_vec()));
 
         let request = Value::Map(vec![
@@ -4302,7 +4438,7 @@ mod tests {
                 Value::Binary(destination.as_slice().to_vec()),
             ),
         ]);
-        let response = handle_shared_rpc_request(&request, Some(&guard));
+        let response = handle_shared_rpc_request(&request, Some(&mut *guard));
         assert_eq!(response, Value::from(iface.to_string()));
     }
 

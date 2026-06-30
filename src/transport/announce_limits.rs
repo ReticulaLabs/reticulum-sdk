@@ -21,11 +21,11 @@ impl Default for AnnounceRateLimit {
     }
 }
 
-struct AnnounceLimitEntry {
-    rate_limit: Option<AnnounceRateLimit>,
-    violations: u32,
-    last_announce: Instant,
-    blocked_until: Instant,
+pub struct AnnounceLimitEntry {
+    pub rate_limit: Option<AnnounceRateLimit>,
+    pub violations: u32,
+    pub last_announce: Instant,
+    pub blocked_until: Instant,
 }
 
 impl AnnounceLimitEntry {
@@ -81,6 +81,10 @@ impl AnnounceLimits {
         Self {
             limits: BTreeMap::new(),
         }
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&AddressHash, &AnnounceLimitEntry)> {
+        self.limits.iter()
     }
 
     pub fn check(&mut self, destination: &AddressHash) -> Option<Duration> {
