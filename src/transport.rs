@@ -1449,11 +1449,74 @@ async fn handle_shared_rpc_client(
 
     let request = read_py_connection_frame(&mut stream, 64 * 1024).await?;
     let request = read_shared_rpc_value(&request)?;
-    let mut handler = handler.lock().await;
-    let response = handle_shared_rpc_request(&request, Some(&mut handler));
+
+    let response = if let Some(map) = request.as_map() {
+        if shared_rpc_map_str(map, "get") == Some("request_path") {
+            handle_shared_rpc_request_path(map, handler).await
+        } else {
+            let mut h = handler.lock().await;
+            handle_shared_rpc_request(&request, Some(&mut h))
+        }
+    } else {
+        let mut h = handler.lock().await;
+        handle_shared_rpc_request(&request, Some(&mut h))
+    };
 
     let encoded = write_shared_rpc_value(&response)?;
     write_py_connection_frame(&mut stream, &encoded).await
+}
+
+async fn handle_shared_rpc_request_path(
+    map: &[(Value, Value)],
+    handler: Arc<Mutex<TransportHandler>>,
+) -> Value {
+    let Some(dest_bytes) = shared_rpc_map_value(map, "destination_hash").and_then(|v| v.as_slice()) else {
+        return Value::Boolean(false);
+    };
+    if dest_bytes.len() != crate::hash::ADDRESS_HASH_SIZE {
+        return Value::Boolean(false);
+    }
+
+    let mut hash = [0u8; crate::hash::ADDRESS_HASH_SIZE];
+    hash.copy_from_slice(&dest_bytes[..crate::hash::ADDRESS_HASH_SIZE]);
+    let address_hash = AddressHash::new(hash);
+
+    {
+        let mut h = handler.lock().await;
+        h.request_path(&address_hash, None, None).await;
+    }
+
+    let timeout = Duration::from_secs(DEFAULT_PER_HOP_TIMEOUT_SECS * 3);
+    let start = time::Instant::now();
+
+    loop {
+        if time::Instant::now().duration_since(start) >= timeout {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let h = handler.lock().await;
+        let path_table = h.send_ctx.path_table.read().unwrap();
+        if let Some(entry) = path_table.get(&address_hash) {
+            return Value::Map(vec![
+                (Value::from("found"), Value::from(true)),
+                (Value::from("hops"), Value::from(entry.hops as u64)),
+                (
+                    Value::from("next_hop"),
+                    Value::Binary(entry.received_from.as_slice().to_vec()),
+                ),
+                (
+                    Value::from("interface"),
+                    Value::Binary(entry.iface.as_slice().to_vec()),
+                ),
+            ]);
+        }
+    }
+
+    Value::Map(vec![
+        (Value::from("found"), Value::from(false)),
+    ])
 }
 
 async fn shared_rpc_authenticate(
