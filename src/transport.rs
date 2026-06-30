@@ -106,6 +106,8 @@ const INTERVAL_PACKET_CACHE_CLEANUP: Duration = Duration::from_secs(90);
 const INTERVAL_LINK_TABLE_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_KEEP_REVERSE_PATH: Duration = Duration::from_secs(8 * 60);
 
+const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
+
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
@@ -308,6 +310,7 @@ struct TransportHandler {
     in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
 
     path_requests: PathRequests,
+    last_path_requests: HashMap<AddressHash, time::Instant>,
 
     link_in_event_tx: broadcast::Sender<LinkEventData>,
     received_data_tx: broadcast::Sender<ReceivedData>,
@@ -623,6 +626,7 @@ impl Transport {
             out_links: HashMap::new(),
             in_links: HashMap::new(),
             path_requests,
+            last_path_requests: HashMap::new(),
             announce_tx,
             discovery_tx: discovery_tx.clone(),
             link_in_event_tx: link_in_event_tx.clone(),
@@ -2395,6 +2399,8 @@ impl TransportHandler {
             packet,
         })
         .await;
+
+        self.last_path_requests.insert(*address, time::Instant::now());
     }
 
     async fn build_discovery_packet(&mut self, iface: &AddressHash) -> Result<Packet, RnsError> {
@@ -3261,7 +3267,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     links_to_remove.clear();
 
-    let mut rediscover_destinations: Vec<AddressHash> = Vec::new();
+    let mut rediscover_destinations: Vec<(AddressHash, Option<AddressHash>)> = Vec::new();
 
     for link_entry in &handler.out_links {
         let mut link = link_entry.1.lock().await;
@@ -3322,27 +3328,57 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                 }
 
                 if link.elapsed() > INTERVAL_OUTPUT_LINK_TRIED {
-                    if !handler
+                    let already_unresponsive = handler
                         .send_ctx
                         .path_table
                         .read()
                         .unwrap()
-                        .is_unresponsive(link_entry.0)
-                    {
-                        log::warn!(
-                            "tp({}): link {} pending for >{}s, marking path unresponsive \
-                             and rediscovering",
-                            handler.config.name,
-                            link.id(),
-                            INTERVAL_OUTPUT_LINK_TRIED.as_secs(),
-                        );
-                        handler
-                            .send_ctx
-                            .path_table
-                            .write()
-                            .unwrap()
-                            .mark_unresponsive(link_entry.0);
-                        rediscover_destinations.push(*link_entry.0);
+                        .is_unresponsive(link_entry.0);
+
+                    if !already_unresponsive {
+                        let enough_time_passed = handler
+                            .last_path_requests
+                            .get(link_entry.0)
+                            .map(|last| last.elapsed() > PATH_REQUEST_MI)
+                            .unwrap_or(true);
+
+                        if enough_time_passed {
+                            log::warn!(
+                                "tp({}): link {} pending for >{}s, marking path unresponsive \
+                                 and rediscovering",
+                                handler.config.name,
+                                link.id(),
+                                INTERVAL_OUTPUT_LINK_TRIED.as_secs(),
+                            );
+
+                            let blocked_if = handler
+                                .send_ctx
+                                .path_table
+                                .read()
+                                .unwrap()
+                                .next_hop_iface(link_entry.0);
+
+                            handler
+                                .send_ctx
+                                .path_table
+                                .write()
+                                .unwrap()
+                                .mark_unresponsive(link_entry.0);
+
+                            // If we are not a transport instance, drop the current
+                            // path to allow using higher-hop count paths.
+                            if !handler.config.retransmit {
+                                handler
+                                    .send_ctx
+                                    .path_table
+                                    .write()
+                                    .unwrap()
+                                    .remove(link_entry.0);
+                            }
+
+                            rediscover_destinations
+                                .push((*link_entry.0, blocked_if));
+                        }
                     }
                 }
             }
@@ -3358,8 +3394,22 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         handler.out_links.remove(&addr);
     }
 
-    for dest in &rediscover_destinations {
-        handler.request_path(dest, None, None).await;
+    for (dest, blocked_if) in &rediscover_destinations {
+        if let Some(blocked_if) = blocked_if {
+            let ifaces = handler
+                .send_ctx
+                .iface_manager
+                .lock()
+                .await
+                .active_interface_addresses();
+            for iface in ifaces {
+                if iface != *blocked_if {
+                    handler.request_path(dest, Some(iface), None).await;
+                }
+            }
+        } else {
+            handler.request_path(dest, None, None).await;
+        }
     }
 }
 
