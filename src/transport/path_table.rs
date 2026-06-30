@@ -16,6 +16,13 @@ const ANNOUNCE_RANDOM_BLOB_OFFSET: usize = PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LEN
 
 type RandomBlob = [u8; RAND_HASH_LENGTH];
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PathState {
+    Unknown,
+    Responsive,
+    Unresponsive,
+}
+
 pub struct PathEntry {
     pub timestamp: Instant,
     pub received_from: AddressHash,
@@ -24,7 +31,7 @@ pub struct PathEntry {
     pub packet_hash: Hash,
     pub expires: Instant,
     random_blobs: Vec<RandomBlob>,
-    unresponsive: bool,
+    state: PathState,
 }
 
 pub struct PathTable {
@@ -106,17 +113,23 @@ impl PathTable {
     pub fn is_unresponsive(&self, destination: &AddressHash) -> bool {
         self.map
             .get(destination)
-            .map(|entry| entry.unresponsive)
+            .map(|entry| entry.state == PathState::Unresponsive)
             .unwrap_or(false)
     }
 
     pub fn mark_unresponsive(&mut self, destination: &AddressHash) {
         if let Some(entry) = self.map.get_mut(destination) {
-            entry.unresponsive = true;
+            entry.state = PathState::Unresponsive;
             log::info!(
                 "path_table mark {} unresponsive",
                 destination,
             );
+        }
+    }
+
+    pub fn mark_state_unknown(&mut self, destination: &AddressHash) {
+        if let Some(entry) = self.map.get_mut(destination) {
+            entry.state = PathState::Unknown;
         }
     }
 
@@ -182,7 +195,7 @@ self_referential_transport={}",
                 .get(&announce.destination)
                 .map(|entry| entry.updated_random_blobs(random_blob))
                 .unwrap_or_else(|| random_blob.into_iter().collect()),
-            unresponsive: false,
+            state: PathState::Unknown,
         };
 
         self.map.insert(announce.destination, new_entry);
@@ -345,14 +358,12 @@ impl PathEntry {
             return false;
         }
 
-        // Accept any non-duplicate announce for an unresponsive path,
-        // giving the network a chance to find a working route.
-        if self.unresponsive {
-            return true;
-        }
-
         if hops <= self.hops {
             if announce_emitted > path_timebase {
+                return true;
+            }
+
+            if announce_emitted == path_timebase && self.state == PathState::Unresponsive {
                 return true;
             }
 
@@ -370,6 +381,10 @@ impl PathEntry {
         }
 
         if announce_emitted > path_timebase {
+            return true;
+        }
+
+        if announce_emitted == path_timebase && self.state == PathState::Unresponsive {
             return true;
         }
 
