@@ -51,6 +51,8 @@ use crate::hash::Hash;
 use crate::identity::{PrivateIdentity, PUBLIC_KEY_LENGTH};
 
 use crate::iface::InterfaceManager;
+
+use blackhole::BlackholeTable;
 use crate::iface::InterfaceQueueLengths;
 use crate::iface::InterfaceRxReceiver;
 use crate::iface::RxMessage;
@@ -70,6 +72,7 @@ use crate::packet::PropagationType;
 
 mod announce_limits;
 mod announce_table;
+mod blackhole;
 mod discovery;
 mod link_table;
 mod packet_cache;
@@ -142,6 +145,19 @@ pub struct TransportConfig {
     /// Create a local `rnstransport.probe` destination that returns
     /// packet proofs for incoming probe packets.
     respond_to_probes: bool,
+
+    /// Whether to publish blackhole list via a `rnstransport.info.blackhole`
+    /// request handler (protocol-compatible with Python Reticulum).
+    publish_blackhole: bool,
+
+    /// Remote transport identity hashes from which blackhole lists
+    /// are fetched (protocol-compatible with Python Reticulum
+    /// `blackhole_sources` config option).
+    blackhole_sources: Vec<AddressHash>,
+
+    /// Interval at which remote blackhole sources are polled for
+    /// updates. Defaults to 1 hour.
+    blackhole_update_interval: Duration,
 
     /// Whether to participate in link MTU discovery and upgrades.
     /// When enabled, the initiator queries the next-hop interface HW_MTU and
@@ -220,6 +236,8 @@ pub struct TransportMetrics {
     pub active_interfaces: usize,
     /// Number of pending discovery path requests.
     pub pending_path_requests: usize,
+    /// Number of entries in the blackhole table.
+    pub blackhole_entries: usize,
 }
 
 /// Shared sending context: independently-locked resources used for
@@ -304,6 +322,10 @@ struct TransportHandler {
     announces_rate_limited: u64,
     /// Number of packets that failed decryption.
     decryption_failures: u64,
+
+    /// Blackholed identity table (protocol-compatible with Python
+    /// Reticulum `RNS.Transport.blackholed_identities`).
+    blackhole_table: BlackholeTable,
 }
 
 pub struct Transport {
@@ -330,6 +352,9 @@ impl TransportConfig {
             restart_outlinks: false,
             announce_forever: false,
             respond_to_probes: false,
+            publish_blackhole: false,
+            blackhole_sources: vec![],
+            blackhole_update_interval: Duration::from_secs(60 * 60),
             link_mtu_discovery: true,
             share_instance: false,
             require_shared_instance: false,
@@ -366,6 +391,26 @@ impl TransportConfig {
 
     pub fn set_respond_to_probes(&mut self, respond_to_probes: bool) {
         self.respond_to_probes = respond_to_probes;
+    }
+
+    pub fn set_publish_blackhole(&mut self, publish: bool) {
+        self.publish_blackhole = publish;
+    }
+
+    pub fn publish_blackhole(&self) -> bool {
+        self.publish_blackhole
+    }
+
+    pub fn set_blackhole_sources(&mut self, sources: Vec<AddressHash>) {
+        self.blackhole_sources = sources;
+    }
+
+    pub fn blackhole_sources(&self) -> &[AddressHash] {
+        &self.blackhole_sources
+    }
+
+    pub fn set_blackhole_update_interval(&mut self, interval: Duration) {
+        self.blackhole_update_interval = interval;
     }
 
     pub fn set_link_mtu_discovery(&mut self, link_mtu_discovery: bool) {
@@ -473,6 +518,9 @@ impl Default for TransportConfig {
             restart_outlinks: false,
             announce_forever: false,
             respond_to_probes: false,
+            publish_blackhole: false,
+            blackhole_sources: vec![],
+            blackhole_update_interval: Duration::from_secs(60 * 60),
             link_mtu_discovery: true,
             share_instance: false,
             require_shared_instance: false,
@@ -580,6 +628,7 @@ impl Transport {
             packets_dropped_duplicate: 0,
             announces_rate_limited: 0,
             decryption_failures: 0,
+            blackhole_table: BlackholeTable::new(),
         }));
 
         {
@@ -628,6 +677,56 @@ impl Transport {
         self.send_ctx.path_table.read().unwrap().len()
     }
 
+    /// Blackhole an identity.  Once blackholed, all announces from this
+    /// identity will be ignored and any existing paths to its destinations
+    /// will be removed.
+    ///
+    /// Protocol-compatible with Python `RNS.Transport.blackhole_identity()`.
+    pub async fn blackhole_identity(
+        &self,
+        identity_hash: &AddressHash,
+        until: Option<time::Instant>,
+        reason: Option<String>,
+    ) -> bool {
+        let mut handler = self.handler.lock().await;
+        let source = *handler.config.identity.address_hash();
+        let added = handler.blackhole_table.add(*identity_hash, source, until, reason);
+        let removed = handler.remove_blackholed_paths();
+        log::info!(
+            "tp({}): blackholed identity {}, removed {} path{}",
+            handler.config.name,
+            identity_hash,
+            removed,
+            if removed == 1 { "" } else { "s" },
+        );
+        added
+    }
+
+    /// Lift the blackhole for an identity.
+    ///
+    /// Protocol-compatible with Python `RNS.Transport.unblackhole_identity()`.
+    pub async fn unblackhole_identity(&self, identity_hash: &AddressHash) -> bool {
+        let mut handler = self.handler.lock().await;
+        let removed = handler.blackhole_table.remove(identity_hash);
+        if removed {
+            log::info!(
+                "tp({}): lifted blackhole for identity {}",
+                handler.config.name,
+                identity_hash,
+            );
+        }
+        removed
+    }
+
+    /// Reload blackhole entries (persistence not yet implemented;
+    /// this is a no-op stub for API compatibility).
+    pub async fn reload_blackhole(&self) {
+        log::warn!(
+            "tp({}): blackhole persistence not yet implemented",
+            self.name,
+        );
+    }
+
     /// Returns a metrics snapshot for transport-level collectors.
     pub async fn metrics(&self) -> TransportMetrics {
         let path_table_entries = self.path_table_len().await;
@@ -673,6 +772,7 @@ impl Transport {
             total_in_links: handler.in_links.len(),
             active_interfaces,
             pending_path_requests: handler.path_requests.pending_discovery_len(),
+            blackhole_entries: handler.blackhole_table.len(),
         }
     }
 
@@ -1442,8 +1542,27 @@ fn handle_shared_rpc_request(request: &Value, handler: Option<&TransportHandler>
             "packet_rssi" | "packet_snr" | "packet_q" => Value::Boolean(false),
             "first_hop_timeout" => Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
             "link_count" => Value::from(0),
-            "blackholed_identities" => Value::Map(vec![]),
-            "is_blackholed" => Value::Boolean(false),
+            "blackholed_identities" => {
+                if let Some(handler) = handler {
+                    handler.blackhole_table.to_msgpack()
+                } else {
+                    Value::Map(vec![])
+                }
+            }
+            "is_blackholed" => {
+                if let Some(handler) = handler {
+                    if let Some(identity_bytes) = shared_rpc_map_value(map, "identity_hash")
+                        .and_then(|v| v.as_slice())
+                    {
+                        let identity_hash = AddressHash::new_from_slice(identity_bytes);
+                        Value::Boolean(handler.blackhole_table.contains(&identity_hash))
+                    } else {
+                        Value::Boolean(false)
+                    }
+                } else {
+                    Value::Boolean(false)
+                }
+            }
             _ => {
                 log::warn!(
                     "share_instance: unsupported RPC get operation <{}>",
@@ -1474,9 +1593,26 @@ fn handle_shared_rpc_request(request: &Value, handler: Option<&TransportHandler>
         return Value::Boolean(false);
     }
 
-    if shared_rpc_map_value(map, "blackhole_identity").is_some()
-        || shared_rpc_map_value(map, "unblackhole_identity").is_some()
+    if shared_rpc_map_value(map, "blackhole_identity")
+        .and_then(|v| v.as_slice())
+        .is_some()
     {
+        // RPC blackhole mutation requires &mut access to TransportHandler.
+        // Currently not supported over shared instance RPC; the Python client
+        // connected to a Rust shared instance should manage blackholes locally.
+        log::warn!(
+            "share_instance: blackhole_identity RPC not supported over shared instance",
+        );
+        return Value::Boolean(false);
+    }
+
+    if shared_rpc_map_value(map, "unblackhole_identity")
+        .and_then(|v| v.as_slice())
+        .is_some()
+    {
+        log::warn!(
+            "share_instance: unblackhole_identity RPC not supported over shared instance",
+        );
         return Value::Boolean(false);
     }
 
@@ -1934,6 +2070,50 @@ impl TransportHandler {
         self.single_out_destinations.contains_key(address)
     }
 
+    /// Remove path table entries whose associated identity is blackholed.
+    /// Protocol-compatible with Python `Transport.remove_blackholed_paths()`.
+    pub fn remove_blackholed_paths(&mut self) -> usize {
+        let blackholed: HashSet<AddressHash> = self
+            .blackhole_table
+            .identity_hashes()
+            .into_iter()
+            .collect();
+
+        if blackholed.is_empty() {
+            return 0;
+        }
+
+        let mut drop_destinations = Vec::new();
+        for (dest_hash, dest) in &self.single_out_destinations {
+            if let Ok(handler) = dest.try_lock() {
+                if blackholed.contains(&handler.identity.address_hash) {
+                    drop_destinations.push(*dest_hash);
+                }
+            }
+        }
+
+        let count = drop_destinations.len();
+        for dest_hash in &drop_destinations {
+            self.single_out_destinations.remove(dest_hash);
+            self.send_ctx
+                .path_table
+                .write()
+                .unwrap()
+                .remove(dest_hash);
+        }
+
+        if count > 0 {
+            log::info!(
+                "tp({}): removed {} destination{} associated with blackholed identities",
+                self.config.name,
+                count,
+                if count == 1 { "" } else { "s" },
+            );
+        }
+
+        count
+    }
+
     fn accepts_transport_packet(&self, packet: &Packet) -> bool {
         if packet.header.packet_type == PacketType::Announce {
             return true;
@@ -2362,6 +2542,19 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
         let app_data = result.1;
         let identity_hash = destination.identity.address_hash;
         let dest_desc = destination.desc;
+
+        // Protocol-compatible blackhole check: reject announces from
+        // identities that have been blackholed.  Equivalent to the check
+        // in Python `RNS.Identity.validate_announce()`.
+        if handler.blackhole_table.contains(&identity_hash) {
+            log::info!(
+                "tp({}): dropped announce from blackholed identity {}",
+                handler.config.name,
+                identity_hash,
+            );
+            return;
+        }
+
         let destination = Arc::new(Mutex::new(destination));
 
         log::trace!(
@@ -3232,6 +3425,19 @@ async fn manage_transport(
                         let mut handler = handler.lock().await;
                         handler.link_table.remove_stale(INTERVAL_LINK_TABLE_STALE);
                         handler.reverse_table.remove_stale(INTERVAL_KEEP_REVERSE_PATH);
+
+                        // Periodically remove expired blackhole entries
+                        // (rate-limited internally to 60-second intervals).
+                        if let Some(removed) = handler.blackhole_table.check_expired() {
+                            if removed > 0 {
+                                log::info!(
+                                    "tp({}): removed {} expired blackhole entr{}",
+                                    handler.config.name,
+                                    removed,
+                                    if removed == 1 { "y" } else { "ies" },
+                                );
+                            }
+                        }
 
                         let active_ifaces: HashSet<AddressHash> = handler
                             .send_ctx

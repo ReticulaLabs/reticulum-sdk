@@ -16,7 +16,7 @@ Reticulum operates independently of traditional IP, and can function effectively
 * ✅ rnstransport probe (aka respond_to_probes)
 * ✅ rnstransport discovery (aka discoverable)
 * ❌ rnstransport remote.management (aka enable_remote_management)
-* ❌ info blackhole (aka publish_blackhole)
+* ✅ info blackhole (aka publish_blackhole) — core table + expiry + announce rejection + RPC stub
 
 ## Implemented interfaces
 

@@ -172,6 +172,12 @@ self_referential_transport={}",
         );
     }
 
+    /// Remove a specific destination from the path table.
+    /// Returns `true` if the entry existed.
+    pub fn remove(&mut self, destination: &AddressHash) -> bool {
+        self.map.remove(destination).is_some()
+    }
+
     pub fn handle_inbound_packet(
         &self,
         original_packet: &Packet,
