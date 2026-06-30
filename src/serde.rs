@@ -2,7 +2,10 @@ use crate::{
     buffer::{InputBuffer, OutputBuffer},
     error::RnsError,
     hash::AddressHash,
-    packet::{Header, HeaderType, Packet, PacketContext, PacketDataBuffer},
+    packet::{
+        Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer, PacketIfac,
+        PACKET_IFAC_MAX_LENGTH,
+    },
 };
 
 pub trait Serialize {
@@ -29,6 +32,14 @@ impl Serialize for PacketContext {
 impl Serialize for Packet {
     fn serialize(&self, buffer: &mut OutputBuffer) -> Result<usize, RnsError> {
         self.header.serialize(buffer)?;
+
+        if self.header.ifac_flag == IfacFlag::Authenticated {
+            if let Some(ifac) = &self.ifac {
+                buffer.write(ifac.as_slice())?;
+            } else {
+                return Err(RnsError::PacketError);
+            }
+        }
 
         if self.header.header_type == HeaderType::Type2 {
             let transport = self.transport.as_ref().ok_or(RnsError::PacketError)?;
@@ -69,7 +80,25 @@ impl PacketContext {
 }
 impl Packet {
     pub fn deserialize(buffer: &mut InputBuffer) -> Result<Packet, RnsError> {
+        Self::deserialize_with_ifac_len(buffer, 0)
+    }
+
+    pub fn deserialize_with_ifac_len(
+        buffer: &mut InputBuffer,
+        ifac_len: usize,
+    ) -> Result<Packet, RnsError> {
         let header = Header::deserialize(buffer)?;
+
+        let ifac = if header.ifac_flag == IfacFlag::Authenticated {
+            if ifac_len == 0 || ifac_len > PACKET_IFAC_MAX_LENGTH {
+                return Err(RnsError::PacketError);
+            }
+            let mut ifac_data = [0u8; PACKET_IFAC_MAX_LENGTH];
+            buffer.read(&mut ifac_data[..ifac_len])?;
+            Some(PacketIfac::new_from_slice(&ifac_data[..ifac_len]))
+        } else {
+            None
+        };
 
         let transport = if header.header_type == HeaderType::Type2 {
             Some(AddressHash::deserialize(buffer)?)
@@ -83,7 +112,7 @@ impl Packet {
 
         let mut packet = Packet {
             header,
-            ifac: None,
+            ifac,
             destination,
             transport,
             context,
@@ -107,7 +136,8 @@ mod tests {
         hash::AddressHash,
         packet::{
             ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
-            PacketDataBuffer, PacketType, PropagationType, PACKET_MDU, RETICULUM_MTU,
+            PacketDataBuffer, PacketIfac, PacketType, PropagationType, PACKET_IFAC_MAX_LENGTH,
+            PACKET_MDU, RETICULUM_MTU,
         },
         test_vectors,
     };
@@ -305,5 +335,169 @@ mod tests {
             .serialize(&mut output_buffer)
             .expect("reserialized high-MTU packet");
         assert_eq!(output_buffer.as_slice(), packet_bytes.as_slice());
+    }
+
+    #[test]
+    fn ifac_roundtrip() {
+        let ifac_bytes = [0xab, 0xcd, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05];
+        let ifac = PacketIfac::new_from_slice(&ifac_bytes);
+
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Authenticated,
+                header_type: HeaderType::Type1,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 3,
+                ..Default::default()
+            },
+            ifac: Some(ifac),
+            destination: AddressHash::new_from_rand(OsRng),
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(b"hello"),
+        };
+
+        let mut output_data = [0u8; 1024];
+        let mut output_buffer = OutputBuffer::new(&mut output_data);
+        packet
+            .serialize(&mut output_buffer)
+            .expect("serialized with ifac");
+
+        let mut input_buffer = InputBuffer::new(output_buffer.as_slice());
+        let decoded = Packet::deserialize_with_ifac_len(&mut input_buffer, ifac_bytes.len())
+            .expect("deserialized with ifac");
+
+        assert_eq!(decoded.header, packet.header);
+        assert_eq!(decoded.destination, packet.destination);
+        assert_eq!(decoded.context, packet.context);
+        assert_eq!(decoded.data.as_slice(), packet.data.as_slice());
+        assert_eq!(decoded.transport, None);
+
+        let decoded_ifac = decoded.ifac.expect("ifac should be present");
+        assert_eq!(decoded_ifac.as_slice(), ifac_bytes);
+    }
+
+    #[test]
+    fn ifac_type2_roundtrip() {
+        let ifac_bytes = [0x11, 0x22, 0x33, 0x44];
+        let ifac = PacketIfac::new_from_slice(&ifac_bytes);
+
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Authenticated,
+                header_type: HeaderType::Type2,
+                propagation_type: PropagationType::Transport,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 1,
+                ..Default::default()
+            },
+            ifac: Some(ifac),
+            destination: AddressHash::new_from_rand(OsRng),
+            transport: Some(AddressHash::new_from_rand(OsRng)),
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(b"world"),
+        };
+
+        let mut output_data = [0u8; 1024];
+        let mut output_buffer = OutputBuffer::new(&mut output_data);
+        packet
+            .serialize(&mut output_buffer)
+            .expect("serialized type2 with ifac");
+
+        let mut input_buffer = InputBuffer::new(output_buffer.as_slice());
+        let decoded =
+            Packet::deserialize_with_ifac_len(&mut input_buffer, ifac_bytes.len())
+                .expect("deserialized type2 with ifac");
+
+        assert_eq!(decoded.header, packet.header);
+        assert_eq!(decoded.destination, packet.destination);
+        assert_eq!(decoded.transport, packet.transport);
+        assert_eq!(decoded.context, packet.context);
+        assert_eq!(decoded.data.as_slice(), packet.data.as_slice());
+
+        let decoded_ifac = decoded.ifac.expect("ifac should be present");
+        assert_eq!(decoded_ifac.as_slice(), ifac_bytes);
+    }
+
+    #[test]
+    fn serialize_rejects_ifac_flag_without_ifac_data() {
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Authenticated,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: AddressHash::new_from_rand(OsRng),
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(b"data"),
+        };
+
+        let mut output_data = [0u8; 1024];
+        let mut output_buffer = OutputBuffer::new(&mut output_data);
+        let result = packet.serialize(&mut output_buffer);
+
+        assert!(matches!(result, Err(RnsError::PacketError)));
+    }
+
+    #[test]
+    fn deserialize_rejects_ifac_flag_with_zero_len() {
+        let ifac_len = 8;
+        let ifac_bytes = vec![0x42u8; ifac_len];
+        let mut packet_bytes = Vec::new();
+        let header = Header {
+            ifac_flag: IfacFlag::Authenticated,
+            ..Default::default()
+        };
+        packet_bytes.extend_from_slice(&[header.to_meta(), 0]);
+        packet_bytes.extend_from_slice(&ifac_bytes);
+        packet_bytes.extend_from_slice(AddressHash::new_empty().as_slice());
+        packet_bytes.push(PacketContext::None as u8);
+        packet_bytes.push(0x00);
+
+        let mut input_buffer = InputBuffer::new(&packet_bytes);
+        let result = Packet::deserialize(&mut input_buffer);
+        assert!(matches!(result, Err(RnsError::PacketError)));
+    }
+
+    #[test]
+    fn deserialize_rejects_ifac_len_exceeds_max() {
+        let mut packet_bytes = Vec::new();
+        let header = Header {
+            ifac_flag: IfacFlag::Authenticated,
+            ..Default::default()
+        };
+        packet_bytes.extend_from_slice(&[header.to_meta(), 0]);
+        packet_bytes.extend_from_slice(&[0u8; PACKET_IFAC_MAX_LENGTH + 1]);
+        packet_bytes.extend_from_slice(AddressHash::new_empty().as_slice());
+        packet_bytes.push(PacketContext::None as u8);
+        packet_bytes.push(0x00);
+
+        let mut input_buffer = InputBuffer::new(&packet_bytes);
+        let result = Packet::deserialize_with_ifac_len(&mut input_buffer, PACKET_IFAC_MAX_LENGTH + 1);
+        assert!(matches!(result, Err(RnsError::PacketError)));
+    }
+
+    #[test]
+    fn deserialize_fallback_ignores_ifac_when_flag_not_set() {
+        let mut packet_bytes = Vec::new();
+        let header = Header {
+            ifac_flag: IfacFlag::Open,
+            ..Default::default()
+        };
+        packet_bytes.extend_from_slice(&[header.to_meta(), 0]);
+        packet_bytes.extend_from_slice(AddressHash::new_empty().as_slice());
+        packet_bytes.push(PacketContext::None as u8);
+        packet_bytes.extend_from_slice(b"no ifac expected");
+
+        let mut input_buffer = InputBuffer::new(&packet_bytes);
+        let packet = Packet::deserialize_with_ifac_len(&mut input_buffer, 64)
+            .expect("should succeed when flag is not set even with non-zero ifac_len");
+
+        assert!(packet.ifac.is_none());
+        assert_eq!(packet.data.as_slice(), b"no ifac expected");
     }
 }
