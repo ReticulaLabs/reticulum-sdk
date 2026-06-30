@@ -1,9 +1,27 @@
 use std::collections::HashMap;
 
 use rmpv::Value;
+use sha2::Digest;
 use tokio::time::{Duration, Instant};
 
+use crate::destination::DestinationName;
 use crate::hash::AddressHash;
+use crate::hash::Hash;
+
+/// Compute the destination hash for the blackhole info service associated
+/// with a given source identity. Matches the Python reference:
+/// `RNS.Destination.hash_from_name_and_identity("rnstransport.info.blackhole", identity_hash)`.
+pub fn blackhole_destination_hash(identity_hash: &AddressHash) -> AddressHash {
+    let name = DestinationName::new("rnstransport", "info.blackhole");
+    let hash = Hash::new(
+        Hash::generator()
+            .chain_update(name.as_name_hash_slice())
+            .chain_update(identity_hash.as_slice())
+            .finalize()
+            .into(),
+    );
+    AddressHash::new_from_hash(&hash)
+}
 
 /// Interval at which expired blackhole entries are cleaned up.
 const BLACKHOLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -110,6 +128,24 @@ impl BlackholeTable {
             .collect()
     }
 
+    /// Insert a single entry from a remote source. Local-originated
+    /// entries are never overwritten. Returns `true` if a new entry
+    /// was inserted.
+    pub fn insert_remote_entry(
+        &mut self,
+        identity_hash: AddressHash,
+        entry: BlackholeEntry,
+    ) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.entries.entry(identity_hash) {
+            Entry::Vacant(e) => {
+                e.insert(entry);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
     /// Merge entries from a remote source. Any conflicting identity
     /// hashes that were originally blackholed by the *local* identity
     /// are preserved (not overwritten by the remote source).
@@ -203,7 +239,7 @@ impl BlackholeTable {
 }
 
 impl BlackholeEntry {
-    fn to_msgpack(&self) -> Value {
+    pub(crate) fn to_msgpack(&self) -> Value {
         let mut pairs = vec![
             (Value::from("source"), Value::from(self.source.as_slice().to_vec())),
         ];
@@ -220,7 +256,7 @@ impl BlackholeEntry {
         Value::Map(pairs)
     }
 
-    fn from_msgpack(value: &Value, source: AddressHash) -> Option<Self> {
+    pub(crate) fn from_msgpack(value: &Value, source: AddressHash) -> Option<Self> {
         let map = value.as_map()?;
         let mut until: Option<Instant> = None;
         let mut reason: Option<String> = None;
@@ -407,5 +443,61 @@ mod tests {
         // Second immediate call should be rate-limited
         let result = table.check_expired();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn insert_remote_entry_preserves_local_entries() {
+        let mut table = BlackholeTable::new();
+        let local_src = test_hash(0xaa);
+        let remote_src = test_hash(0xbb);
+        let id = test_hash(1);
+
+        // Local entry
+        table.add(id, local_src, None, None);
+
+        // Remote tries to overwrite via single-entry method
+        let remote_entry = BlackholeEntry {
+            source: remote_src,
+            until: None,
+            reason: Some("remote".to_owned()),
+        };
+        assert!(!table.insert_remote_entry(id, remote_entry));
+
+        // Local entry should not be overwritten
+        let entry = table.entries.get(&id).unwrap();
+        assert_eq!(entry.source, local_src);
+        assert_eq!(entry.reason, None);
+    }
+
+    #[test]
+    fn insert_remote_entry_accepts_new_identity() {
+        let mut table = BlackholeTable::new();
+        let src = test_hash(0xaa);
+        let id = test_hash(1);
+
+        let remote_entry = BlackholeEntry {
+            source: src,
+            until: None,
+            reason: Some("new".to_owned()),
+        };
+        assert!(table.insert_remote_entry(id, remote_entry));
+        assert!(table.contains(&id));
+    }
+
+    #[test]
+    fn blackhole_destination_hash_is_deterministic() {
+        let id = test_hash(0x42);
+        let hash_a = super::blackhole_destination_hash(&id);
+        let hash_b = super::blackhole_destination_hash(&id);
+        assert_eq!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn blackhole_destination_hash_differs_for_different_identities() {
+        let id_a = test_hash(0x01);
+        let id_b = test_hash(0x02);
+        let hash_a = super::blackhole_destination_hash(&id_a);
+        let hash_b = super::blackhole_destination_hash(&id_b);
+        assert_ne!(hash_a, hash_b);
     }
 }
