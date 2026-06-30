@@ -3543,6 +3543,7 @@ async fn blackhole_updater_job(
     tokio::time::sleep(BLACKHOLE_INITIAL_WAIT).await;
 
     let mut last_updates: HashMap<AddressHash, time::Instant> = HashMap::new();
+    let mut iteration: u64 = 0;
 
     loop {
         tokio::select! {
@@ -3553,6 +3554,9 @@ async fn blackhole_updater_job(
             _ = tokio::time::sleep(Duration::from_secs(60)) => {}
         }
 
+        iteration += 1;
+        log::trace!("tp({name}): blackhole updater iteration {iteration}");
+
         let sources: Vec<AddressHash> = {
             let handler = handler.lock().await;
             handler.config.blackhole_sources.clone()
@@ -3562,14 +3566,34 @@ async fn blackhole_updater_job(
 
         for source_hash in &sources {
             let should_update = match last_updates.get(source_hash) {
-                Some(last) => now >= *last + update_interval,
-                None => true,
+                Some(last) => {
+                    let elapsed = now.saturating_duration_since(*last);
+                    let due = elapsed >= update_interval;
+                    log::trace!(
+                        "tp({name}): blackhole source {source_hash} last update {:.0}s ago, {}",
+                        elapsed.as_secs_f64(),
+                        if due { "due" } else { "skipping" },
+                    );
+                    due
+                }
+                None => {
+                    log::trace!(
+                        "tp({name}): blackhole source {source_hash} never updated, due",
+                    );
+                    true
+                }
             };
             if !should_update {
                 continue;
             }
 
+            log::trace!(
+                "tp({name}): computing destination hash for blackhole source {source_hash}",
+            );
             let dest_hash = blackhole::blackhole_destination_hash(source_hash);
+            log::trace!(
+                "tp({name}): blackhole destination hash {dest_hash} for source {source_hash}",
+            );
 
             let has_path = send_ctx
                 .path_table
@@ -3579,10 +3603,13 @@ async fn blackhole_updater_job(
                 .is_some();
             if !has_path {
                 log::debug!(
-                    "tp({name}): no path to blackhole source {source_hash}, skipping"
+                    "tp({name}): no path to blackhole source {source_hash} (dest {dest_hash}), skipping"
                 );
                 continue;
             }
+            log::trace!(
+                "tp({name}): found path to blackhole destination {dest_hash}",
+            );
 
             let dest_desc = {
                 let handler = handler.lock().await;
@@ -3595,16 +3622,22 @@ async fn blackhole_updater_job(
             };
 
             let desc = match dest_desc {
-                Some(desc) => desc,
+                Some(desc) => {
+                    log::trace!(
+                        "tp({name}): resolved blackhole destination {dest_hash} to identity {}",
+                        desc.identity.address_hash,
+                    );
+                    desc
+                }
                 None => {
                     log::warn!(
-                        "tp({name}): blackhole source {source_hash} has path but no destination desc",
+                        "tp({name}): blackhole source {source_hash} (dest {dest_hash}) has path but no destination desc",
                     );
                     continue;
                 }
             };
 
-            log::info!("tp({name}): updating blackhole list from {source_hash}");
+            log::info!("tp({name}): updating blackhole list from {source_hash} (dest {dest_hash})");
 
             match update_blackhole_from_source(
                 &handler,
@@ -3614,22 +3647,32 @@ async fn blackhole_updater_job(
                 &name,
                 desc,
                 *source_hash,
+                dest_hash,
             )
             .await
             {
-                Ok(_) => {
+                Ok(count) => {
                     last_updates.insert(*source_hash, now);
+                    log::info!("tp({name}): blackhole update from {source_hash} complete, {count} new entries");
                 }
                 Err(e) => {
                     log::warn!("tp({name}): blackhole update from {source_hash} failed: {e}");
                 }
             }
         }
+
+        if sources.is_empty() {
+            log::trace!("tp({name}): blackhole updater iteration {iteration}: no sources configured");
+        }
     }
 }
 
 /// Establish a link to a blackhole source, send a `/list` request, and merge
 /// the response into the local [`BlackholeTable`].
+///
+/// Returns `Ok(inserted_count)` on success (even if the response contained no
+/// new entries or was in an unexpected format), or `Err(reason)` on connection
+/// / protocol failure.
 async fn update_blackhole_from_source(
     handler: &Arc<Mutex<TransportHandler>>,
     send_ctx: &Arc<SendCtx>,
@@ -3638,7 +3681,11 @@ async fn update_blackhole_from_source(
     name: &str,
     dest_desc: DestinationDesc,
     source_hash: AddressHash,
-) -> Result<(), String> {
+    dest_hash: AddressHash,
+) -> Result<usize, String> {
+    log::trace!(
+        "tp({name}): starting blackhole fetch from {source_hash} (dest {dest_hash})",
+    );
     let mut rx = event_tx.subscribe();
 
     let path_mtu = {
@@ -3648,10 +3695,15 @@ async fn update_blackhole_from_source(
                 .path_table
                 .read()
                 .unwrap()
-                .next_hop_iface(&dest_desc.address_hash);
+                .next_hop_iface(&dest_hash);
             if let Some(iface) = iface_addr {
-                iface_manager.lock().await.hw_mtu(&iface)
+                let mtu = iface_manager.lock().await.hw_mtu(&iface);
+                log::trace!(
+                    "tp({name}): blackhole link path_mtu={mtu:?} via iface {iface}",
+                );
+                mtu
             } else {
+                log::trace!("tp({name}): blackhole link no next-hop iface found");
                 None
             }
         } else {
@@ -3659,14 +3711,12 @@ async fn update_blackhole_from_source(
         }
     };
 
-    let dest_addr_hash = dest_desc.address_hash;
-
     let mut link = Link::new(dest_desc, event_tx.clone());
     let link_id = {
         let packet = link.request(path_mtu);
         let link_id = *link.id();
         log::debug!(
-            "tp({name}): blackhole updater created link {link_id} to {dest_addr_hash}",
+            "tp({name}): blackhole updater created link {link_id} to {dest_hash}",
         );
         send_ctx.send_packet(name, packet).await;
         link_id
@@ -3677,8 +3727,12 @@ async fn update_blackhole_from_source(
         .lock()
         .await
         .out_links
-        .insert(dest_addr_hash, link_arc.clone());
+        .insert(dest_hash, link_arc.clone());
 
+    log::trace!(
+        "tp({name}): waiting for blackhole link {link_id} to activate (timeout {:.0}s)",
+        BLACKHOLE_LINK_TIMEOUT.as_secs_f64(),
+    );
     let activated = async {
         loop {
             match rx.recv().await {
@@ -3687,10 +3741,23 @@ async fn update_blackhole_from_source(
                         return true;
                     }
                     if data.id == link_id && matches!(data.event, LinkEvent::Closed) {
+                        log::trace!(
+                            "tp({name}): blackhole link {link_id} closed while waiting for activation",
+                        );
                         return false;
                     }
                 }
-                Err(_) => return false,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::trace!(
+                        "tp({name}): blackhole link event receiver lagged by {n} messages, retrying",
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    log::trace!(
+                        "tp({name}): blackhole link event channel closed",
+                    );
+                    return false;
+                }
             }
         }
     };
@@ -3711,6 +3778,10 @@ async fn update_blackhole_from_source(
             .map_err(|e| format!("request packet error: {e}"))?
     };
     let request_id = AddressHash::new_from_hash(&request_packet.hash());
+    log::trace!(
+        "tp({name}): sending /list request {request_id} ({}) on link {link_id}",
+        request_packet.data.len(),
+    );
     send_ctx.send_packet(name, request_packet).await;
 
     log::debug!("tp({name}): sent /list request {request_id} on link {link_id}");
@@ -3724,12 +3795,33 @@ async fn update_blackhole_from_source(
                             LinkEvent::Response(resp) if resp.request_id == request_id => {
                                 return Some(resp.data);
                             }
-                            LinkEvent::Closed => return None,
-                            _ => continue,
+                            LinkEvent::Closed => {
+                                log::trace!(
+                                    "tp({name}): blackhole link {link_id} closed while waiting for response",
+                                );
+                                return None;
+                            }
+                            LinkEvent::Response(resp) => {
+                                log::trace!(
+                                    "tp({name}): blackhole link {link_id} got response for different request {resp_request_id}, ignoring",
+                                    resp_request_id = resp.request_id,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 }
-                Err(_) => return None,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::trace!(
+                        "tp({name}): blackhole response receiver lagged by {n}, retrying",
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    log::trace!(
+                        "tp({name}): blackhole response channel closed",
+                    );
+                    return None;
+                }
             }
         }
     };
@@ -3741,13 +3833,20 @@ async fn update_blackhole_from_source(
 
     log::debug!("tp({name}): received blackhole list on link {link_id}");
 
-    if let Value::Map(entries) = &response {
+    let inserted = if let Value::Map(entries) = &response {
+        log::trace!(
+            "tp({name}): blackhole response contains {} entry(ies)",
+            entries.len(),
+        );
         let mut inserted = 0usize;
+        let mut skipped_bad_key = 0usize;
+        let mut skipped_existing = 0usize;
         {
             let mut handler_locked = handler.lock().await;
             for (k, v) in entries {
                 if let Some(identity_bytes) = k.as_slice() {
                     if identity_bytes.len() != AddressHash::new_empty().as_slice().len() {
+                        skipped_bad_key += 1;
                         continue;
                     }
                     let mut identity_hash = AddressHash::new_empty();
@@ -3756,23 +3855,36 @@ async fn update_blackhole_from_source(
                         if handler_locked.blackhole_table.insert_remote_entry(identity_hash, entry)
                         {
                             inserted += 1;
+                        } else {
+                            skipped_existing += 1;
                         }
                     }
                 }
             }
         }
-        log::info!("tp({name}): merged {inserted} blackhole entries from {source_hash}");
+        log::trace!(
+            "tp({name}): blackhole response summary: {inserted} new, {skipped_existing} existing, {skipped_bad_key} bad keys",
+        );
+        inserted
     } else {
-        log::warn!("tp({name}): unexpected blackhole response format from {source_hash}");
-    }
+        log::warn!("tp({name}): unexpected blackhole response format from {source_hash}: expected Map, got {:?}", response);
+        0
+    };
 
+    log::trace!(
+        "tp({name}): tearing down blackhole link {link_id} to {dest_hash}",
+    );
     handler
         .lock()
         .await
         .out_links
-        .remove(&dest_desc.address_hash);
+        .remove(&dest_hash);
 
-    Ok(())
+    log::trace!(
+        "tp({name}): blackhole fetch from {source_hash} complete, {inserted} new entries",
+    );
+
+    Ok(inserted)
 }
 
 #[cfg(test)]
