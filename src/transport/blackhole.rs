@@ -41,9 +41,7 @@ pub struct BlackholeEntry {
 impl BlackholeEntry {
     /// Returns `true` if this entry has an expiry that is now in the past.
     pub fn is_expired(&self) -> bool {
-        self.until
-            .map(|t| Instant::now() >= t)
-            .unwrap_or(false)
+        self.until.map(|t| Instant::now() >= t).unwrap_or(false)
     }
 }
 
@@ -78,11 +76,19 @@ impl BlackholeTable {
         use std::collections::hash_map::Entry;
         match self.entries.entry(identity_hash) {
             Entry::Vacant(e) => {
-                e.insert(BlackholeEntry { source, until, reason });
+                e.insert(BlackholeEntry {
+                    source,
+                    until,
+                    reason,
+                });
                 true
             }
             Entry::Occupied(mut e) => {
-                e.insert(BlackholeEntry { source, until, reason });
+                e.insert(BlackholeEntry {
+                    source,
+                    until,
+                    reason,
+                });
                 false
             }
         }
@@ -240,15 +246,13 @@ impl BlackholeTable {
 
 impl BlackholeEntry {
     pub(crate) fn to_msgpack(&self) -> Value {
-        let mut pairs = vec![
-            (Value::from("source"), Value::from(self.source.as_slice().to_vec())),
-        ];
+        let mut pairs = vec![(
+            Value::from("source"),
+            Value::from(self.source.as_slice().to_vec()),
+        )];
         if let Some(until) = self.until {
             let secs = until.duration_since(Instant::now());
-            pairs.push((
-                Value::from("until"),
-                Value::from(secs.as_secs_f64()),
-            ));
+            pairs.push((Value::from("until"), Value::from(secs.as_secs_f64())));
         }
         if let Some(ref reason) = self.reason {
             pairs.push((Value::from("reason"), Value::from(reason.clone())));
@@ -276,7 +280,11 @@ impl BlackholeEntry {
             }
         }
 
-        Some(Self { source, until, reason })
+        Some(Self {
+            source,
+            until,
+            reason,
+        })
     }
 }
 
@@ -317,7 +325,12 @@ mod tests {
         // Permanent entry (no until)
         table.add(id1, src, None, None);
         // Entry that expires immediately
-        table.add(id2, src, Some(Instant::now() - Duration::from_secs(1)), None);
+        table.add(
+            id2,
+            src,
+            Some(Instant::now() - Duration::from_secs(1)),
+            None,
+        );
 
         assert_eq!(table.remove_expired(), 1);
         assert!(table.contains(&id1));

@@ -1,22 +1,19 @@
-use std::{
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, SigningKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use ed25519_dalek::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, Signature, SigningKey};
 use rand_core::OsRng;
-use rmpv::{decode::read_value, encode::write_value, Value};
+use rmpv::{Value, decode::read_value, encode::write_value};
 use sha2::Digest;
 use x25519_dalek::StaticSecret;
 
 use crate::{
     buffer::OutputBuffer,
     error::RnsError,
-    hash::{AddressHash, Hash, ADDRESS_HASH_SIZE, HASH_SIZE},
+    hash::{ADDRESS_HASH_SIZE, AddressHash, HASH_SIZE, Hash},
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
-        compute_link_mdu, DestinationType, Header, Packet, PacketContext, PacketDataBuffer,
-        PacketType, PACKET_MDU, RETICULUM_AES_BLOCK_SIZE, RETICULUM_MTU,
-        RETICULUM_TOKEN_OVERHEAD,
+        DestinationType, Header, PACKET_MDU, Packet, PacketContext, PacketDataBuffer, PacketType,
+        RETICULUM_AES_BLOCK_SIZE, RETICULUM_MTU, RETICULUM_TOKEN_OVERHEAD, compute_link_mdu,
     },
 };
 
@@ -81,9 +78,7 @@ pub struct LinkPayload {
 
 impl LinkPayload {
     pub fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-        }
+        Self { buffer: Vec::new() }
     }
 
     pub fn new_from_slice(data: &[u8]) -> Self {
@@ -595,7 +590,9 @@ impl Link {
         }
 
         if self.status == LinkStatus::Active && packet.context == PacketContext::None {
-            if let Ok(hash) = validate_message_proof(&self.peer_identity, packet.data.as_slice(), None) {
+            if let Ok(hash) =
+                validate_message_proof(&self.peer_identity, packet.data.as_slice(), None)
+            {
                 self.post_event(LinkEvent::Proof(hash));
             }
         }
@@ -657,9 +654,8 @@ impl Link {
         let cipher_text_len = {
             let cipher_text = self.encrypt(
                 data,
-                packet_data.accuire_buf(
-                    data.len() + RETICULUM_TOKEN_OVERHEAD + RETICULUM_AES_BLOCK_SIZE,
-                ),
+                packet_data
+                    .accuire_buf(data.len() + RETICULUM_TOKEN_OVERHEAD + RETICULUM_AES_BLOCK_SIZE),
             )?;
             cipher_text.len()
         };
@@ -1060,8 +1056,7 @@ fn validate_message_proof(
     } else if data.len() == SIGNATURE_LENGTH {
         // Implicit proof: entire data is the signature, hash must be provided externally
         let hash = expected_hash.ok_or(RnsError::PacketError)?;
-        let signature =
-            Signature::from_slice(data).map_err(|_| RnsError::PacketError)?;
+        let signature = Signature::from_slice(data).map_err(|_| RnsError::PacketError)?;
         peer_identity
             .verify(hash.as_slice(), &signature)
             .map_err(|_| RnsError::IncorrectSignature)?;
@@ -1136,12 +1131,12 @@ mod tests {
     use crate::error::RnsError;
     use crate::hash::AddressHash;
     use crate::identity::PrivateIdentity;
-    use crate::packet::{DestinationType, PacketContext, PacketType, LINK_PACKET_MDU};
+    use crate::packet::{DestinationType, LINK_PACKET_MDU, PacketContext, PacketType};
     use crate::serde::Serialize;
     use crate::test_vectors;
 
     use super::{
-        ChannelEnvelope, ChannelMessage, Link, LinkEvent, LinkHandleResult, LINK_MTU_SIZE,
+        ChannelEnvelope, ChannelMessage, LINK_MTU_SIZE, Link, LinkEvent, LinkHandleResult,
     };
 
     struct TestChannelMessage(Vec<u8>);
@@ -1337,7 +1332,9 @@ mod tests {
 
         assert_eq!(
             raw,
-            vec![0x12, 0x34, 0x00, 0x02, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o']
+            vec![
+                0x12, 0x34, 0x00, 0x02, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'
+            ]
         );
         assert_eq!(ChannelEnvelope::unpack(&raw).expect("unpacked"), envelope);
         assert!(ChannelEnvelope::unpack(&raw[..raw.len() - 1]).is_err());

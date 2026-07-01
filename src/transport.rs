@@ -35,31 +35,31 @@ use crate::destination::DestinationHandleStatus;
 use crate::destination::DestinationName;
 use crate::destination::SingleInputDestination;
 use crate::destination::SingleOutputDestination;
-use crate::destination::link::link_signalling_bytes;
-use crate::destination::link::mtu_from_signalling_bytes;
+use crate::destination::link::LINK_MTU_SIZE;
 use crate::destination::link::Link;
 use crate::destination::link::LinkEvent;
 use crate::destination::link::LinkEventData;
 use crate::destination::link::LinkHandleResult;
 use crate::destination::link::LinkId;
 use crate::destination::link::LinkStatus;
-use crate::destination::link::LINK_MTU_SIZE;
+use crate::destination::link::link_signalling_bytes;
+use crate::destination::link::mtu_from_signalling_bytes;
 
 use crate::error::RnsError;
 
 use crate::hash::AddressHash;
 use crate::hash::Hash;
-use crate::identity::{PrivateIdentity, PUBLIC_KEY_LENGTH};
+use crate::identity::{PUBLIC_KEY_LENGTH, PrivateIdentity};
 
 use crate::iface::InterfaceManager;
 
-use blackhole::BlackholeTable;
 use crate::iface::InterfaceQueueLengths;
 use crate::iface::InterfaceRxReceiver;
 use crate::iface::RxMessage;
 use crate::iface::TxMessage;
 use crate::iface::TxMessageType;
 use crate::iface::tcp_client::TcpClient;
+use blackhole::BlackholeTable;
 
 use crate::packet::DestinationType;
 use crate::packet::Header;
@@ -721,7 +721,9 @@ impl Transport {
     ) -> bool {
         let mut handler = self.handler.lock().await;
         let source = *handler.config.identity.address_hash();
-        let added = handler.blackhole_table.add(*identity_hash, source, until, reason);
+        let added = handler
+            .blackhole_table
+            .add(*identity_hash, source, until, reason);
         let removed = handler.remove_blackholed_paths();
         log::info!(
             "tp({}): blackholed identity {}, removed {} path{}",
@@ -1475,7 +1477,8 @@ async fn handle_shared_rpc_request_path(
     map: &[(Value, Value)],
     handler: Arc<Mutex<TransportHandler>>,
 ) -> Value {
-    let Some(dest_bytes) = shared_rpc_map_value(map, "destination_hash").and_then(|v| v.as_slice()) else {
+    let Some(dest_bytes) = shared_rpc_map_value(map, "destination_hash").and_then(|v| v.as_slice())
+    else {
         return Value::Boolean(false);
     };
     if dest_bytes.len() != crate::hash::ADDRESS_HASH_SIZE {
@@ -1519,9 +1522,7 @@ async fn handle_shared_rpc_request_path(
         }
     }
 
-    Value::Map(vec![
-        (Value::from("found"), Value::from(false)),
-    ])
+    Value::Map(vec![(Value::from("found"), Value::from(false))])
 }
 
 async fn shared_rpc_authenticate(
@@ -1664,14 +1665,14 @@ fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut Transport
         };
     }
 
-    if let Some(identity_bytes) = shared_rpc_map_value(map, "blackhole_identity")
-        .and_then(|v| v.as_slice())
+    if let Some(identity_bytes) =
+        shared_rpc_map_value(map, "blackhole_identity").and_then(|v| v.as_slice())
     {
         return shared_rpc_blackhole_identity(identity_bytes, map, handler.as_deref_mut());
     }
 
-    if let Some(identity_bytes) = shared_rpc_map_value(map, "unblackhole_identity")
-        .and_then(|v| v.as_slice())
+    if let Some(identity_bytes) =
+        shared_rpc_map_value(map, "unblackhole_identity").and_then(|v| v.as_slice())
     {
         return shared_rpc_unblackhole_identity(identity_bytes, handler.as_deref_mut());
     }
@@ -1703,8 +1704,14 @@ fn shared_rpc_path_table(handler: Option<&mut TransportHandler>) -> Value {
             Value::Map(vec![
                 (Value::from("hash"), Value::Binary(hash.as_slice().to_vec())),
                 (Value::from("hops"), Value::from(entry.hops as u64)),
-                (Value::from("via"), Value::Binary(entry.received_from.as_slice().to_vec())),
-                (Value::from("interface"), Value::Binary(entry.iface.as_slice().to_vec())),
+                (
+                    Value::from("via"),
+                    Value::Binary(entry.received_from.as_slice().to_vec()),
+                ),
+                (
+                    Value::from("interface"),
+                    Value::Binary(entry.iface.as_slice().to_vec()),
+                ),
                 (Value::from("expires"), Value::from(expires_secs)),
             ])
         })
@@ -1734,7 +1741,10 @@ fn shared_rpc_rate_table(handler: Option<&mut TransportHandler>) -> Value {
             Value::Map(vec![
                 (Value::from("hash"), Value::Binary(hash.as_slice().to_vec())),
                 (Value::from("last"), Value::from(last_secs)),
-                (Value::from("rate_violations"), Value::from(entry.violations as u64)),
+                (
+                    Value::from("rate_violations"),
+                    Value::from(entry.violations as u64),
+                ),
                 (Value::from("blocked_until"), Value::from(blocked_secs)),
             ])
         })
@@ -1749,12 +1759,15 @@ fn shared_rpc_blackholed_identities(handler: Option<&mut TransportHandler>) -> V
     }
 }
 
-fn shared_rpc_is_blackholed(map: &[(Value, Value)], handler: Option<&mut TransportHandler>) -> Value {
+fn shared_rpc_is_blackholed(
+    map: &[(Value, Value)],
+    handler: Option<&mut TransportHandler>,
+) -> Value {
     let Some(handler) = handler else {
         return Value::Boolean(false);
     };
-    if let Some(identity_bytes) = shared_rpc_map_value(map, "identity_hash")
-        .and_then(|v| v.as_slice())
+    if let Some(identity_bytes) =
+        shared_rpc_map_value(map, "identity_hash").and_then(|v| v.as_slice())
     {
         let identity_hash = AddressHash::new_from_slice(identity_bytes);
         Value::Boolean(handler.blackhole_table.contains(&identity_hash))
@@ -1770,18 +1783,31 @@ fn shared_rpc_drop_path(map: &[(Value, Value)], handler: Option<&mut TransportHa
     let Some(destination) = shared_rpc_destination_hash(map) else {
         return Value::Boolean(false);
     };
-    let removed = handler.send_ctx.path_table.write().unwrap().remove(&destination);
+    let removed = handler
+        .send_ctx
+        .path_table
+        .write()
+        .unwrap()
+        .remove(&destination);
     Value::Boolean(removed)
 }
 
-fn shared_rpc_drop_all_via(map: &[(Value, Value)], handler: Option<&mut TransportHandler>) -> Value {
+fn shared_rpc_drop_all_via(
+    map: &[(Value, Value)],
+    handler: Option<&mut TransportHandler>,
+) -> Value {
     let Some(handler) = handler else {
         return Value::from(0);
     };
     let Some(via) = shared_rpc_destination_hash(map) else {
         return Value::from(0);
     };
-    let count = handler.send_ctx.path_table.write().unwrap().drop_all_via(&via);
+    let count = handler
+        .send_ctx
+        .path_table
+        .write()
+        .unwrap()
+        .drop_all_via(&via);
     Value::from(count as u64)
 }
 
@@ -1816,7 +1842,9 @@ fn shared_rpc_blackhole_identity(
         .map(|s| s.to_owned());
 
     let source = *handler.config.identity.address_hash();
-    let added = handler.blackhole_table.add(identity_hash, source, until, reason);
+    let added = handler
+        .blackhole_table
+        .add(identity_hash, source, until, reason);
     let removed = handler.remove_blackholed_paths();
     log::info!(
         "share_instance: blackholed identity {}, removed {} path{}",
@@ -2303,11 +2331,8 @@ impl TransportHandler {
     /// Remove path table entries whose associated identity is blackholed.
     /// Protocol-compatible with Python `Transport.remove_blackholed_paths()`.
     pub fn remove_blackholed_paths(&mut self) -> usize {
-        let blackholed: HashSet<AddressHash> = self
-            .blackhole_table
-            .identity_hashes()
-            .into_iter()
-            .collect();
+        let blackholed: HashSet<AddressHash> =
+            self.blackhole_table.identity_hashes().into_iter().collect();
 
         if blackholed.is_empty() {
             return 0;
@@ -2325,11 +2350,7 @@ impl TransportHandler {
         let count = drop_destinations.len();
         for dest_hash in &drop_destinations {
             self.single_out_destinations.remove(dest_hash);
-            self.send_ctx
-                .path_table
-                .write()
-                .unwrap()
-                .remove(dest_hash);
+            self.send_ctx.path_table.write().unwrap().remove(dest_hash);
         }
 
         if count > 0 {
@@ -2400,7 +2421,8 @@ impl TransportHandler {
         })
         .await;
 
-        self.last_path_requests.insert(*address, time::Instant::now());
+        self.last_path_requests
+            .insert(*address, time::Instant::now());
     }
 
     async fn build_discovery_packet(&mut self, iface: &AddressHash) -> Result<Packet, RnsError> {
@@ -2650,7 +2672,10 @@ async fn handle_data<'a>(
             let mut proof = None;
             let decrypted_len = {
                 let destination = destination.lock().await;
-                match destination.decrypt(packet.data.as_slice(), plain_data.accuire_buf(packet.data.len())) {
+                match destination.decrypt(
+                    packet.data.as_slice(),
+                    plain_data.accuire_buf(packet.data.len()),
+                ) {
                     Ok(data) => {
                         if destination.prove_packets() {
                             proof = Some(destination.proof_packet(&packet.hash()));
@@ -3376,8 +3401,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                                     .remove(link_entry.0);
                             }
 
-                            rediscover_destinations
-                                .push((*link_entry.0, blocked_if));
+                            rediscover_destinations.push((*link_entry.0, blocked_if));
                         }
                     }
                 }
@@ -3519,7 +3543,12 @@ async fn manage_transport(
 ) {
     let (cancel, retransmit, announce_forever, tp_name) = {
         let h = handler.lock().await;
-        (h.cancel.clone(), h.config.retransmit, h.config.announce_forever, h.config.name.clone())
+        (
+            h.cancel.clone(),
+            h.config.retransmit,
+            h.config.announce_forever,
+            h.config.name.clone(),
+        )
     };
     let mut last_retransmit_old = if announce_forever {
         Some(time::Instant::now() - INTERVAL_OLD_ANNOUNCES_RETRANSMIT)
@@ -3579,7 +3608,8 @@ async fn manage_transport(
                         "tp({}): dropping packet for other transport: dst={}, transport={}",
                         tp_name,
                         packet.destination,
-                        packet.transport
+                        packet
+                            .transport
                             .map(|transport| transport.to_string())
                             .unwrap_or_else(|| "None".to_owned()),
                     );
@@ -3865,9 +3895,7 @@ async fn blackhole_updater_job(
                     due
                 }
                 None => {
-                    log::trace!(
-                        "tp({name}): blackhole source {source_hash} never updated, due",
-                    );
+                    log::trace!("tp({name}): blackhole source {source_hash} never updated, due",);
                     true
                 }
             };
@@ -3895,9 +3923,7 @@ async fn blackhole_updater_job(
                 );
                 continue;
             }
-            log::trace!(
-                "tp({name}): found path to blackhole destination {dest_hash}",
-            );
+            log::trace!("tp({name}): found path to blackhole destination {dest_hash}",);
 
             let dest_desc = {
                 let handler = handler.lock().await;
@@ -3941,7 +3967,9 @@ async fn blackhole_updater_job(
             {
                 Ok(count) => {
                     last_updates.insert(*source_hash, now);
-                    log::info!("tp({name}): blackhole update from {source_hash} complete, {count} new entries");
+                    log::info!(
+                        "tp({name}): blackhole update from {source_hash} complete, {count} new entries"
+                    );
                 }
                 Err(e) => {
                     log::warn!("tp({name}): blackhole update from {source_hash} failed: {e}");
@@ -3950,7 +3978,9 @@ async fn blackhole_updater_job(
         }
 
         if sources.is_empty() {
-            log::trace!("tp({name}): blackhole updater iteration {iteration}: no sources configured");
+            log::trace!(
+                "tp({name}): blackhole updater iteration {iteration}: no sources configured"
+            );
         }
     }
 }
@@ -3971,9 +4001,7 @@ async fn update_blackhole_from_source(
     source_hash: AddressHash,
     dest_hash: AddressHash,
 ) -> Result<usize, String> {
-    log::trace!(
-        "tp({name}): starting blackhole fetch from {source_hash} (dest {dest_hash})",
-    );
+    log::trace!("tp({name}): starting blackhole fetch from {source_hash} (dest {dest_hash})",);
     let mut rx = event_tx.subscribe();
 
     let path_mtu = {
@@ -3986,9 +4014,7 @@ async fn update_blackhole_from_source(
                 .next_hop_iface(&dest_hash);
             if let Some(iface) = iface_addr {
                 let mtu = iface_manager.lock().await.hw_mtu(&iface);
-                log::trace!(
-                    "tp({name}): blackhole link path_mtu={mtu:?} via iface {iface}",
-                );
+                log::trace!("tp({name}): blackhole link path_mtu={mtu:?} via iface {iface}",);
                 mtu
             } else {
                 log::trace!("tp({name}): blackhole link no next-hop iface found");
@@ -4003,9 +4029,7 @@ async fn update_blackhole_from_source(
     let link_id = {
         let packet = link.request(path_mtu);
         let link_id = *link.id();
-        log::debug!(
-            "tp({name}): blackhole updater created link {link_id} to {dest_hash}",
-        );
+        log::debug!("tp({name}): blackhole updater created link {link_id} to {dest_hash}",);
         send_ctx.send_packet(name, packet).await;
         link_id
     };
@@ -4041,9 +4065,7 @@ async fn update_blackhole_from_source(
                     );
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    log::trace!(
-                        "tp({name}): blackhole link event channel closed",
-                    );
+                    log::trace!("tp({name}): blackhole link event channel closed",);
                     return false;
                 }
             }
@@ -4100,14 +4122,10 @@ async fn update_blackhole_from_source(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    log::trace!(
-                        "tp({name}): blackhole response receiver lagged by {n}, retrying",
-                    );
+                    log::trace!("tp({name}): blackhole response receiver lagged by {n}, retrying",);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    log::trace!(
-                        "tp({name}): blackhole response channel closed",
-                    );
+                    log::trace!("tp({name}): blackhole response channel closed",);
                     return None;
                 }
             }
@@ -4140,7 +4158,9 @@ async fn update_blackhole_from_source(
                     let mut identity_hash = AddressHash::new_empty();
                     identity_hash.as_mut_slice().copy_from_slice(identity_bytes);
                     if let Some(entry) = blackhole::BlackholeEntry::from_msgpack(v, source_hash) {
-                        if handler_locked.blackhole_table.insert_remote_entry(identity_hash, entry)
+                        if handler_locked
+                            .blackhole_table
+                            .insert_remote_entry(identity_hash, entry)
                         {
                             inserted += 1;
                         } else {
@@ -4155,22 +4175,17 @@ async fn update_blackhole_from_source(
         );
         inserted
     } else {
-        log::warn!("tp({name}): unexpected blackhole response format from {source_hash}: expected Map, got {:?}", response);
+        log::warn!(
+            "tp({name}): unexpected blackhole response format from {source_hash}: expected Map, got {:?}",
+            response
+        );
         0
     };
 
-    log::trace!(
-        "tp({name}): tearing down blackhole link {link_id} to {dest_hash}",
-    );
-    handler
-        .lock()
-        .await
-        .out_links
-        .remove(&dest_hash);
+    log::trace!("tp({name}): tearing down blackhole link {link_id} to {dest_hash}",);
+    handler.lock().await.out_links.remove(&dest_hash);
 
-    log::trace!(
-        "tp({name}): blackhole fetch from {source_hash} complete, {inserted} new entries",
-    );
+    log::trace!("tp({name}): blackhole fetch from {source_hash} complete, {inserted} new entries",);
 
     Ok(inserted)
 }

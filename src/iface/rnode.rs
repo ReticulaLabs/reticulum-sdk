@@ -1235,7 +1235,9 @@ mod tests {
             update_command_state(
                 KissFrame {
                     command: kiss::CMD_STAT_CHTM,
-                    payload: vec![0x04, 0xd2, 0x09, 0xc4, 0x00, 0x64, 0x00, 0xc8, 180, 120, 0xff],
+                    payload: vec![
+                        0x04, 0xd2, 0x09, 0xc4, 0x00, 0x64, 0x00, 0xc8, 180, 120, 0xff
+                    ],
                 },
                 &state,
                 &ready,

@@ -131,7 +131,12 @@ async fn backbone_discovery_announce_roundtrip() {
     assert_eq!(discovered.port, Some(port_a));
     assert!(discovered.stamp_value >= 14);
     assert!(discovered.config_entry.is_some());
-    assert!(discovered.config_entry.unwrap().contains("type = BackboneInterface"));
+    assert!(
+        discovered
+            .config_entry
+            .unwrap()
+            .contains("type = BackboneInterface")
+    );
 }
 
 #[tokio::test]

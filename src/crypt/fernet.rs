@@ -1,10 +1,10 @@
 use core::cmp;
 use core::convert::From;
 
-use aes::cipher::block_padding::Pkcs7;
 use aes::cipher::BlockDecryptMut;
 use aes::cipher::Key;
 use aes::cipher::Unsigned;
+use aes::cipher::block_padding::Pkcs7;
 use cbc::cipher::BlockEncryptMut;
 use cbc::cipher::KeyIvInit;
 use crypto_common::{IvSizeUser, KeySizeUser, OutputSizeUser};

@@ -624,7 +624,7 @@ fn baud_constant(speed: u32) -> io::Result<libc::speed_t> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unsupported serial baud rate {speed}"),
-            ))
+            ));
         }
     };
 
@@ -640,7 +640,9 @@ mod tests {
         let encoded = encode_data_frame(&[0x01, FEND, 0x02, FESC, 0x03]);
         assert_eq!(
             encoded,
-            vec![FEND, CMD_DATA, 0x01, FESC, TFEND, 0x02, FESC, TFESC, 0x03, FEND]
+            vec![
+                FEND, CMD_DATA, 0x01, FESC, TFEND, 0x02, FESC, TFESC, 0x03, FEND
+            ]
         );
     }
 

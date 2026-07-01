@@ -8,10 +8,8 @@ use rmpv::{Value, decode::read_value, encode::write_value};
 
 use crate::{
     error::RnsError,
-    hash::{Hash, HASH_SIZE},
-    packet::{
-        RETICULUM_AES_BLOCK_SIZE, RETICULUM_TOKEN_OVERHEAD,
-    },
+    hash::{HASH_SIZE, Hash},
+    packet::{RETICULUM_AES_BLOCK_SIZE, RETICULUM_TOKEN_OVERHEAD},
 };
 
 // ============================================================================
@@ -122,12 +120,24 @@ impl ResourceAdvertisement {
         let is_response = resource.request_id.is_some() && resource.is_response;
 
         let mut flags: u8 = 0x00;
-        if encrypted { flags |= 0x01; }
-        if compressed { flags |= 0x02; }
-        if resource.split { flags |= 0x04; }
-        if is_request { flags |= 0x08; }
-        if is_response { flags |= 0x10; }
-        if has_metadata { flags |= 0x20; }
+        if encrypted {
+            flags |= 0x01;
+        }
+        if compressed {
+            flags |= 0x02;
+        }
+        if resource.split {
+            flags |= 0x04;
+        }
+        if is_request {
+            flags |= 0x08;
+        }
+        if is_response {
+            flags |= 0x10;
+        }
+        if has_metadata {
+            flags |= 0x20;
+        }
 
         ResourceAdvertisement {
             transfer_size: resource.size,
@@ -161,16 +171,25 @@ impl ResourceAdvertisement {
         dict.push((Value::from("t"), Value::from(self.transfer_size as i64)));
         dict.push((Value::from("d"), Value::from(self.data_size as i64)));
         dict.push((Value::from("n"), Value::from(self.num_parts as i64)));
-        dict.push((Value::from("h"), Value::Binary(self.hash.to_bytes().to_vec())));
+        dict.push((
+            Value::from("h"),
+            Value::Binary(self.hash.to_bytes().to_vec()),
+        ));
         dict.push((Value::from("r"), Value::Binary(self.random_hash.to_vec())));
-        dict.push((Value::from("o"), Value::Binary(self.original_hash.to_bytes().to_vec())));
+        dict.push((
+            Value::from("o"),
+            Value::Binary(self.original_hash.to_bytes().to_vec()),
+        ));
         dict.push((Value::from("i"), Value::from(self.segment_index as i64)));
         dict.push((Value::from("l"), Value::from(self.total_segments as i64)));
         dict.push((Value::from("f"), Value::from(self.flags as i64)));
         dict.push((Value::from("m"), Value::Binary(hashmap_seg)));
-        dict.push((Value::from("q"),
-            self.request_id.map(|h| Value::Binary(h.to_bytes().to_vec()))
-                .unwrap_or(Value::Nil)));
+        dict.push((
+            Value::from("q"),
+            self.request_id
+                .map(|h| Value::Binary(h.to_bytes().to_vec()))
+                .unwrap_or(Value::Nil),
+        ));
 
         let map = Value::Map(dict);
         let mut out = Vec::new();
@@ -909,8 +928,7 @@ impl Resource {
         let requested_hashes = &request_data[pad + HASH_SIZE..];
 
         if self.adv_sent.is_some() && self.rtt.is_none() {
-            let elapsed = std::time::Instant::now()
-                .duration_since(self.adv_sent.unwrap());
+            let elapsed = std::time::Instant::now().duration_since(self.adv_sent.unwrap());
             self.rtt = Some(elapsed);
         }
 
@@ -962,8 +980,7 @@ impl Resource {
                 }
             }
 
-            self.receiver_min_consecutive_height =
-                part_index.saturating_sub(1 + WINDOW_MAX);
+            self.receiver_min_consecutive_height = part_index.saturating_sub(1 + WINDOW_MAX);
 
             if hml > 0 && part_index % hml != 0 {
                 self.status = ResourceStatus::Failed;
@@ -987,8 +1004,7 @@ impl Resource {
                 Value::Binary(hashmap_seg),
             ]);
             let mut hmu_body = Vec::new();
-            write_value(&mut hmu_body, &hmu_value)
-                .map_err(|_| RnsError::InvalidArgument)?;
+            write_value(&mut hmu_body, &hmu_value).map_err(|_| RnsError::InvalidArgument)?;
 
             let mut hmu = Vec::with_capacity(HASH_SIZE + hmu_body.len());
             hmu.extend_from_slice(self.hash.as_slice());
@@ -1011,22 +1027,54 @@ impl Resource {
 
     // ---- Getters ----
 
-    pub fn hash(&self) -> &Hash { &self.hash }
-    pub fn original_hash(&self) -> &Hash { &self.original_hash }
-    pub fn size(&self) -> usize { self.size }
-    pub fn total_size(&self) -> usize { self.total_size }
-    pub fn status(&self) -> ResourceStatus { self.status }
-    pub fn set_status(&mut self, s: ResourceStatus) { self.status = s; }
-    pub fn total_parts(&self) -> usize { self.total_parts }
-    pub fn received_count(&self) -> usize { self.received_count }
-    pub fn window(&self) -> usize { self.window }
-    pub fn eifr(&self) -> Option<f64> { self.eifr }
-    pub fn is_encrypted(&self) -> bool { self.encrypted }
-    pub fn is_compressed(&self) -> bool { self.compressed }
-    pub fn random_hash_bytes(&self) -> &[u8; RANDOM_HASH_SIZE] { &self.random_hash }
-    pub fn segment_index(&self) -> usize { self.segment_index }
-    pub fn total_segments(&self) -> usize { self.total_segments }
-    pub fn split(&self) -> bool { self.split }
+    pub fn hash(&self) -> &Hash {
+        &self.hash
+    }
+    pub fn original_hash(&self) -> &Hash {
+        &self.original_hash
+    }
+    pub fn size(&self) -> usize {
+        self.size
+    }
+    pub fn total_size(&self) -> usize {
+        self.total_size
+    }
+    pub fn status(&self) -> ResourceStatus {
+        self.status
+    }
+    pub fn set_status(&mut self, s: ResourceStatus) {
+        self.status = s;
+    }
+    pub fn total_parts(&self) -> usize {
+        self.total_parts
+    }
+    pub fn received_count(&self) -> usize {
+        self.received_count
+    }
+    pub fn window(&self) -> usize {
+        self.window
+    }
+    pub fn eifr(&self) -> Option<f64> {
+        self.eifr
+    }
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
+    pub fn is_compressed(&self) -> bool {
+        self.compressed
+    }
+    pub fn random_hash_bytes(&self) -> &[u8; RANDOM_HASH_SIZE] {
+        &self.random_hash
+    }
+    pub fn segment_index(&self) -> usize {
+        self.segment_index
+    }
+    pub fn total_segments(&self) -> usize {
+        self.total_segments
+    }
+    pub fn split(&self) -> bool {
+        self.split
+    }
 }
 
 // ============================================================================
@@ -1063,8 +1111,8 @@ mod tests {
     fn resource_advertisement_pack_unpack_roundtrip() {
         let data = b"Hello, Resource World!";
         let link_mdu = 400;
-        let resource = Resource::new(data, link_mdu, dummy_encrypt, None, false)
-            .expect("resource creation");
+        let resource =
+            Resource::new(data, link_mdu, dummy_encrypt, None, false).expect("resource creation");
 
         let adv = ResourceAdvertisement::from_resource(&resource);
         let packed = adv.pack(0, link_mdu).expect("pack");
@@ -1086,13 +1134,13 @@ mod tests {
         let original_data = b"Test data!";
         let link_mdu = 400;
 
-        let mut sender = Resource::new(original_data, link_mdu, dummy_encrypt, None, false)
-            .expect("sender");
+        let mut sender =
+            Resource::new(original_data, link_mdu, dummy_encrypt, None, false).expect("sender");
 
         let adv = ResourceAdvertisement::from_resource(&sender);
         let rtt = Duration::from_millis(50);
-        let mut receiver = Resource::new_from_advertisement(&adv, link_mdu, rtt, None)
-            .expect("receiver");
+        let mut receiver =
+            Resource::new_from_advertisement(&adv, link_mdu, rtt, None).expect("receiver");
 
         let first_req = receiver.start_receive(&adv.hashmap).expect("first request");
         let req_result = sender.handle_request(&first_req, None).expect("handle req");
@@ -1133,8 +1181,7 @@ mod tests {
     fn resource_hash_verification() {
         let data = b"Verify my hash!";
         let link_mdu = 200;
-        let resource = Resource::new(data, link_mdu, dummy_encrypt, None, false)
-            .expect("resource");
+        let resource = Resource::new(data, link_mdu, dummy_encrypt, None, false).expect("resource");
 
         // Hash should be SHA-256(original_plaintext || random_hash)
         let mut expected = Sha256::new();
@@ -1142,7 +1189,10 @@ mod tests {
         expected.update(resource.random_hash_bytes());
         let expected_hash = Hash::new(expected.finalize().into());
 
-        assert_eq!(*resource.hash(), expected_hash,
-            "resource hash must be SHA-256(plaintext || random_hash)");
+        assert_eq!(
+            *resource.hash(),
+            expected_hash,
+            "resource hash must be SHA-256(plaintext || random_hash)"
+        );
     }
 }

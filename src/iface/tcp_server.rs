@@ -1,12 +1,12 @@
 use alloc::string::String;
 use std::net::TcpListener as StdTcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::net::TcpListener;
 
 use crate::error::RnsError;
-use crate::iface::{configured_bitrate, DEFAULT_HW_MTU};
+use crate::iface::{DEFAULT_HW_MTU, configured_bitrate};
 
 use super::tcp_client::TcpClient;
 use super::{Interface, InterfaceContext, InterfaceManager};

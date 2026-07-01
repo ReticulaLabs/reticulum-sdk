@@ -1,3 +1,4 @@
+pub mod backbone;
 pub mod hdlc;
 pub mod ifac;
 pub mod kiss;
@@ -5,7 +6,6 @@ pub mod modem73;
 pub mod rnode;
 pub mod tcp_client;
 pub mod tcp_server;
-pub mod backbone;
 pub mod udp;
 
 use std::sync::Arc;
@@ -682,12 +682,8 @@ impl InterfaceManager {
                         )
                         .await;
                 } else {
-                    send_or_drop(
-                        &iface.tx_send,
-                        message,
-                        Some(&iface.saturated_queue_logger),
-                    )
-                    .await;
+                    send_or_drop(&iface.tx_send, message, Some(&iface.saturated_queue_logger))
+                        .await;
                 }
             }
         }

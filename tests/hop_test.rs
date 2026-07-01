@@ -2,7 +2,7 @@ use std::net::TcpListener;
 use std::sync::Once;
 use std::time::Duration;
 
-use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
+use ed25519_dalek::{SIGNATURE_LENGTH, Signature};
 use rand_core::OsRng;
 use reticulum_sdk::{
     destination::link::LinkEvent,

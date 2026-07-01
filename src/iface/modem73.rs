@@ -1,23 +1,23 @@
 use std::cmp;
 use std::io;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpStream,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::iface::{
-    configured_bitrate, Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU,
-    MAX_AUTOCONFIGURED_HW_MTU,
+    DEFAULT_HW_MTU, Interface, InterfaceContext, MAX_AUTOCONFIGURED_HW_MTU, RxMessage,
+    configured_bitrate,
 };
 use crate::packet::Packet;
 use crate::serde::Serialize;
@@ -663,7 +663,9 @@ mod tests {
         let encoded = encode_data_frame(&[0x01, FEND, 0x02, FESC, 0x03]);
         assert_eq!(
             encoded,
-            vec![FEND, CMD_DATA, 0x01, FESC, TFEND, 0x02, FESC, TFESC, 0x03, FEND]
+            vec![
+                FEND, CMD_DATA, 0x01, FESC, TFEND, 0x02, FESC, TFESC, 0x03, FEND
+            ]
         );
     }
 

@@ -3,9 +3,7 @@ use std::time::{Duration, Instant};
 
 use rand_core::OsRng;
 use reticulum_sdk::{
-    destination::{
-        DestinationName, SingleInputDestination, SingleOutputDestination,
-    },
+    destination::{DestinationName, SingleInputDestination, SingleOutputDestination},
     hash::AddressHash,
     identity::PrivateIdentity,
     iface::RxMessage,
@@ -17,10 +15,7 @@ static INIT: Once = Once::new();
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        )
-        .init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     });
 }
 
@@ -169,7 +164,9 @@ async fn bench_inbound_data_decryption() {
     let output = SingleOutputDestination::new_from_desc(desc);
     let payload = b"benchmark payload";
 
-    let packets: Vec<Packet> = (0..5_000).map(|_| output.data_packet(payload).unwrap()).collect();
+    let packets: Vec<Packet> = (0..5_000)
+        .map(|_| output.data_packet(payload).unwrap())
+        .collect();
 
     let start = Instant::now();
     let mut count = 0u64;

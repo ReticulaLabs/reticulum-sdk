@@ -417,7 +417,10 @@ impl Packet {
         buf.push(self.header.hops);
 
         if self.header.header_type == HeaderType::Type2 {
-            let transport = self.transport.as_ref().ok_or(crate::error::RnsError::PacketError)?;
+            let transport = self
+                .transport
+                .as_ref()
+                .ok_or(crate::error::RnsError::PacketError)?;
             buf.extend_from_slice(transport.as_slice());
         }
         buf.extend_from_slice(self.destination.as_slice());

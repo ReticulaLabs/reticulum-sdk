@@ -1,8 +1,8 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
+use ed25519_dalek::{SIGNATURE_LENGTH, Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::error::RnsError;
-use crate::packet::{IfacFlag, Header, Packet, PacketIfac};
+use crate::packet::{Header, IfacFlag, Packet, PacketIfac};
 
 /// Configuration for Interface Access Codes (IFAC) on a single interface.
 ///
@@ -108,8 +108,7 @@ impl IfacConfig {
             }
         } else {
             // Full 64-byte signature: standard Ed25519 verification.
-            let signature =
-                Signature::from_slice(ifac_bytes).map_err(|_| RnsError::CryptoError)?;
+            let signature = Signature::from_slice(ifac_bytes).map_err(|_| RnsError::CryptoError)?;
             self.verify_key
                 .verify_strict(signed_data, &signature)
                 .map_err(|_| RnsError::IncorrectSignature)
@@ -137,11 +136,11 @@ mod tests {
     use rand_core::OsRng;
 
     use super::*;
-    use crate::packet::{
-        Header, HeaderType, PacketContext, PacketDataBuffer, PropagationType, DestinationType,
-        PacketType,
-    };
     use crate::hash::AddressHash;
+    use crate::packet::{
+        DestinationType, Header, HeaderType, PacketContext, PacketDataBuffer, PacketType,
+        PropagationType,
+    };
 
     #[test]
     fn derive_is_deterministic() {
@@ -272,13 +271,12 @@ mod tests {
         config.attach(&mut packet).expect("attach truncated ifac");
 
         // The IFAC should only be 16 bytes
-        assert_eq!(
-            packet.ifac.as_ref().map(|i| i.as_slice().len()),
-            Some(16)
-        );
+        assert_eq!(packet.ifac.as_ref().map(|i| i.as_slice().len()), Some(16));
 
         // The verify takes the truncated IFAC and pad with zeroes
-        config.verify_packet(&packet).expect("verify truncated ifac");
+        config
+            .verify_packet(&packet)
+            .expect("verify truncated ifac");
     }
 
     #[test]
@@ -340,8 +338,11 @@ mod tests {
 
         use crate::buffer::InputBuffer;
         let mut input = InputBuffer::new(&raw_bytes);
-        let parsed = Packet::deserialize_with_ifac_len(&mut input, 64).expect("deserialize with ifac");
+        let parsed =
+            Packet::deserialize_with_ifac_len(&mut input, 64).expect("deserialize with ifac");
 
-        config.verify_packet(&parsed).expect("verify after deserialization");
+        config
+            .verify_packet(&parsed)
+            .expect("verify after deserialization");
     }
 }

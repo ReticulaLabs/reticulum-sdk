@@ -199,10 +199,7 @@ impl LinkTable {
                 Some(propagate(proof, entry.received_from))
             }
             None => {
-                log::trace!(
-                    "link_table: no entry for proof dst={}",
-                    proof.destination,
-                );
+                log::trace!("link_table: no entry for proof dst={}", proof.destination,);
                 None
             }
         }

@@ -120,10 +120,7 @@ impl PathTable {
     pub fn mark_unresponsive(&mut self, destination: &AddressHash) {
         if let Some(entry) = self.map.get_mut(destination) {
             entry.state = PathState::Unresponsive;
-            log::info!(
-                "path_table mark {} unresponsive",
-                destination,
-            );
+            log::info!("path_table mark {} unresponsive", destination,);
         }
     }
 
@@ -276,10 +273,7 @@ self_referential_transport={}",
 
     pub fn handle_packet(&self, packet: Packet) -> (Packet, Option<AddressHash>) {
         if packet.header.header_type == HeaderType::Type2 {
-            log::trace!(
-                "path_table: skip Type2 packet dst={}",
-                packet.destination
-            );
+            log::trace!("path_table: skip Type2 packet dst={}", packet.destination);
             return (packet, None);
         }
 
@@ -892,7 +886,10 @@ mod tests {
 
         assert_eq!(forwarded_iface, None);
         assert_eq!(forwarded.header.header_type, HeaderType::Type1);
-        assert_eq!(forwarded.transport, Some(AddressHash::new_from_slice(b"stale-transport")));
+        assert_eq!(
+            forwarded.transport,
+            Some(AddressHash::new_from_slice(b"stale-transport"))
+        );
     }
 
     #[test]

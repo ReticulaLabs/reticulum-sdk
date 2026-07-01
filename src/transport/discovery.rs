@@ -3,7 +3,7 @@ use std::time::Duration;
 use ed25519_dalek::Signature;
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
-use rmpv::{decode::read_value, encode::write_value, Value};
+use rmpv::{Value, decode::read_value, encode::write_value};
 use sha2::{Digest, Sha256};
 use tokio::time;
 
@@ -11,7 +11,7 @@ use crate::{
     buffer::StaticBuffer,
     destination::{DestinationDesc, DestinationName, SingleInputDestination},
     error::RnsError,
-    hash::{AddressHash, Hash, HASH_SIZE},
+    hash::{AddressHash, HASH_SIZE, Hash},
     identity::PrivateIdentity,
     packet::PacketDataBuffer,
 };
@@ -286,9 +286,7 @@ impl DiscoveredInterface {
             signed_data.extend_from_slice(packed);
             signed_data.extend_from_slice(stamp);
 
-            source
-                .identity
-                .verify(&signed_data, &signature)?;
+            source.identity.verify(&signed_data, &signature)?;
         }
 
         let infohash = Hash::new_from_slice(packed);
@@ -599,11 +597,13 @@ mod tests {
         assert_eq!(decoded.name, "København 測試");
         assert_eq!(decoded.ifac_netname.as_deref(), Some("møøse-net"));
         assert_eq!(decoded.ifac_netkey.as_deref(), Some("nøgle"));
-        assert!(decoded
-            .config_entry
-            .as_deref()
-            .unwrap()
-            .contains("[[København 測試]]"));
+        assert!(
+            decoded
+                .config_entry
+                .as_deref()
+                .unwrap()
+                .contains("[[København 測試]]")
+        );
     }
 
     #[test]

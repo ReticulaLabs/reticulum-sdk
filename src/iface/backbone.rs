@@ -1,5 +1,6 @@
 use std::cmp;
 use std::fmt::Write as _;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
 use crate::iface::{
-    configured_bitrate, Interface, InterfaceContext, RxMessage, MAX_AUTOCONFIGURED_HW_MTU,
+    Interface, InterfaceContext, MAX_AUTOCONFIGURED_HW_MTU, RxMessage, configured_bitrate,
 };
 use crate::packet::{
     Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
@@ -31,6 +32,57 @@ const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
 
 pub const BACKBONE_DEFAULT_HW_MTU: usize = 1_048_576;
 pub const BACKBONE_DEFAULT_BITRATE: f64 = 1_000_000_000.0;
+
+fn set_tcp_sockopts(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = stream.as_raw_fd();
+        let on: libc::c_int = 1;
+        let idle: libc::c_int = 5;
+        let intvl: libc::c_int = 2;
+        let cnt: libc::c_int = 12;
+        let uto: libc::c_int = 24_000;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                &idle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                &intvl as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
+                &cnt as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                &uto as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
 
 /// Server-side listening interface modeled after Python's `BackboneInterface`.
 /// Accepts incoming TCP connections and spawns `BackboneClient` handlers.
@@ -336,6 +388,7 @@ impl BackboneClient {
             let stop = CancellationToken::new();
 
             let stream = stream.unwrap();
+            set_tcp_sockopts(&stream);
             reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
             let (read_stream, write_stream) = stream.into_split();
 
@@ -457,6 +510,7 @@ impl BackboneClient {
                                     }
                                     Err(e) => {
                                         log::warn!("backbone_client: connection error {}", e);
+                                        stop.cancel();
                                         break;
                                     }
                                 }
@@ -585,37 +639,36 @@ mod tests {
 
     #[test]
     fn bitrate_defaults_to_one_gbps() {
-        let iface_manager = Arc::new(tokio::sync::Mutex::new(crate::iface::InterfaceManager::new(
-            1,
-        )));
+        let iface_manager = Arc::new(tokio::sync::Mutex::new(
+            crate::iface::InterfaceManager::new(1),
+        ));
         let server = BackboneServer::new("127.0.0.1:0", iface_manager);
         assert_eq!(server.bitrate(), Some(BACKBONE_DEFAULT_BITRATE));
     }
 
     #[test]
     fn bitrate_can_be_configured() {
-        let iface_manager = Arc::new(tokio::sync::Mutex::new(crate::iface::InterfaceManager::new(
-            1,
-        )));
-        let server = BackboneServer::new("127.0.0.1:0", iface_manager)
-            .with_bitrate(100_000_000.0);
+        let iface_manager = Arc::new(tokio::sync::Mutex::new(
+            crate::iface::InterfaceManager::new(1),
+        ));
+        let server = BackboneServer::new("127.0.0.1:0", iface_manager).with_bitrate(100_000_000.0);
         assert_eq!(server.bitrate(), Some(100_000_000.0));
     }
 
     #[test]
     fn hw_mtu_defaults_to_one_mib() {
-        let iface_manager = Arc::new(tokio::sync::Mutex::new(crate::iface::InterfaceManager::new(
-            1,
-        )));
+        let iface_manager = Arc::new(tokio::sync::Mutex::new(
+            crate::iface::InterfaceManager::new(1),
+        ));
         let server = BackboneServer::new("127.0.0.1:0", iface_manager);
         assert_eq!(server.hw_mtu(), BACKBONE_DEFAULT_HW_MTU);
     }
 
     #[test]
     fn hw_mtu_can_be_configured() {
-        let iface_manager = Arc::new(tokio::sync::Mutex::new(crate::iface::InterfaceManager::new(
-            1,
-        )));
+        let iface_manager = Arc::new(tokio::sync::Mutex::new(
+            crate::iface::InterfaceManager::new(1),
+        ));
         let server = BackboneServer::new("127.0.0.1:0", iface_manager).with_hw_mtu(2048);
         assert_eq!(server.hw_mtu(), 2048);
     }

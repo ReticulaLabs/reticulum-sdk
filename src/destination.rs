@@ -2,7 +2,7 @@ pub mod link;
 pub mod link_map;
 pub mod resource;
 
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
+use ed25519_dalek::{SIGNATURE_LENGTH, Signature, SigningKey, VerifyingKey};
 use rand_core::{CryptoRngCore, OsRng};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -11,10 +11,10 @@ use core::{fmt, marker::PhantomData};
 use crate::{
     error::RnsError,
     hash::{AddressHash, Hash},
-    identity::{EmptyIdentity, HashIdentity, Identity, PrivateIdentity, PUBLIC_KEY_LENGTH},
+    identity::{EmptyIdentity, HashIdentity, Identity, PUBLIC_KEY_LENGTH, PrivateIdentity},
     packet::{
-        self, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
-        PacketDataBuffer, PacketType, PropagationType, ENCRYPTED_PACKET_MDU,
+        self, ContextFlag, DestinationType, ENCRYPTED_PACKET_MDU, Header, HeaderType, IfacFlag,
+        Packet, PacketContext, PacketDataBuffer, PacketType, PropagationType,
         RETICULUM_AES_BLOCK_SIZE, RETICULUM_EC_PUBLIC_KEY_SIZE, RETICULUM_TOKEN_OVERHEAD,
     },
 };
@@ -563,7 +563,9 @@ impl Destination<Identity, Output, Single> {
                     data,
                     Some(self.identity.as_address_hash_slice()),
                     packet_data.accuire_buf(
-                        data.len() + RETICULUM_EC_PUBLIC_KEY_SIZE + RETICULUM_TOKEN_OVERHEAD
+                        data.len()
+                            + RETICULUM_EC_PUBLIC_KEY_SIZE
+                            + RETICULUM_TOKEN_OVERHEAD
                             + RETICULUM_AES_BLOCK_SIZE,
                     ),
                 )?
@@ -573,7 +575,9 @@ impl Destination<Identity, Output, Single> {
                     data,
                     Some(self.identity.as_address_hash_slice()),
                     packet_data.accuire_buf(
-                        data.len() + RETICULUM_EC_PUBLIC_KEY_SIZE + RETICULUM_TOKEN_OVERHEAD
+                        data.len()
+                            + RETICULUM_EC_PUBLIC_KEY_SIZE
+                            + RETICULUM_TOKEN_OVERHEAD
                             + RETICULUM_AES_BLOCK_SIZE,
                     ),
                 )?
@@ -635,21 +639,21 @@ pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
+    use ed25519_dalek::{SIGNATURE_LENGTH, Signature};
     use rand_core::OsRng;
     use sha2::Digest;
     use x25519_dalek::{PublicKey, StaticSecret};
 
     use crate::buffer::OutputBuffer;
     use crate::hash::{AddressHash, Hash};
-    use crate::identity::{PrivateIdentity, PUBLIC_KEY_LENGTH};
+    use crate::identity::{PUBLIC_KEY_LENGTH, PrivateIdentity};
     use crate::packet::{
-        ContextFlag, PacketContext, PacketDataBuffer, PacketType, ENCRYPTED_PACKET_MDU,
+        ContextFlag, ENCRYPTED_PACKET_MDU, PacketContext, PacketDataBuffer, PacketType,
     };
     use crate::serde::Serialize;
     use crate::test_vectors;
 
-    use super::{DestinationAnnounce, DestinationName, SingleInputDestination, RAND_HASH_LENGTH};
+    use super::{DestinationAnnounce, DestinationName, RAND_HASH_LENGTH, SingleInputDestination};
 
     fn python_announce_rand_hash() -> [u8; RAND_HASH_LENGTH] {
         let timestamp = test_vectors::FIXED_ANNOUNCE_TIMESTAMP.to_be_bytes();

@@ -1,5 +1,6 @@
 use std::cmp;
 use std::fmt::Write as _;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
 use crate::iface::{
-    configured_bitrate, Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU,
-    MAX_AUTOCONFIGURED_HW_MTU,
+    DEFAULT_HW_MTU, Interface, InterfaceContext, MAX_AUTOCONFIGURED_HW_MTU, RxMessage,
+    configured_bitrate,
 };
 use crate::packet::{
     Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
@@ -21,6 +22,57 @@ use crate::serde::Serialize;
 use tokio::io::AsyncReadExt;
 
 use alloc::string::String;
+
+fn set_tcp_sockopts(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = stream.as_raw_fd();
+        let on: libc::c_int = 1;
+        let idle: libc::c_int = 5;
+        let intvl: libc::c_int = 2;
+        let cnt: libc::c_int = 12;
+        let uto: libc::c_int = 24_000;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                &idle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                &intvl as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
+                &cnt as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                &uto as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
 
 use super::hdlc::Hdlc;
 
@@ -134,6 +186,7 @@ impl TcpClient {
             let stop = CancellationToken::new();
 
             let stream = stream.unwrap();
+            set_tcp_sockopts(&stream);
             reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
             let (read_stream, write_stream) = stream.into_split();
 
@@ -256,6 +309,7 @@ impl TcpClient {
                                         }
                                         Err(e) => {
                                             log::warn!("tcp_client: connection error {}", e);
+                                            stop.cancel();
                                             break;
                                         }
                                     }

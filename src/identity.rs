@@ -2,7 +2,7 @@ use alloc::fmt::Write;
 use hkdf::Hkdf;
 use rand_core::CryptoRngCore;
 
-use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey, ed25519::signature::Signer};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret, StaticSecret};
 
@@ -103,10 +103,7 @@ impl Identity {
             .unwrap();
         }
 
-        Self::new_from_slices(
-            &public_key_bytes[..],
-            &verifying_key_bytes[..],
-        )
+        Self::new_from_slices(&public_key_bytes[..], &verifying_key_bytes[..])
     }
 
     pub fn to_hex_string(&self) -> String {

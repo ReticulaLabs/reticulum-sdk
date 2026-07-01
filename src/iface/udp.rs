@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
-use crate::iface::{configured_bitrate, Interface, InterfaceContext, RxMessage, DEFAULT_HW_MTU};
+use crate::iface::{DEFAULT_HW_MTU, Interface, InterfaceContext, RxMessage, configured_bitrate};
 use crate::packet::Packet;
 use crate::serde::Serialize;
 

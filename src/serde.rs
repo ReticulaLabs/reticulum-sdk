@@ -3,8 +3,8 @@ use crate::{
     error::RnsError,
     hash::AddressHash,
     packet::{
-        Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer, PacketIfac,
-        PACKET_IFAC_MAX_LENGTH,
+        Header, HeaderType, IfacFlag, PACKET_IFAC_MAX_LENGTH, Packet, PacketContext,
+        PacketDataBuffer, PacketIfac,
     },
 };
 
@@ -135,9 +135,9 @@ mod tests {
         error::RnsError,
         hash::AddressHash,
         packet::{
-            ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
-            PacketDataBuffer, PacketIfac, PacketType, PropagationType, PACKET_IFAC_MAX_LENGTH,
-            PACKET_MDU, RETICULUM_MTU,
+            ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PACKET_IFAC_MAX_LENGTH,
+            PACKET_MDU, Packet, PacketContext, PacketDataBuffer, PacketIfac, PacketType,
+            PropagationType, RETICULUM_MTU,
         },
         test_vectors,
     };
@@ -408,9 +408,8 @@ mod tests {
             .expect("serialized type2 with ifac");
 
         let mut input_buffer = InputBuffer::new(output_buffer.as_slice());
-        let decoded =
-            Packet::deserialize_with_ifac_len(&mut input_buffer, ifac_bytes.len())
-                .expect("deserialized type2 with ifac");
+        let decoded = Packet::deserialize_with_ifac_len(&mut input_buffer, ifac_bytes.len())
+            .expect("deserialized type2 with ifac");
 
         assert_eq!(decoded.header, packet.header);
         assert_eq!(decoded.destination, packet.destination);
@@ -477,7 +476,8 @@ mod tests {
         packet_bytes.push(0x00);
 
         let mut input_buffer = InputBuffer::new(&packet_bytes);
-        let result = Packet::deserialize_with_ifac_len(&mut input_buffer, PACKET_IFAC_MAX_LENGTH + 1);
+        let result =
+            Packet::deserialize_with_ifac_len(&mut input_buffer, PACKET_IFAC_MAX_LENGTH + 1);
         assert!(matches!(result, Err(RnsError::PacketError)));
     }
 
