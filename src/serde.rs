@@ -87,10 +87,10 @@ impl Packet {
         buffer: &mut InputBuffer,
         ifac_len: usize,
     ) -> Result<Packet, RnsError> {
-        let header = Header::deserialize(buffer)?;
+        let mut header = Header::deserialize(buffer)?;
 
-        let ifac = if header.ifac_flag == IfacFlag::Authenticated {
-            if ifac_len == 0 || ifac_len > PACKET_IFAC_MAX_LENGTH {
+        let ifac = if ifac_len > 0 {
+            if ifac_len > PACKET_IFAC_MAX_LENGTH {
                 return Err(RnsError::PacketError);
             }
             let mut ifac_data = [0u8; PACKET_IFAC_MAX_LENGTH];
@@ -98,6 +98,12 @@ impl Packet {
             Some(PacketIfac::new_from_slice(&ifac_data[..ifac_len]))
         } else {
             None
+        };
+
+        header.ifac_flag = if ifac.is_some() {
+            IfacFlag::Authenticated
+        } else {
+            IfacFlag::Open
         };
 
         let transport = if header.header_type == HeaderType::Type2 {
@@ -443,9 +449,8 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_rejects_ifac_flag_with_zero_len() {
-        let ifac_len = 8;
-        let ifac_bytes = vec![0x42u8; ifac_len];
+    fn deserialize_skips_ifac_when_ifac_len_is_zero() {
+        let ifac_bytes = vec![0x42u8; 8];
         let mut packet_bytes = Vec::new();
         let header = Header {
             ifac_flag: IfacFlag::Authenticated,
@@ -458,8 +463,10 @@ mod tests {
         packet_bytes.push(0x00);
 
         let mut input_buffer = InputBuffer::new(&packet_bytes);
-        let result = Packet::deserialize(&mut input_buffer);
-        assert!(matches!(result, Err(RnsError::PacketError)));
+        let packet = Packet::deserialize(&mut input_buffer)
+            .expect("deserialize with ifac_len=0 should succeed");
+        assert_eq!(packet.header.ifac_flag, IfacFlag::Open);
+        assert!(packet.ifac.is_none());
     }
 
     #[test]
@@ -482,22 +489,26 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_fallback_ignores_ifac_when_flag_not_set() {
+    fn deserialize_reads_ifac_bytes_when_ifac_len_provided() {
+        let ifac_data = [0xab, 0xcd, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05];
         let mut packet_bytes = Vec::new();
         let header = Header {
             ifac_flag: IfacFlag::Open,
             ..Default::default()
         };
         packet_bytes.extend_from_slice(&[header.to_meta(), 0]);
+        packet_bytes.extend_from_slice(&ifac_data);
         packet_bytes.extend_from_slice(AddressHash::new_empty().as_slice());
         packet_bytes.push(PacketContext::None as u8);
-        packet_bytes.extend_from_slice(b"no ifac expected");
+        packet_bytes.extend_from_slice(b"data");
 
         let mut input_buffer = InputBuffer::new(&packet_bytes);
-        let packet = Packet::deserialize_with_ifac_len(&mut input_buffer, 64)
-            .expect("should succeed when flag is not set even with non-zero ifac_len");
+        let packet = Packet::deserialize_with_ifac_len(&mut input_buffer, ifac_data.len())
+            .expect("should read IFAC bytes when ifac_len > 0");
 
-        assert!(packet.ifac.is_none());
-        assert_eq!(packet.data.as_slice(), b"no ifac expected");
+        assert!(packet.ifac.is_some());
+        assert_eq!(packet.header.ifac_flag, IfacFlag::Authenticated);
+        assert_eq!(packet.ifac.unwrap().as_slice(), &ifac_data);
+        assert_eq!(packet.data.as_slice(), b"data");
     }
 }

@@ -229,8 +229,7 @@ impl Default for Header {
 
 impl Header {
     pub fn to_meta(&self) -> u8 {
-        let meta = (self.ifac_flag as u8) << 7
-            | (self.header_type as u8) << 6
+        let meta = (self.header_type as u8) << 6
             | (self.context_flag as u8) << 5
             | (self.propagation_type as u8) << 4
             | (self.destination_type as u8) << 2
@@ -240,7 +239,7 @@ impl Header {
 
     pub fn from_meta(meta: u8) -> Self {
         Self {
-            ifac_flag: IfacFlag::from(meta >> 7),
+            ifac_flag: IfacFlag::Open,
             header_type: HeaderType::from(meta >> 6),
             context_flag: ContextFlag::from(meta >> 5),
             propagation_type: PropagationType::from(meta >> 4),
@@ -255,8 +254,7 @@ impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:b}{:b}{:b}{:b}{:0>2b}{:0>2b}.{}",
-            self.ifac_flag as u8,
+            "{:b}{:b}{:b}{:0>2b}{:0>2b}.{}",
             self.header_type as u8,
             self.context_flag as u8,
             self.propagation_type as u8,
