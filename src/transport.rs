@@ -105,6 +105,7 @@ const INTERVAL_KEEP_PACKET_CACHED: Duration = Duration::from_secs(180);
 const INTERVAL_PACKET_CACHE_CLEANUP: Duration = Duration::from_secs(90);
 const INTERVAL_LINK_TABLE_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_KEEP_REVERSE_PATH: Duration = Duration::from_secs(8 * 60);
+const INTERVAL_PATH_TABLE_CULL: Duration = Duration::from_secs(30);
 
 const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
 
@@ -257,9 +258,12 @@ struct SendCtx {
 impl SendCtx {
     async fn send_packet(&self, name: &str, packet: Packet) {
         let message = {
+            let destination = packet.destination;
             let pt = self.path_table.read().unwrap();
             let (packet, maybe_iface) = pt.handle_packet(packet);
             let tx_type = if let Some(iface) = maybe_iface {
+                drop(pt);
+                self.path_table.write().unwrap().refresh(&destination);
                 log::trace!(
                     "tp({name}): outbound packet dst={} ctx={:?} over iface={}",
                     packet.destination,
@@ -2495,12 +2499,19 @@ async fn send_to_next_hop<'a>(
     handler: &MutexGuard<'a, TransportHandler>,
     lookup: Option<AddressHash>,
 ) -> bool {
+    let dst = packet.destination;
     let (packet, maybe_iface) = {
         let pt = handler.send_ctx.path_table.read().unwrap();
         pt.handle_inbound_packet(packet, lookup)
     };
 
     if let Some(iface) = maybe_iface {
+        handler
+            .send_ctx
+            .path_table
+            .write()
+            .unwrap()
+            .refresh(&dst);
         handler
             .send(TxMessage {
                 tx_type: TxMessageType::Direct(iface),
@@ -3793,6 +3804,40 @@ async fn manage_transport(
                             .into_iter()
                             .collect();
                         drop(handler);
+
+                        send_ctx
+                            .path_table
+                            .write()
+                            .unwrap()
+                            .remove_stale(|iface| active_ifaces.contains(iface));
+                    },
+                }
+            }
+        });
+    }
+
+    {
+        let send_ctx = send_ctx.clone();
+        let cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    _ = time::sleep(INTERVAL_PATH_TABLE_CULL) => {
+                        let active_ifaces: HashSet<AddressHash> = send_ctx
+                            .iface_manager
+                            .lock()
+                            .await
+                            .active_interface_addresses()
+                            .into_iter()
+                            .collect();
 
                         send_ctx
                             .path_table
