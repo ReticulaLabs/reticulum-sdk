@@ -5005,6 +5005,7 @@ mod tests {
         handle_announce(&second_announce, handler.lock().await, iface).await;
 
         let mut guard = handler.lock().await;
+        guard.announce_table.reset_retransmit_timers();
         let retransmitted = guard.announce_table.to_retransmit(&transport_id);
         let destinations: Vec<_> = retransmitted
             .iter()

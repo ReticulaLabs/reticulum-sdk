@@ -1,5 +1,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use rand_core::OsRng;
+use rand_core::RngCore;
 use tokio::time::{Duration, Instant};
 
 use crate::hash::AddressHash;
@@ -8,6 +10,18 @@ use crate::packet::{
     DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketType,
     PropagationType,
 };
+
+/// Retry grace period (seconds). Matches Python `PATHFINDER_G`.
+const PATHFINDER_G: u64 = 5;
+/// Random window for announce rebroadcast (seconds). Matches Python `PATHFINDER_RW`.
+const PATHFINDER_RW_MILLIS: u64 = 500;
+/// Maximum local rebroadcasts before an announce entry is completed.
+/// Matches Python `LOCAL_REBROADCASTS_MAX`.
+const LOCAL_REBROADCASTS_MAX: u8 = 2;
+
+fn random_rw_jitter() -> Duration {
+    Duration::from_millis(OsRng.next_u64() % (PATHFINDER_RW_MILLIS + 1))
+}
 
 #[derive(Clone)]
 pub struct AnnounceEntry {
@@ -22,11 +36,29 @@ pub struct AnnounceEntry {
 
 impl AnnounceEntry {
     pub fn retransmit(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
-        if self.retries == 0 || Instant::now() >= self.timeout {
+        if self.retries >= LOCAL_REBROADCASTS_MAX {
             return None;
         }
 
-        self.retries = self.retries.saturating_sub(1);
+        if Instant::now() < self.timeout {
+            return None;
+        }
+
+        self.retries += 1;
+        self.timeout = Instant::now() + Duration::from_secs(PATHFINDER_G) + random_rw_jitter();
+
+        Some(self.always_retransmit(transport_id))
+    }
+
+    /// Retransmit immediately, bypassing the timeout check.
+    /// Used by `new_packet` when a new announce arrives for an already-tracked destination.
+    pub fn retransmit_now(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
+        if self.retries >= LOCAL_REBROADCASTS_MAX {
+            return None;
+        }
+
+        self.retries += 1;
+        self.timeout = Instant::now() + Duration::from_secs(PATHFINDER_G) + random_rw_jitter();
 
         Some(self.always_retransmit(transport_id))
     }
@@ -128,9 +160,9 @@ impl AnnounceTable {
         let entry = AnnounceEntry {
             packet: announce.clone(),
             timestamp: now,
-            timeout: now + Duration::from_secs(60),
+            timeout: now + random_rw_jitter(),
             received_from,
-            retries: 5, // TODO: make this configurable too?
+            retries: 0,
             hops,
             response_to_iface: None,
         };
@@ -145,9 +177,9 @@ impl AnnounceTable {
         to_iface: AddressHash,
         hops: u8,
     ) {
-        response.retries = 1;
+        response.retries = 0;
         response.hops = hops;
-        response.timeout = Instant::now() + Duration::from_secs(60);
+        response.timeout = Instant::now() + random_rw_jitter();
         response.response_to_iface = Some(to_iface);
 
         self.responses.insert(destination, response);
@@ -182,15 +214,25 @@ impl AnnounceTable {
         self.cache.clear();
     }
 
+    /// Reset all retransmit counters and timeouts so entries are
+    /// eligible for retransmission on the next `to_retransmit` call.
+    /// Intended for testing only.
+    #[cfg(test)]
+    pub fn reset_retransmit_timers(&mut self) {
+        for entry in self.map.values_mut() {
+            entry.retries = 0;
+            entry.timeout = Instant::now();
+        }
+    }
+
     pub fn new_packet(
         &mut self,
         dest_hash: &AddressHash,
         transport_id: &AddressHash,
     ) -> Option<TxMessage> {
-        // temporary hack
         self.map
             .get_mut(dest_hash)
-            .map_or(None, |e| e.retransmit(transport_id))
+            .map_or(None, |e| e.retransmit_now(transport_id))
     }
 
     pub fn to_retransmit(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {
