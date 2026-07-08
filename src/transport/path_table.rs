@@ -136,9 +136,7 @@ impl PathTable {
         transport_id: Option<AddressHash>,
         iface: AddressHash,
     ) {
-        let Some(hops) = announce.header.hops.checked_add(1) else {
-            return;
-        };
+        let hops = announce.header.hops;
 
         let random_blob = announce_random_blob(announce);
 
@@ -231,10 +229,6 @@ self_referential_transport={}",
             None => return (original_packet.clone(), None),
         };
 
-        let Some(hops) = original_packet.header.hops.checked_add(1) else {
-            return (original_packet.clone(), None);
-        };
-
         let (header_type, propagation_type, transport) = if entry.hops > 1 {
             (
                 HeaderType::Type2,
@@ -251,7 +245,7 @@ self_referential_transport={}",
                     ifac_flag: IfacFlag::Open,
                     header_type,
                     propagation_type,
-                    hops,
+                    hops: original_packet.header.hops,
                     ..original_packet.header
                 },
                 ifac: None,
@@ -494,7 +488,7 @@ mod tests {
             forwarded.header.propagation_type,
             PropagationType::Broadcast
         );
-        assert_eq!(forwarded.header.hops, 1);
+        assert_eq!(forwarded.header.hops, 0);
         assert_eq!(forwarded.transport, None);
     }
 
@@ -510,7 +504,7 @@ mod tests {
                 header_type: HeaderType::Type2,
                 packet_type: PacketType::Announce,
                 destination_type: DestinationType::Single,
-                hops: 1,
+                hops: 2,
                 ..Default::default()
             },
             destination,
@@ -543,12 +537,12 @@ mod tests {
             forwarded.header.propagation_type,
             PropagationType::Transport
         );
-        assert_eq!(forwarded.header.hops, 1);
+        assert_eq!(forwarded.header.hops, 0);
         assert_eq!(forwarded.transport, Some(transport));
     }
 
     #[test]
-    fn forwarding_max_hop_packet_does_not_overflow() {
+    fn forwarding_max_hop_packet_preserves_hop_count() {
         let destination = AddressHash::new_from_slice(b"direct-destination");
         let iface = AddressHash::new_from_slice(b"direct-iface");
         let mut table = PathTable::new(false);
@@ -582,9 +576,10 @@ mod tests {
             data: Default::default(),
         };
 
-        let (_, forwarded_iface) = table.handle_inbound_packet(&original, None);
+        let (forwarded, forwarded_iface) = table.handle_inbound_packet(&original, None);
 
-        assert_eq!(forwarded_iface, None);
+        assert_eq!(forwarded_iface, Some(iface));
+        assert_eq!(forwarded.header.hops, u8::MAX);
     }
 
     #[test]
@@ -718,7 +713,7 @@ mod tests {
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
         assert_eq!(iface, first_iface);
-        assert_eq!(hops, 3);
+        assert_eq!(hops, 2);
     }
 
     #[test]
@@ -741,7 +736,7 @@ mod tests {
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
         assert_eq!(iface, first_iface);
-        assert_eq!(hops, 3);
+        assert_eq!(hops, 2);
     }
 
     #[test]
@@ -764,7 +759,7 @@ mod tests {
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
         assert_eq!(iface, second_iface);
-        assert_eq!(hops, 2);
+        assert_eq!(hops, 1);
     }
 
     #[test]
@@ -826,7 +821,7 @@ mod tests {
                 header_type: HeaderType::Type2,
                 packet_type: PacketType::Announce,
                 destination_type: DestinationType::Single,
-                hops: 1,
+                hops: 2,
                 ..Default::default()
             },
             destination,

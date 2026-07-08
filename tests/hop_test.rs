@@ -395,7 +395,7 @@ async fn probe_destination_returns_multihop_packet_proof() {
     tokio::select! {
         proof_packet = recv_expected_proof(&mut iface_rx, expected_destination) => {
             assert_eq!(proof_packet.destination, expected_destination);
-            assert!(proof_packet.header.hops >= 1);
+            assert_eq!(proof_packet.header.hops, 1);
             assert_valid_packet_proof(&proof_packet, expected_hash.as_slice(), probe_identity);
         },
         _ = time::sleep(Duration::from_secs(10)) => {

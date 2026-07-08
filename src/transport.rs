@@ -2860,7 +2860,7 @@ is_path_response={}",
                     propagation_type: PropagationType::Transport,
                     destination_type: DestinationType::Single,
                     packet_type: PacketType::Announce,
-                    hops: packet.header.hops.saturating_add(1),
+                    hops: packet.header.hops,
                 },
                 ifac: None,
                 destination: packet.destination,
@@ -2936,7 +2936,7 @@ is_path_response={}",
         if is_discovery_destination(&dest_desc) {
             if let Ok(discovered) = DiscoveredInterface::from_announce(
                 dest_desc,
-                packet.header.hops.saturating_add(1),
+                packet.header.hops,
                 app_data,
             ) {
                 let _ = handler.discovery_tx.send(discovered);
@@ -3049,7 +3049,7 @@ fn should_rebroadcast_inbound_packet(packet: &Packet) -> bool {
         && packet.header.propagation_type == PropagationType::Broadcast
         && packet.header.packet_type == PacketType::Data
         && packet.header.destination_type == DestinationType::Plain
-        && packet.header.hops == 0
+        && packet.header.hops == 1
 }
 
 async fn handle_link_request_as_destination<'a>(
@@ -3525,7 +3525,7 @@ fn create_retransmit_packet(packet: &Packet) -> Packet {
             propagation_type: packet.header.propagation_type,
             destination_type: packet.header.destination_type,
             packet_type: packet.header.packet_type,
-            hops: packet.header.hops.saturating_add(1),
+            hops: packet.header.hops,
         },
         ifac: packet.ifac,
         destination: packet.destination,
@@ -3584,7 +3584,8 @@ async fn manage_transport(
 
                 let _ = iface_messages_tx.send(message.clone());
 
-                let packet = message.packet;
+                let mut packet = message.packet;
+                packet.header.hops = packet.header.hops.saturating_add(1);
 
                 if PACKET_TRACE {
                     log::debug!(
@@ -4260,7 +4261,7 @@ mod tests {
         packet.header.propagation_type = PropagationType::Broadcast;
         packet.header.destination_type = DestinationType::Plain;
         packet.header.packet_type = PacketType::Data;
-        packet.header.hops = 0;
+        packet.header.hops = 1;
         packet
     }
 
@@ -4270,7 +4271,7 @@ mod tests {
         assert!(should_rebroadcast_inbound_packet(&packet));
 
         let mut already_forwarded = packet.clone();
-        already_forwarded.header.hops = 1;
+        already_forwarded.header.hops = 2;
         assert!(!should_rebroadcast_inbound_packet(&already_forwarded));
 
         let mut transported = packet.clone();
@@ -4844,7 +4845,7 @@ mod tests {
 
         announce.header.header_type = HeaderType::Type2;
         announce.header.propagation_type = PropagationType::Transport;
-        announce.header.hops = 1;
+        announce.header.hops = 2;
         announce.transport = Some(next_hop);
 
         handle_announce(&announce, handler.lock().await, iface).await;

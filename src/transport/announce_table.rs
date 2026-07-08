@@ -123,7 +123,7 @@ impl AnnounceTable {
 
     pub fn add(&mut self, announce: &Packet, destination: AddressHash, received_from: AddressHash) {
         let now = Instant::now();
-        let hops = announce.header.hops.saturating_add(1);
+        let hops = announce.header.hops;
 
         let entry = AnnounceEntry {
             packet: announce.clone(),

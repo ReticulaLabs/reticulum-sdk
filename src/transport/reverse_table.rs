@@ -14,7 +14,7 @@ pub struct ReverseEntry {
 fn send_backwards(packet: &Packet, entry: &ReverseEntry) -> (Packet, AddressHash) {
     let propagated = Packet {
         header: Header {
-            hops: packet.header.hops.saturating_add(1),
+            hops: packet.header.hops,
             ..packet.header
         },
         ifac: None,
@@ -115,6 +115,6 @@ mod tests {
         assert_eq!(iface, previous_hop_iface);
         assert_eq!(propagated.destination, proof.destination);
         assert_eq!(propagated.transport, None);
-        assert_eq!(propagated.header.hops, proof.header.hops + 1);
+        assert_eq!(propagated.header.hops, proof.header.hops);
     }
 }

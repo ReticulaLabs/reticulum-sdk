@@ -19,7 +19,7 @@ pub struct LinkEntry {
 fn propagate(packet: &Packet, iface: AddressHash) -> (Packet, AddressHash) {
     let propagated = Packet {
         header: Header {
-            hops: packet.header.hops.saturating_add(1),
+            hops: packet.header.hops,
             ..packet.header
         },
         ifac: None,
@@ -296,7 +296,7 @@ mod tests {
             .handle_packet(&forward, request_iface)
             .expect("request side packet forwards");
         assert_eq!(iface, destination_iface);
-        assert_eq!(forwarded.header.hops, 1);
+        assert_eq!(forwarded.header.hops, 0);
         assert_eq!(forwarded.transport, None);
 
         let backward = link_data(link_id, 0);
@@ -304,7 +304,7 @@ mod tests {
             .handle_packet(&backward, destination_iface)
             .expect("destination side packet forwards");
         assert_eq!(iface, request_iface);
-        assert_eq!(forwarded.header.hops, 1);
+        assert_eq!(forwarded.header.hops, 0);
         assert_eq!(forwarded.transport, None);
     }
 }
