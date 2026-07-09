@@ -2459,7 +2459,7 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         let mut link = link.lock().await;
         match link.handle_packet(packet, true) {
             LinkHandleResult::Activated => {
-                log::info!(
+                log::debug!(
                     "tp({}): out-link {} activated by proof, sending RTT",
                     handler.config.name,
                     link.id(),
@@ -3264,7 +3264,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         match link.status() {
             LinkStatus::Active => {
                 if link.elapsed() > INTERVAL_INPUT_LINK_STALE {
-                    log::info!(
+                    log::debug!(
                         "tp({}): in-link {} stale after {}s",
                         handler.config.name,
                         link.id(),
@@ -3275,7 +3275,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
             }
             LinkStatus::Stale => {
                 if link.elapsed() > INTERVAL_INPUT_LINK_STALE + INTERVAL_INPUT_LINK_CLOSE {
-                    log::info!(
+                    log::debug!(
                         "tp({}): teardown stale in-link {} after {}s",
                         handler.config.name,
                         link.id(),
@@ -3311,7 +3311,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         match link.status() {
             LinkStatus::Active => {
                 if link.elapsed() > INTERVAL_OUTPUT_LINK_STALE {
-                    log::info!(
+                    log::debug!(
                         "tp({}): out-link {} stale after {}s",
                         handler.config.name,
                         link.id(),
@@ -3323,7 +3323,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
             LinkStatus::Stale => {
                 if handler.config.restart_outlinks {
                     if link.elapsed() > INTERVAL_OUTPUT_LINK_RESTART {
-                        log::info!(
+                        log::debug!(
                             "tp({}): restart out-link {} after {}s",
                             handler.config.name,
                             link.id(),
@@ -3333,7 +3333,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     }
                 } else {
                     if link.elapsed() > INTERVAL_OUTPUT_LINK_STALE + INTERVAL_OUTPUT_LINK_CLOSE {
-                        log::info!(
+                        log::debug!(
                             "tp({}): teardown out-link {} after {}s",
                             handler.config.name,
                             link.id(),
@@ -3786,7 +3786,7 @@ async fn manage_transport(
                         // (rate-limited internally to 60-second intervals).
                         if let Some(removed) = handler.blackhole_table.check_expired() {
                             if removed > 0 {
-                                log::info!(
+                                log::debug!(
                                     "tp({}): removed {} expired blackhole entr{}",
                                     handler.config.name,
                                     removed,
@@ -3912,7 +3912,7 @@ async fn blackhole_updater_job(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                log::info!("tp({name}): blackhole updater cancelled");
+                log::debug!("tp({name}): blackhole updater cancelled");
                 break;
             }
             _ = tokio::time::sleep(Duration::from_secs(60)) => {}

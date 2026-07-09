@@ -120,7 +120,7 @@ impl PathTable {
     pub fn mark_unresponsive(&mut self, destination: &AddressHash) {
         if let Some(entry) = self.map.get_mut(destination) {
             entry.state = PathState::Unresponsive;
-            log::info!("path_table mark {} unresponsive", destination,);
+            log::debug!("path_table mark {} unresponsive", destination);
         }
     }
 
@@ -195,7 +195,7 @@ self_referential_transport={}",
 
         self.map.insert(announce.destination, new_entry);
 
-        log::info!(
+        log::debug!(
             "{} is now reachable over {} hops through {}",
             announce.destination,
             hops,

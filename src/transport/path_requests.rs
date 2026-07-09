@@ -52,7 +52,7 @@ pub struct DiscoveryPathRequest {
 impl PathRequest {
     fn decode(data: &[u8], transport_name: &str) -> Option<Self> {
         if data.len() <= ADDRESS_HASH_SIZE {
-            log::info!(
+            log::debug!(
                 "tp({}): ignoring malformed path request: no {}",
                 transport_name,
                 if data.len() < ADDRESS_HASH_SIZE {
@@ -122,7 +122,7 @@ impl PathRequests {
 
             let tag = (request.destination, request.tag_bytes.clone());
             if self.cache.contains_key(&tag) {
-                log::info!(
+                log::debug!(
                     "tp({}): ignoring duplicate path request for destination {}",
                     self.name,
                     request.destination
@@ -202,7 +202,7 @@ impl PathRequests {
 
         if let Some(timeout) = self.discovery.get(destination) {
             if timeout.timeout > now {
-                log::info!(
+                log::debug!(
                     "tp({}): rejecting discovery path request for destination {} as a request is already pending",
                     self.name,
                     destination

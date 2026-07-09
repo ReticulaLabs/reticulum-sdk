@@ -212,7 +212,7 @@ impl LinkTable {
         for (link_id, entry) in &self.0 {
             if entry.validated {
                 if entry.timestamp + max_age <= now {
-                    log::info!(
+                    log::debug!(
                         "link_table: remove stale validated entry for link {} (idle for {}s)",
                         link_id,
                         now.duration_since(entry.timestamp).as_secs(),
