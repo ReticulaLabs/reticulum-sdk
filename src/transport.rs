@@ -188,6 +188,7 @@ pub struct TransportConfig {
 #[derive(Clone)]
 pub struct AnnounceEvent {
     pub destination: Arc<Mutex<SingleOutputDestination>>,
+    pub hops: u8,
     pub app_data: PacketDataBuffer,
 }
 
@@ -2941,6 +2942,7 @@ is_path_response={}",
 
         let _ = handler.announce_tx.send(AnnounceEvent {
             destination,
+            hops: packet.header.hops,
             app_data: PacketDataBuffer::new_from_slice(&app_data),
         });
 
