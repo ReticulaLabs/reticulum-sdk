@@ -359,6 +359,11 @@ struct TransportHandler {
     /// Number of packets that failed decryption.
     decryption_failures: u64,
 
+    /// Last received packet SNR/RSSI, updated per-packet from any interface.
+    /// Used by the shared-instance RPC to expose radio metrics to peers.
+    last_snr: Option<f32>,
+    last_rssi: Option<i16>,
+
     /// Blackholed identity table (protocol-compatible with Python
     /// Reticulum `RNS.Transport.blackholed_identities`).
     blackhole_table: BlackholeTable,
@@ -666,6 +671,8 @@ impl Transport {
             received_data_tx: received_data_tx.clone(),
             receipt_tx: receipt_tx.clone(),
             pending_proofs: HashMap::new(),
+            last_snr: None,
+            last_rssi: None,
             fixed_dest_path_requests: path_request_dest,
             cancel: cancel.clone(),
             packets_received_by_type: PacketTypeCounters::default(),
@@ -1705,7 +1712,15 @@ fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut Transport
             "interface_stats" => shared_rpc_interface_stats(),
             "next_hop_if_name" => shared_rpc_next_hop_if_name(map, handler.as_deref()),
             "next_hop" => shared_rpc_next_hop(map, handler.as_deref()),
-            "packet_rssi" | "packet_snr" | "packet_q" => Value::Boolean(false),
+            "packet_snr" => handler
+                .and_then(|h| h.last_snr)
+                .map(Value::from)
+                .unwrap_or(Value::Nil),
+            "packet_rssi" => handler
+                .and_then(|h| h.last_rssi)
+                .map(|v| Value::from(v as i64))
+                .unwrap_or(Value::Nil),
+            "packet_q" => Value::Nil,
             "first_hop_timeout" => Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
             "link_count" => Value::from(0),
             "blackholed_identities" => shared_rpc_blackholed_identities(handler.as_deref_mut()),
@@ -3739,6 +3754,8 @@ async fn manage_transport(
 
                 let snr = message.snr;
                 let rssi = message.rssi;
+                handler.last_snr = snr;
+                handler.last_rssi = rssi;
                 match packet.header.packet_type {
                     PacketType::Announce => {
                         handler.packets_received_by_type.announce += 1;
@@ -4635,9 +4652,9 @@ mod tests {
                 Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
             ),
             ("link_count", Value::from(0)),
-            ("packet_rssi", Value::Boolean(false)),
-            ("packet_snr", Value::Boolean(false)),
-            ("packet_q", Value::Boolean(false)),
+            ("packet_rssi", Value::Nil),
+            ("packet_snr", Value::Nil),
+            ("packet_q", Value::Nil),
             ("blackholed_identities", Value::Map(vec![])),
             ("is_blackholed", Value::Boolean(false)),
         ];
