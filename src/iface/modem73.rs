@@ -506,7 +506,7 @@ async fn read_loop(
                                         if PACKET_TRACE {
                                             log::trace!("modem73_interface: rx << ({}) {}", iface_address, packet);
                                         }
-                                        let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                        let _ = rx_channel.send(RxMessage { address: iface_address, snr: None, rssi: None, packet }).await;
                                     }
                                     Err(_) => log::warn!("modem73_interface: couldn't decode packet"),
                                 }

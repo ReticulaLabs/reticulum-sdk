@@ -60,9 +60,11 @@ pub struct TxMessage {
     pub packet: Packet,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, Clone)]
 pub struct RxMessage {
     pub address: AddressHash, // Address of source interface
+    pub snr: Option<f32>,     // Signal-to-noise ratio (RNode only)
+    pub rssi: Option<i16>,    // Received signal strength (RNode only)
     pub packet: Packet,       // Received packet
 }
 
@@ -821,6 +823,8 @@ mod tests {
         rx_channel
             .send(RxMessage {
                 address: iface,
+                snr: None,
+                rssi: None,
                 packet: Packet::default(),
             })
             .await

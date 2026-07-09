@@ -312,7 +312,7 @@ async fn read_loop<R>(
                                         if PACKET_TRACE {
                                             log::trace!("kiss_interface: rx << ({}) {}", iface_address, packet);
                                         }
-                                        let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                        let _ = rx_channel.send(RxMessage { address: iface_address, snr: None, rssi: None, packet }).await;
                                     } else {
                                         log::warn!("kiss_interface: couldn't decode packet");
                                     }

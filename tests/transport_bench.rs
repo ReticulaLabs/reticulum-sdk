@@ -60,6 +60,8 @@ async fn bench_send_packet_routed() {
         .rx_channel
         .send(RxMessage {
             address: iface_addr,
+            snr: None,
+            rssi: None,
             packet: announce,
         })
         .await
@@ -177,6 +179,8 @@ async fn bench_inbound_data_decryption() {
             .rx_channel
             .send(RxMessage {
                 address: iface_addr,
+                snr: None,
+                rssi: None,
                 packet: packets[idx].clone(),
             })
             .await

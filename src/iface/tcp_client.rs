@@ -254,7 +254,7 @@ impl TcpClient {
                                                                 if PACKET_TRACE {
                                                                     log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
                                                                 }
-                                                                let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                                                let _ = rx_channel.send(RxMessage { address: iface_address, snr: None, rssi: None, packet }).await;
                                                             }
                                                             Err(err) => {
                                                                 log::warn!(

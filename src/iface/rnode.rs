@@ -798,9 +798,15 @@ async fn handle_frame(
                     if PACKET_TRACE {
                         log::trace!("rnode_interface: rx << ({}) {}", iface_address, packet);
                     }
+                    let rstate = state.lock().await;
+                    let snr = rstate.r_stat_snr;
+                    let rssi = rstate.r_stat_rssi;
+                    drop(rstate);
                     let _ = rx_channel
                         .send(RxMessage {
                             address: iface_address,
+                            snr,
+                            rssi,
                             packet,
                         })
                         .await;

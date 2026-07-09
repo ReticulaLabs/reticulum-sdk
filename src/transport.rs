@@ -90,6 +90,7 @@ const PACKET_TRACE: bool = false;
 pub const PATHFINDER_M: usize = 128; // Max hops
 
 const INTERVAL_LINKS_CHECK: Duration = Duration::from_secs(1);
+const INTERVAL_PENDING_PROOF_TIMEOUT: Duration = Duration::from_secs(60);
 const INTERVAL_INPUT_LINK_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_INPUT_LINK_CLOSE: Duration = Duration::from_secs(5);
 const INTERVAL_OUTPUT_LINK_RESTART: Duration = Duration::from_secs(60);
@@ -189,7 +190,29 @@ pub struct TransportConfig {
 pub struct AnnounceEvent {
     pub destination: Arc<Mutex<SingleOutputDestination>>,
     pub hops: u8,
+    pub snr: Option<f32>,
+    pub rssi: Option<i16>,
     pub app_data: PacketDataBuffer,
+}
+
+/// Proof-of-delivery receipt with per-packet radio metadata.
+/// Created when a proof packet arrives for a tracked pending proof.
+#[derive(Clone)]
+pub struct PacketReceipt {
+    /// Hash of the original data packet that was proven.
+    pub packet_hash: Hash,
+    /// Destination address the original packet was sent to.
+    pub destination: AddressHash,
+    /// Signal-to-noise ratio of the received proof packet (RNode only).
+    pub snr: Option<f32>,
+    /// Received signal strength of the received proof packet (RNode only).
+    pub rssi: Option<i16>,
+}
+
+struct PendingProof {
+    original_packet_hash: Hash,
+    destination_address: AddressHash,
+    created_at: time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,6 +342,9 @@ struct TransportHandler {
 
     link_in_event_tx: broadcast::Sender<LinkEventData>,
     received_data_tx: broadcast::Sender<ReceivedData>,
+    receipt_tx: broadcast::Sender<PacketReceipt>,
+
+    pending_proofs: HashMap<AddressHash, PendingProof>,
 
     fixed_dest_path_requests: AddressHash,
 
@@ -344,6 +370,7 @@ pub struct Transport {
     link_in_event_tx: broadcast::Sender<LinkEventData>,
     link_out_event_tx: broadcast::Sender<LinkEventData>,
     received_data_tx: broadcast::Sender<ReceivedData>,
+    receipt_tx: broadcast::Sender<PacketReceipt>,
     iface_messages_tx: broadcast::Sender<RxMessage>,
     handler: Arc<Mutex<TransportHandler>>,
     iface_manager: Arc<Mutex<InterfaceManager>>,
@@ -553,6 +580,7 @@ impl Transport {
         let (link_in_event_tx, _) = tokio::sync::broadcast::channel(16);
         let (link_out_event_tx, _) = tokio::sync::broadcast::channel(16);
         let (received_data_tx, _) = tokio::sync::broadcast::channel(16);
+        let (receipt_tx, _) = tokio::sync::broadcast::channel(16);
         let (iface_messages_tx, _) = tokio::sync::broadcast::channel(16);
 
         let iface_manager = InterfaceManager::new(16);
@@ -636,6 +664,8 @@ impl Transport {
             discovery_tx: discovery_tx.clone(),
             link_in_event_tx: link_in_event_tx.clone(),
             received_data_tx: received_data_tx.clone(),
+            receipt_tx: receipt_tx.clone(),
+            pending_proofs: HashMap::new(),
             fixed_dest_path_requests: path_request_dest,
             cancel: cancel.clone(),
             packets_received_by_type: PacketTypeCounters::default(),
@@ -689,6 +719,7 @@ impl Transport {
             link_in_event_tx,
             link_out_event_tx,
             received_data_tx,
+            receipt_tx,
             iface_messages_tx,
             handler,
             send_ctx,
@@ -822,12 +853,35 @@ impl Transport {
         self.handler.lock().await.announce_tx.subscribe()
     }
 
+    pub fn recv_receipts(&self) -> broadcast::Receiver<PacketReceipt> {
+        self.receipt_tx.subscribe()
+    }
+
     pub fn recv_discovery(&self) -> broadcast::Receiver<DiscoveredInterface> {
         self.discovery_tx.subscribe()
     }
 
     pub async fn send_packet(&self, packet: Packet) {
         self.send_ctx.send_packet(&self.name, packet).await;
+    }
+
+    /// Track a pending proof for a sent data packet.
+    /// When the corresponding proof packet arrives, a `PacketReceipt`
+    /// (with RSSI/SNR if available) will be sent on the receipt channel.
+    ///
+    /// For link data packets sent via `send_to_out_links`, this is called
+    /// automatically. For direct data packets, call this manually after sending.
+    pub async fn track_pending_proof(&self, packet_hash: Hash, destination: AddressHash) {
+        let proof_dest = AddressHash::new_from_hash(&packet_hash);
+        let mut handler = self.handler.lock().await;
+        handler.pending_proofs.insert(
+            proof_dest,
+            PendingProof {
+                original_packet_hash: packet_hash,
+                destination_address: destination,
+                created_at: time::Instant::now(),
+            },
+        );
     }
 
     pub async fn send_announce(
@@ -896,8 +950,19 @@ impl Transport {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
                     let packet_hash = packet.hash();
+                    let link_id = link.id().clone();
                     drop(link);
                     self.send_ctx.send_packet(&self.name, packet).await;
+                    // Track as pending proof (proof destination = link id)
+                    let mut handler = self.handler.lock().await;
+                    handler.pending_proofs.insert(
+                        link_id,
+                        PendingProof {
+                            original_packet_hash: packet_hash,
+                            destination_address: *destination,
+                            created_at: time::Instant::now(),
+                        },
+                    );
                     sent_packets.push(packet_hash);
                 }
             }
@@ -2449,7 +2514,12 @@ impl TransportHandler {
     }
 }
 
-async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_proof<'a>(
+    packet: &Packet,
+    mut handler: MutexGuard<'a, TransportHandler>,
+    snr: Option<f32>,
+    rssi: Option<i16>,
+) {
     log::trace!(
         "tp({}): handle proof for {}",
         handler.config.name,
@@ -2470,6 +2540,17 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
             }
             _ => {}
         }
+    }
+
+    // Check pending proofs for both link and direct packet proofs
+    if let Some(pending) = handler.pending_proofs.remove(&packet.destination) {
+        let receipt = PacketReceipt {
+            packet_hash: pending.original_packet_hash,
+            destination: pending.destination_address,
+            snr,
+            rssi,
+        };
+        let _ = handler.receipt_tx.send(receipt);
     }
 
     let maybe_packet = handler.link_table.handle_proof(packet);
@@ -2764,6 +2845,8 @@ async fn handle_announce<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
     iface: AddressHash,
+    snr: Option<f32>,
+    rssi: Option<i16>,
 ) {
     if handler.has_destination(&packet.destination) {
         // destination is local
@@ -2943,6 +3026,8 @@ is_path_response={}",
         let _ = handler.announce_tx.send(AnnounceEvent {
             destination,
             hops: packet.header.hops,
+            snr,
+            rssi,
             app_data: PacketDataBuffer::new_from_slice(&app_data),
         });
 
@@ -3652,10 +3737,12 @@ async fn manage_transport(
                         .await;
                 }
 
+                let snr = message.snr;
+                let rssi = message.rssi;
                 match packet.header.packet_type {
                     PacketType::Announce => {
                         handler.packets_received_by_type.announce += 1;
-                        handle_announce(&packet, handler, message.address).await
+                        handle_announce(&packet, handler, message.address, snr, rssi).await
                     }
                     PacketType::LinkRequest => {
                         handler.packets_received_by_type.link_request += 1;
@@ -3663,7 +3750,7 @@ async fn manage_transport(
                     }
                     PacketType::Proof => {
                         handler.packets_received_by_type.proof += 1;
-                        handle_proof(&packet, handler).await
+                        handle_proof(&packet, handler, snr, rssi).await
                     }
                     PacketType::Data => {
                         handler.packets_received_by_type.data += 1;
@@ -3690,6 +3777,10 @@ async fn manage_transport(
                     },
                     _ = time::sleep(INTERVAL_LINKS_CHECK) => {
                         handle_check_links(handler.lock().await).await;
+                        // Expire stale pending proofs
+                        let cutoff = time::Instant::now() - INTERVAL_PENDING_PROOF_TIMEOUT;
+                        let mut h = handler.lock().await;
+                        h.pending_proofs.retain(|_, v| v.created_at > cutoff);
                     }
                 }
             }
@@ -4633,7 +4724,7 @@ mod tests {
         announce.header.hops = 1;
         announce.transport = Some(next_hop);
 
-        handle_announce(&announce, handler.lock().await, iface).await;
+        handle_announce(&announce, handler.lock().await, iface, None, None).await;
 
         let request = Value::Map(vec![
             (Value::from("get"), Value::from("next_hop")),
@@ -4726,7 +4817,7 @@ mod tests {
                 .await
         );
 
-        handle_announce(&announce, handler.lock().await, next_hop_iface).await;
+        handle_announce(&announce, handler.lock().await, next_hop_iface, None, None).await;
 
         let mut data_packet: Packet = Default::default();
         data_packet.data = PacketDataBuffer::new_from_slice(b"foo");
@@ -4895,7 +4986,7 @@ mod tests {
         announce.header.hops = 2;
         announce.transport = Some(next_hop);
 
-        handle_announce(&announce, handler.lock().await, iface).await;
+        handle_announce(&announce, handler.lock().await, iface, None, None).await;
 
         let mut packet: Packet = Default::default();
         packet.header.destination_type = DestinationType::Single;
@@ -4940,7 +5031,7 @@ mod tests {
                 .force_block(path_response.destination, Duration::from_secs(60));
         }
 
-        handle_announce(&path_response, handler.lock().await, iface).await;
+        handle_announce(&path_response, handler.lock().await, iface, None, None).await;
 
         assert!(
             handler
@@ -4986,7 +5077,7 @@ mod tests {
         assert_eq!(m.active_interfaces, 0);
 
         // Process an announce
-        handle_announce(&announce, handler.lock().await, iface).await;
+        handle_announce(&announce, handler.lock().await, iface, None, None).await;
 
         let m = transport.metrics().await;
         assert_eq!(m.path_table_entries, 1);
@@ -5017,7 +5108,7 @@ mod tests {
                 .force_block(announce.destination, Duration::from_secs(60));
         }
 
-        handle_announce(&announce, handler.lock().await, iface).await;
+        handle_announce(&announce, handler.lock().await, iface, None, None).await;
 
         let m = transport.metrics().await;
         assert_eq!(m.announces_rate_limited, 1);
@@ -5048,8 +5139,8 @@ mod tests {
         let handler = transport.get_handler();
         let iface = AddressHash::new_from_rand(OsRng);
 
-        handle_announce(&first_announce, handler.lock().await, iface).await;
-        handle_announce(&second_announce, handler.lock().await, iface).await;
+        handle_announce(&first_announce, handler.lock().await, iface, None, None).await;
+        handle_announce(&second_announce, handler.lock().await, iface, None, None).await;
 
         let mut guard = handler.lock().await;
         guard.announce_table.reset_retransmit_timers();
@@ -5098,6 +5189,8 @@ mod tests {
         in_rx
             .send(RxMessage {
                 address: in_address,
+                snr: None,
+                rssi: None,
                 packet: first_announce,
             })
             .await
@@ -5105,6 +5198,8 @@ mod tests {
         in_rx
             .send(RxMessage {
                 address: in_address,
+                snr: None,
+                rssi: None,
                 packet: second_announce,
             })
             .await
