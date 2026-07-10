@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task;
@@ -271,7 +271,8 @@ struct AnnouncePacer {
 
 struct AnnouncePacerState {
     announce_allowed_at: Instant,
-    announce_queue: VecDeque<TxMessage>,
+    announce_queue: VecDeque<AddressHash>,
+    announce_data: HashMap<AddressHash, TxMessage>,
     timer_active: bool,
 }
 
@@ -283,6 +284,7 @@ impl AnnouncePacer {
             state: Arc::new(tokio::sync::Mutex::new(AnnouncePacerState {
                 announce_allowed_at: Instant::now(),
                 announce_queue: VecDeque::new(),
+                announce_data: HashMap::new(),
                 timer_active: false,
             })),
         }
@@ -311,7 +313,7 @@ impl AnnouncePacer {
     }
 
     async fn queue_len(&self) -> usize {
-        self.state.lock().await.announce_queue.len()
+        self.state.lock().await.announce_data.len()
     }
 
     async fn send(
@@ -336,14 +338,12 @@ impl AnnouncePacer {
             return;
         }
 
-        if let Some(existing) = state
-            .announce_queue
-            .iter_mut()
-            .find(|entry| entry.packet.destination == message.packet.destination)
-        {
-            *existing = message;
+        let dest = message.packet.destination;
+        if state.announce_data.contains_key(&dest) {
+            state.announce_data.insert(dest, message);
         } else if state.announce_queue.len() < MAX_QUEUED_ANNOUNCES {
-            state.announce_queue.push_back(message);
+            state.announce_queue.push_back(dest);
+            state.announce_data.insert(dest, message);
         }
 
         if !state.timer_active {
@@ -382,11 +382,16 @@ async fn process_announce_queue(
             }
 
             match state.announce_queue.pop_front() {
-                Some(message) => {
-                    if let Some(wait_time) = pacer.wait_time(&message.packet) {
-                        state.announce_allowed_at = now + wait_time;
+                Some(dest) => {
+                    if let Some(message) = state.announce_data.remove(&dest) {
+                        if let Some(wait_time) = pacer.wait_time(&message.packet) {
+                            state.announce_allowed_at = now + wait_time;
+                        }
+                        Some(message)
+                    } else {
+                        state.timer_active = false;
+                        None
                     }
-                    Some(message)
                 }
                 None => {
                     state.timer_active = false;
