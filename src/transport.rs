@@ -112,6 +112,17 @@ const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
 
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
+
+/// Capacity for internal tokio broadcast channels used to deliver transport
+/// events (announces, link events, received data, receipts, etc.) to the
+/// application layer.
+///
+/// Each broadcast channel pre-allocates a fixed ring buffer of this size.
+/// Memory usage per channel = capacity × size of the message slot. The
+/// largest consumer is `iface_messages_tx`, whose `RxMessage` slots
+/// include full packet payloads (~8 KB each). At 32768, that channel
+/// alone uses ~256 MB of pre-allocated buffer memory. Increase with care.
+const INTERNAL_EVENT_CHANNEL_CAPACITY: usize = 32768;
 const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
 pub const DEFAULT_SHARED_INSTANCE_PORT: u16 = 37428;
 pub const DEFAULT_INSTANCE_CONTROL_PORT: u16 = 37429;
@@ -580,13 +591,13 @@ impl Default for TransportConfig {
 
 impl Transport {
     pub fn new(mut config: TransportConfig) -> Self {
-        let (announce_tx, _) = tokio::sync::broadcast::channel(32768);
-        let (discovery_tx, _) = tokio::sync::broadcast::channel(32768);
-        let (link_in_event_tx, _) = tokio::sync::broadcast::channel(32768);
-        let (link_out_event_tx, _) = tokio::sync::broadcast::channel(32768);
-        let (received_data_tx, _) = tokio::sync::broadcast::channel(32768);
-        let (receipt_tx, _) = tokio::sync::broadcast::channel(32768);
-        let (iface_messages_tx, _) = tokio::sync::broadcast::channel(32768);
+        let (announce_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
+        let (discovery_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
+        let (link_in_event_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
+        let (link_out_event_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
+        let (received_data_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
+        let (receipt_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
+        let (iface_messages_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
 
         let iface_manager = InterfaceManager::new(16);
 
