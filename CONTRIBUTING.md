@@ -1,6 +1,6 @@
 # Contributing to Reticulum-rs
 
-We welcome and value all kinds of contributions to **Reticulum-rs**. These are our guidelines to make collaboration easier.
+We welcome and value all kinds of contributions to **reticulum-sdk**. These are our guidelines to make collaboration easier.
 
 ## I have a question
 
@@ -28,7 +28,7 @@ in your report.
 
 ## Code contributions
 
-If you want to contribute to the programming of **Reticulum-rs**, the easiest way is to find an issue to work on and let us know you want to work on it. Maybe you also have your own idea how to enhance the project, in which case we encourage you to open your own issue.
+If you want to contribute to the programming of **reticulum-sdk**, the easiest way is to find an issue to work on and let us know you want to work on it. Maybe you also have your own idea how to enhance the project, in which case we encourage you to open your own issue.
 
 In any case, **please use the issue tracker to talk to us first.** Your idea may not fit our plan for further development, or it may be based on misunderstandings of the project architecture that can easily happen. We would hate to have to reject a big PR that took you several hours to complete.
 
