@@ -580,13 +580,13 @@ impl Default for TransportConfig {
 
 impl Transport {
     pub fn new(mut config: TransportConfig) -> Self {
-        let (announce_tx, _) = tokio::sync::broadcast::channel(16);
-        let (discovery_tx, _) = tokio::sync::broadcast::channel(16);
-        let (link_in_event_tx, _) = tokio::sync::broadcast::channel(16);
-        let (link_out_event_tx, _) = tokio::sync::broadcast::channel(16);
-        let (received_data_tx, _) = tokio::sync::broadcast::channel(16);
-        let (receipt_tx, _) = tokio::sync::broadcast::channel(16);
-        let (iface_messages_tx, _) = tokio::sync::broadcast::channel(16);
+        let (announce_tx, _) = tokio::sync::broadcast::channel(32768);
+        let (discovery_tx, _) = tokio::sync::broadcast::channel(32768);
+        let (link_in_event_tx, _) = tokio::sync::broadcast::channel(32768);
+        let (link_out_event_tx, _) = tokio::sync::broadcast::channel(32768);
+        let (received_data_tx, _) = tokio::sync::broadcast::channel(32768);
+        let (receipt_tx, _) = tokio::sync::broadcast::channel(32768);
+        let (iface_messages_tx, _) = tokio::sync::broadcast::channel(32768);
 
         let iface_manager = InterfaceManager::new(16);
 
