@@ -38,6 +38,7 @@ Reticulum operates independently of traditional IP, and can function effectively
 * ✅ [RNodeInterface](https://unsigned.io/rnode/) (over Serial)
 * ❌ RNodeMultiInterface
 * ✅ KISSInterface
+* ✅ LoRaInterface (Experimental, direct SPI communication to LoRA chipsets)
 
 ### Other
 

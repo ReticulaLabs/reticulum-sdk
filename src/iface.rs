@@ -2,6 +2,7 @@ pub mod backbone;
 pub mod hdlc;
 pub mod ifac;
 pub mod kiss;
+pub mod lora;
 pub mod modem73;
 pub mod rnode;
 pub mod tcp_client;
