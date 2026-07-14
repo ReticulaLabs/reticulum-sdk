@@ -25,7 +25,8 @@
 //! * [`iface::tcp_server::TcpServer`]
 //! * [`iface::udp::UdpInterface`]
 //! * [`iface::modem73::Modem73Interface`]
-//! * [`iface::lora::LoRaInterface`] with [`iface::lora::sx1262::SX1262`]
+//! * [`iface::lora::LoRaInterface`] with [`iface::lora::sx1262::SX1262`] or
+//!   [`iface::lora::lr1121::LR1121`]
 //! * Kaonic
 //!
 //! The main instance can be used to send messages to [`destination::Destination`]s directly

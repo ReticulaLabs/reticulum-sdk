@@ -1,3 +1,4 @@
+pub mod lr1121;
 pub mod sx1262;
 
 use std::collections::VecDeque;
