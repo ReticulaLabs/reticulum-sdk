@@ -3095,37 +3095,6 @@ is_path_response={}",
             );
         }
 
-        let shared_instance_clients = handler
-            .send_ctx
-            .iface_manager
-            .lock()
-            .await
-            .shared_instance_clients_except(iface);
-        let transport_id = handler.config.identity.address_hash().clone();
-        for local_iface in shared_instance_clients {
-            let local_announce = Packet {
-                header: Header {
-                    ifac_flag: IfacFlag::Open,
-                    header_type: HeaderType::Type2,
-                    context_flag: packet.header.context_flag,
-                    propagation_type: PropagationType::Transport,
-                    destination_type: DestinationType::Single,
-                    packet_type: PacketType::Announce,
-                    hops: packet.header.hops,
-                },
-                ifac: None,
-                destination: packet.destination,
-                transport: Some(transport_id),
-                context: PacketContext::None,
-                data: packet.data.clone(),
-            };
-
-            pending.push(TxMessage {
-                tx_type: TxMessageType::Direct(local_iface),
-                packet: local_announce,
-            });
-        }
-
         let retransmit = handler.config.retransmit;
         if retransmit {
             let transport_id = handler.config.identity.address_hash().clone();
@@ -3828,8 +3797,10 @@ async fn manage_transport(
                 // Hold the handler lock only for synchronous operations.
                 // Outbound sends are accumulated and flushed after the lock is released.
                 let mut pending = PendingSends::new();
+                let transport_id;
                 {
                     let mut handler = handler.lock().await;
+                    transport_id = *handler.config.identity.address_hash();
 
                     if handle_fixed_destinations(&packet, &mut *handler, &mut pending, message.address).await {
                         drop(handler);
@@ -3893,6 +3864,40 @@ async fn manage_transport(
                         }
                     }
                 }
+
+                // Forward announces to shared-instance clients without holding
+                // either the handler or iface_manager lock.
+                if packet.header.packet_type == PacketType::Announce {
+                    let clients = packet_send_ctx
+                        .iface_manager
+                        .lock()
+                        .await
+                        .shared_instance_clients_except(message.address);
+                    for local_iface in clients {
+                        let local_announce = Packet {
+                            header: Header {
+                                ifac_flag: IfacFlag::Open,
+                                header_type: HeaderType::Type2,
+                                context_flag: packet.header.context_flag,
+                                propagation_type: PropagationType::Transport,
+                                destination_type: DestinationType::Single,
+                                packet_type: PacketType::Announce,
+                                hops: packet.header.hops,
+                            },
+                            ifac: None,
+                            destination: packet.destination,
+                            transport: Some(transport_id),
+                            context: PacketContext::None,
+                            data: packet.data.clone(),
+                        };
+
+                        pending.push(TxMessage {
+                            tx_type: TxMessageType::Direct(local_iface),
+                            packet: local_announce,
+                        });
+                    }
+                }
+
                 // handler lock released — flush pending sends without contention
                 pending.flush(&packet_send_ctx).await;
             }
