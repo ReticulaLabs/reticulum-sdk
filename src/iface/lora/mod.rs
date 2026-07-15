@@ -31,10 +31,10 @@ const CR_MAX: u8 = 8;
 
 pub const DEFAULT_SYNC_WORD: u16 = 0x1424;
 
-const SPI_IOC_MESSAGE_1: u64 = 0xC0206B00;
+const SPI_IOC_MESSAGE_1: u64 = 0x40206B00;
 const SPI_IOC_WR_MODE: u64 = 0x40016B01;
 const SPI_IOC_WR_MAX_SPEED_HZ: u64 = 0x40046B04;
-const SPI_IOC_WR_BITS_PER_WORD: u64 = 0x40016B0B;
+const SPI_IOC_WR_BITS_PER_WORD: u64 = 0x40016B03;
 
 /// SPI bus abstraction over a Linux spidev device using raw ioctls.
 pub struct SpiBus {
