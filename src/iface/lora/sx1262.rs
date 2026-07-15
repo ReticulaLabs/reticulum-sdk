@@ -427,6 +427,41 @@ impl SX1262 {
         let val = self.read_register(REG_EVENT_MASK)?;
         self.write_register(REG_EVENT_MASK, &[val | 0x02])
     }
+
+    /// Quick SPI ping: read a register and verify the chip responds with
+    /// valid data (not all-zeros or all-ones).
+    fn ping(&mut self) -> Result<(), LoRaError> {
+        let data = self.read_command(CMD_READ_REGISTER, 2, &REG_LORA_SYNC_WORD_MSB.to_be_bytes())?;
+        if data.len() < 2 {
+            return Err(LoRaError::Chipset(
+                "SPI ping: chip did not respond (no data)".into(),
+            ));
+        }
+        let sync = (data[0] as u16) << 8 | data[1] as u16;
+        if sync == 0x0000 || sync == 0xFFFF {
+            return Err(LoRaError::Chipset(format!(
+                "SPI ping: chip returned invalid data 0x{sync:04X} \
+                 (bus may be floating or chip not connected)"
+            )));
+        }
+        log::debug!("sx1262: SPI ping OK (sync_reg=0x{sync:04X})");
+        Ok(())
+    }
+
+    fn validate_communication(&mut self, sync_word: u16) -> Result<(), LoRaError> {
+        let data = self.read_command(CMD_READ_REGISTER, 2, &REG_LORA_SYNC_WORD_MSB.to_be_bytes())?;
+        if data.len() < 2 {
+            return Err(LoRaError::Chipset("SPI validation failed: no data received".into()));
+        }
+        let read_word = (data[0] as u16) << 8 | data[1] as u16;
+        if read_word != sync_word {
+            return Err(LoRaError::Chipset(format!(
+                "SPI validation failed: wrote sync word 0x{sync_word:04X} but read back 0x{read_word:04X}"
+            )));
+        }
+        log::debug!("sx1262: SPI communication validated (sync word 0x{sync_word:04X})");
+        Ok(())
+    }
 }
 
 impl LoRaChipset for SX1262 {
@@ -451,6 +486,9 @@ impl LoRaChipset for SX1262 {
         // Enter standby RC mode
         self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
         std::thread::sleep(Duration::from_millis(5));
+
+        // Quick SPI ping to confirm the chip is alive and in the right mode
+        self.ping()?;
 
         // Set packet type to LoRa
         self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
@@ -499,6 +537,8 @@ impl LoRaChipset for SX1262 {
         self.fix_lora_bw500(config.bandwidth as u32 * 1000)?;
 
         self.config = Some(config.clone());
+
+        self.validate_communication(config.sync_word)?;
 
         log::info!(
             "sx1262: configured freq={} Hz bw={} kHz sf={} cr={} power={} dBm",
