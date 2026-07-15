@@ -684,7 +684,7 @@ impl Transport {
         let (receipt_tx, _) = tokio::sync::broadcast::channel(cap);
         let (iface_messages_tx, _) = tokio::sync::broadcast::channel(cap);
 
-        let iface_manager = InterfaceManager::new(16);
+        let iface_manager = InterfaceManager::new(config.event_channel_capacity / 2);
 
         let rx_receiver = iface_manager.receiver();
 
