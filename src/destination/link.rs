@@ -892,6 +892,15 @@ impl Link {
     }
 
     fn post_event(&self, event: LinkEvent) {
+        let len = self.event_tx.len();
+        if len >= crate::transport::EVENT_CHANNEL_CAPACITY {
+            log::warn!(
+                "link({}): event channel full ({} of {} slots used), events will be dropped.",
+                self.id,
+                len,
+                crate::transport::EVENT_CHANNEL_CAPACITY,
+            );
+        }
         let _ = self.event_tx.send(LinkEventData {
             id: self.id,
             address_hash: self.destination.address_hash,

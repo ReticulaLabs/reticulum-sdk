@@ -113,16 +113,19 @@ const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 
-/// Capacity for internal tokio broadcast channels used to deliver transport
-/// events (announces, link events, received data, receipts, etc.) to the
-/// application layer.
+/// Default capacity for internal tokio broadcast channels used to deliver
+/// transport events (announces, link events, received data, receipts, etc.)
+/// to the application layer.
 ///
 /// Each broadcast channel pre-allocates a fixed ring buffer of this size.
-/// Memory usage per channel = capacity × size of the message slot. The
-/// largest consumer is `iface_messages_tx`, whose `RxMessage` slots
-/// include full packet payloads (~8 KB each). At 32768, that channel
-/// alone uses ~256 MB of pre-allocated buffer memory. Increase with care.
-const INTERNAL_EVENT_CHANNEL_CAPACITY: usize = 32768;
+/// Memory usage per channel = capacity × size of the message slot.
+///
+/// Can be overridden on a per-transport basis via
+/// [`TransportConfig::set_event_channel_capacity`]. High-throughput
+/// deployments (e.g., backbone links) should use a larger capacity
+/// (up to 32768), while resource-constrained or low-speed links (LoRa,
+/// serial) can use a smaller one (e.g., 512–1024).
+pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 16384;
 const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
 pub const DEFAULT_SHARED_INSTANCE_PORT: u16 = 37428;
 pub const DEFAULT_INSTANCE_CONTROL_PORT: u16 = 37429;
@@ -133,6 +136,20 @@ const PY_CONN_WELCOME: &[u8] = b"#WELCOME#";
 const PY_CONN_FAILURE: &[u8] = b"#FAILURE#";
 const PY_CONN_AUTH_MAX_FRAME: usize = 256;
 const PY_CONN_MUTUAL_AUTH_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Log a warning if a broadcast sender is at or above capacity.
+fn warn_if_event_channel_full<T>(sender: &tokio::sync::broadcast::Sender<T>, capacity: usize, label: &str, name: &str) {
+    let len = sender.len();
+    if len >= capacity {
+        log::warn!(
+            "tp({}): {} event channel is full ({} of {} slots used), messages will be dropped",
+            name,
+            label,
+            len,
+            capacity,
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct ReceivedData {
@@ -181,6 +198,17 @@ pub struct TransportConfig {
     /// signals it in the link request; intermediate transport nodes clamp the
     /// value to the minimum of all interfaces along the path.
     link_mtu_discovery: bool,
+
+    /// Capacity of the internal tokio broadcast channels that deliver
+    /// transport events (announces, link events, received data, receipts,
+    /// raw interface messages) to the application layer.
+    ///
+    /// Each channel pre-allocates a fixed ring buffer of this size.
+    /// High-throughput deployments (e.g. backbone links aggregating many
+    /// peers) can increase this to reduce the chance of dropped messages;
+    /// resource-constrained or low-speed setups (LoRa, serial) can lower
+    /// it to save memory.
+    event_channel_capacity: usize,
 
     /// Python-compatible shared instance mode. When enabled, this transport
     /// tries to become the local shared instance and falls back to connecting
@@ -419,6 +447,7 @@ impl TransportConfig {
             is_shared_instance: false,
             is_connected_to_shared_instance: false,
             is_standalone_instance: true,
+            event_channel_capacity: EVENT_CHANNEL_CAPACITY,
         }
     }
 
@@ -468,6 +497,21 @@ impl TransportConfig {
 
     pub fn set_link_mtu_discovery(&mut self, link_mtu_discovery: bool) {
         self.link_mtu_discovery = link_mtu_discovery;
+    }
+
+    /// Set the capacity of internal broadcast event channels.
+    ///
+    /// Each event channel (announces, link events, received data, receipts,
+    /// raw interface messages) pre-allocates a fixed ring buffer of this
+    /// capacity.  Larger values reduce the chance of dropped messages when
+    /// application-layer consumers are slow, at the cost of more memory.
+    ///
+    /// Recommended ranges:
+    /// - High-throughput backbone / TCP: 16384–32768
+    /// - Moderate-rate WiFi / Ethernet:  4096–8192
+    /// - Low-rate LoRa / serial / KISS:  512–1024
+    pub fn set_event_channel_capacity(&mut self, capacity: usize) {
+        self.event_channel_capacity = capacity;
     }
 
     pub fn set_share_instance(&mut self, share_instance: bool) {
@@ -585,19 +629,21 @@ impl Default for TransportConfig {
             is_shared_instance: false,
             is_connected_to_shared_instance: false,
             is_standalone_instance: true,
+            event_channel_capacity: EVENT_CHANNEL_CAPACITY,
         }
     }
 }
 
 impl Transport {
     pub fn new(mut config: TransportConfig) -> Self {
-        let (announce_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
-        let (discovery_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
-        let (link_in_event_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
-        let (link_out_event_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
-        let (received_data_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
-        let (receipt_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
-        let (iface_messages_tx, _) = tokio::sync::broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
+        let cap = config.event_channel_capacity;
+        let (announce_tx, _) = tokio::sync::broadcast::channel(cap);
+        let (discovery_tx, _) = tokio::sync::broadcast::channel(cap);
+        let (link_in_event_tx, _) = tokio::sync::broadcast::channel(cap);
+        let (link_out_event_tx, _) = tokio::sync::broadcast::channel(cap);
+        let (received_data_tx, _) = tokio::sync::broadcast::channel(cap);
+        let (receipt_tx, _) = tokio::sync::broadcast::channel(cap);
+        let (iface_messages_tx, _) = tokio::sync::broadcast::channel(cap);
 
         let iface_manager = InterfaceManager::new(16);
 
@@ -2576,6 +2622,7 @@ async fn handle_proof<'a>(
             snr,
             rssi,
         };
+        warn_if_event_channel_full(&handler.receipt_tx, handler.config.event_channel_capacity, "receipt", &handler.config.name);
         let _ = handler.receipt_tx.send(receipt);
     }
 
@@ -2817,6 +2864,7 @@ async fn handle_data<'a>(
                 data_handled = true;
                 plain_data.resize(decrypted_len);
 
+                warn_if_event_channel_full(&handler.received_data_tx, handler.config.event_channel_capacity, "received_data", &handler.config.name);
                 handler
                     .received_data_tx
                     .send(ReceivedData {
@@ -3049,6 +3097,7 @@ is_path_response={}",
             }
         }
 
+        warn_if_event_channel_full(&handler.announce_tx, handler.config.event_channel_capacity, "announce", &handler.config.name);
         let _ = handler.announce_tx.send(AnnounceEvent {
             destination,
             hops: packet.header.hops,
@@ -3063,6 +3112,7 @@ is_path_response={}",
                 packet.header.hops,
                 app_data,
             ) {
+                warn_if_event_channel_full(&handler.discovery_tx, handler.config.event_channel_capacity, "discovery", &handler.config.name);
                 let _ = handler.discovery_tx.send(discovered);
             }
         }
@@ -3665,13 +3715,14 @@ async fn manage_transport(
     rx_receiver: Arc<Mutex<InterfaceRxReceiver>>,
     iface_messages_tx: broadcast::Sender<RxMessage>,
 ) {
-    let (cancel, retransmit, announce_forever, tp_name) = {
+    let (cancel, retransmit, announce_forever, tp_name, event_channel_capacity) = {
         let h = handler.lock().await;
         (
             h.cancel.clone(),
             h.config.retransmit,
             h.config.announce_forever,
             h.config.name.clone(),
+            h.config.event_channel_capacity,
         )
     };
     let mut last_retransmit_old = if announce_forever {
@@ -3706,6 +3757,7 @@ async fn manage_transport(
                     break;
                 };
 
+                warn_if_event_channel_full(&iface_messages_tx, event_channel_capacity, "iface_messages", &tp_name);
                 let _ = iface_messages_tx.send(message.clone());
 
                 let mut packet = message.packet;
