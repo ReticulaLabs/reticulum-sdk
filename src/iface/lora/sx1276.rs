@@ -477,7 +477,7 @@ impl LoRaChipset for SX1276 {
         self.write_register(REG_LNA, 0x23)?;
 
         // LoRa modulation parameters (BW, SF, CR, AGC, LDRO, detection)
-        let bw_khz = config.bandwidth as u32;
+        let bw_khz = (config.bandwidth / 1000.0) as u32;
         self.set_modulation_params(config.spreading_factor, bw_khz, config.coding_rate)?;
 
         // Sync word (8-bit, mapped from 16-bit config)
@@ -502,7 +502,7 @@ impl LoRaChipset for SX1276 {
         log::info!(
             "sx1276: configured freq={} Hz bw={} kHz sf={} cr={} power={} dBm",
             config.frequency,
-            config.bandwidth,
+            bw_khz,
             config.spreading_factor,
             config.coding_rate,
             config.tx_power,

@@ -568,7 +568,7 @@ impl LoRaChipset for SX1262 {
         self.set_rf_frequency(config.frequency)?;
         self.set_modulation_params(
             config.spreading_factor,
-            config.bandwidth as u32 * 1000,
+            config.bandwidth as u32,
             config.coding_rate,
         )?;
 
@@ -588,7 +588,7 @@ impl LoRaChipset for SX1262 {
         self.set_dio_irq_params(config.dio1_line.is_some())?;
 
         // BW500 workaround
-        self.fix_lora_bw500(config.bandwidth as u32 * 1000)?;
+        self.fix_lora_bw500(config.bandwidth as u32)?;
 
         // Initial packet params (triggers IQ polarity fix internally)
         let header_mode = if config.implicit_header { 0x01 } else { 0x00 };
@@ -603,7 +603,7 @@ impl LoRaChipset for SX1262 {
         log::info!(
             "sx1262: configured freq={} Hz bw={} kHz sf={} cr={} power={} dBm",
             config.frequency,
-            config.bandwidth,
+            config.bandwidth / 1000.0,
             config.spreading_factor,
             config.coding_rate,
             config.tx_power,
@@ -646,7 +646,7 @@ impl LoRaChipset for SX1262 {
         self.set_packet_params(cfg.preamble_length, header_mode, payload.len() as u8, crc, iq)?;
 
         // BW500 workaround for TX
-        self.fix_lora_bw500(cfg.bandwidth as u32 * 1000)?;
+        self.fix_lora_bw500(cfg.bandwidth as u32)?;
 
         // CMD_SET_TX requires the device to be in STDBY / FS mode, not RX.
         // Use STDBY_XOSC so the PLL has a stable reference before TX.
@@ -670,7 +670,7 @@ impl LoRaChipset for SX1262 {
         let iq = if cfg.iq_inverted { 0x01 } else { 0x00 };
 
         // BW500 workaround for RX
-        self.fix_lora_bw500(cfg.bandwidth as u32 * 1000)?;
+        self.fix_lora_bw500(cfg.bandwidth as u32)?;
 
         // Set packet params (payload len 0xFF, ignored in explicit header mode)
         // NOTE: IQ polarity errata fix is applied inside set_packet_params.

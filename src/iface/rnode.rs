@@ -13,7 +13,6 @@ use crate::iface::{Interface, InterfaceContext, RxMessage};
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
-const PACKET_TRACE: bool = false;
 const RNODE_HW_MTU: usize = 508;
 const SERIAL_SPEED: u32 = 115_200;
 const RECONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -655,6 +654,14 @@ where
         write_airtime_limit(writer, kiss::CMD_LT_ALOCK, limit).await?;
     }
 
+    log::info!(
+        "rnode: configured freq={} Hz bw={} kHz sf={} cr={} power={} dBm",
+        config.frequency,
+        config.bandwidth / 1000,
+        config.spreadingfactor,
+        config.codingrate,
+        config.txpower,
+    );
     write_command(writer, kiss::CMD_RADIO_STATE, &[kiss::RADIO_STATE_ON]).await
 }
 
@@ -797,9 +804,7 @@ async fn handle_frame(
 
             match Packet::deserialize(&mut InputBuffer::new(&frame.payload)) {
                 Ok(packet) => {
-                    if PACKET_TRACE {
-                        log::trace!("rnode_interface: rx << ({}) {}", iface_address, packet);
-                    }
+                    log::trace!("rnode_interface: rx << ({}) {} bytes", iface_address, frame.payload.len());
                     let rstate = state.lock().await;
                     let snr = rstate.r_stat_snr;
                     let rssi = rstate.r_stat_rssi;
@@ -1110,9 +1115,7 @@ where
         return Ok(());
     }
 
-    if PACKET_TRACE {
-        log::trace!("rnode_interface: tx >> ({}) {}", iface_address, packet);
-    }
+    log::trace!("rnode_interface: tx >> ({}) {} bytes", iface_address, output.offset());
 
     if config.flow_control {
         let mut state = state.lock().await;
