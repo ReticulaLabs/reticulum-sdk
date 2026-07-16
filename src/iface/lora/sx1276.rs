@@ -7,6 +7,8 @@ use super::{
 // ── Registers ──────────────────────────────────────────────────────────────
 
 const REG_FIFO: u8 = 0x00;
+const REG_IFFREQ2: u8 = 0x2F;
+const REG_IFFREQ1: u8 = 0x30;
 const REG_OP_MODE: u8 = 0x01;
 const REG_FRF_MSB: u8 = 0x06;
 const REG_FRF_MID: u8 = 0x07;
@@ -37,6 +39,7 @@ const REG_DETECTION_THRESHOLD: u8 = 0x37;
 const REG_SYNC_WORD: u8 = 0x39;
 const REG_HIGH_BW_OPTIMIZE_2: u8 = 0x3A;
 const REG_INVERTIQ2: u8 = 0x3B;
+const REG_TEST_DAC: u8 = 0x5A;
 const REG_VERSION: u8 = 0x42;
 
 // ── OP_MODE values ─────────────────────────────────────────────────────────
@@ -45,7 +48,6 @@ const LONG_RANGE_MODE: u8 = 0x80;
 const MODE_SLEEP: u8 = 0x00;
 const MODE_STDBY: u8 = 0x01;
 const MODE_TX: u8 = 0x03;
-const MODE_FSRX: u8 = 0x04;
 const MODE_RX_CONTINUOUS: u8 = 0x05;
 
 // ── PA config ──────────────────────────────────────────────────────────────
@@ -265,7 +267,9 @@ impl SX1276 {
         }
         self.write_register(REG_MODEM_CONFIG_3, mc3_val)?;
 
-        // Detection settings for SF6 vs SF7-12
+        // Detection settings for SF6 vs SF7-12.
+        // Keep AutomaticIFOn (bit 7 = 1) — this matches the proven
+        // RNode/sx127x.cpp reference.
         if sf == 6 {
             self.write_register(REG_DETECTION_OPTIMIZE, 0xC5)?;
             self.write_register(REG_DETECTION_THRESHOLD, 0x0C)?;
@@ -283,6 +287,7 @@ impl SX1276 {
     fn optimize_modem_sensitivity(&mut self, bw_code: u8) -> Result<(), LoRaError> {
         // When using 500 kHz bandwidth, optimise sensitivity for the
         // frequency band (SX1276 datasheet §4.1.18, §4.1.26).
+        // For all other bandwidths the default reset value (0x20) is correct.
         if bw_code == 9 {
             let freq = self.get_frequency();
             if (410_000_000..=525_000_000).contains(&freq) {
@@ -291,11 +296,7 @@ impl SX1276 {
             } else if (820_000_000..=1_020_000_000).contains(&freq) {
                 self.write_register(REG_HIGH_BW_OPTIMIZE_1, 0x02)?;
                 self.write_register(REG_HIGH_BW_OPTIMIZE_2, 0x64)?;
-            } else {
-                self.write_register(REG_HIGH_BW_OPTIMIZE_1, 0x03)?;
             }
-        } else {
-            self.write_register(REG_HIGH_BW_OPTIMIZE_1, 0x03)?;
         }
         Ok(())
     }
@@ -459,50 +460,40 @@ impl LoRaChipset for SX1276 {
     fn init(&mut self, config: &LoRaConfig) -> Result<(), LoRaError> {
         self.command_delay = config.command_delay;
 
-        // 1. Hardware reset
         self.hardware_reset()?;
 
-        // 2. Enter sleep + LoRa mode
         self.set_op_mode(MODE_SLEEP)?;
         std::thread::sleep(Duration::from_millis(5));
 
-        // 3. Ping the chip: read a known register to confirm SPI is working
         self.ping()?;
 
-        // 4. Set frequency
         self.set_frequency(config.frequency)?;
 
-        // 5. Configure FIFO base addresses
+        // FIFO base addresses
         self.write_register(REG_FIFO_TX_BASE_ADDR, 0)?;
         self.write_register(REG_FIFO_RX_BASE_ADDR, 0)?;
 
-        // 6. Configure LNA: max gain (G1), HF boost, reserved bits
-        //    G1=0b000 + LnaBoostHf=1 + reserved=011 → 0x1B
-        self.write_register(REG_LNA, 0x1B)?;
+        // LNA: default gain (G1), HF boost on (matches reference)
+        self.write_register(REG_LNA, 0x23)?;
 
-        // 7. Set LoRa modulation parameters
+        // LoRa modulation parameters (BW, SF, CR, AGC, LDRO, detection)
         let bw_khz = config.bandwidth as u32;
         self.set_modulation_params(config.spreading_factor, bw_khz, config.coding_rate)?;
 
-        // 8. Set preamble length
-        self.set_preamble_length(config.preamble_length)?;
+        // Sync word (8-bit, mapped from 16-bit config)
+        let sync_byte = Self::sync_word_byte(config.sync_word);
+        self.write_register(REG_SYNC_WORD, sync_byte)?;
 
-        // 9. Set sync word
-        self.set_sync_word(config.sync_word)?;
-
-        // 10. Validate communication: read back the sync word
-        self.validate_communication(config.sync_word)?;
-
-        // 11. CRC
+        // CRC
         self.set_crc(config.crc_enabled)?;
 
-        // 12. IQ inversion
+        // IQ inversion
         self.set_iq_inverted(config.iq_inverted)?;
 
-        // 13. PA configuration and power
+        // PA config and TX power
         self.set_pa_config(config.tx_power)?;
 
-        // 14. Enter standby
+        // STDBY + LoRa mode
         self.set_op_mode(MODE_STDBY)?;
         std::thread::sleep(Duration::from_millis(2));
 
@@ -568,45 +559,10 @@ impl LoRaChipset for SX1276 {
     }
 
     fn start_receive(&mut self) -> Result<(), LoRaError> {
-        let cfg = self
-            .config
-            .clone()
-            .ok_or_else(|| LoRaError::Chipset("not initialised".into()))?;
-
-        self.set_op_mode(MODE_STDBY)?;
-        std::thread::sleep(self.command_delay);
-
-        // Set header mode
-        if cfg.implicit_header {
-            let mc1 = self.read_register(REG_MODEM_CONFIG_1)?;
-            self.write_register(REG_MODEM_CONFIG_1, mc1 | 0x01)?;
-        } else {
-            let mc1 = self.read_register(REG_MODEM_CONFIG_1)?;
-            self.write_register(REG_MODEM_CONFIG_1, mc1 & 0xFE)?;
-        }
-
-        // Clear any pending IRQs
-        self.clear_irq_flags(0xFF)?;
-
-        // Enter RX via FSRX (frequency synthesis) so the PLL locks before
-        // the receiver is enabled.  The SX1276 datasheet recommends this
-        // two-step transition from STDBY to RX.
-        self.set_op_mode(MODE_FSRX)?;
-        std::thread::sleep(Duration::from_millis(2));
-
+        // Exact match of sx127x::receive(0): explicit header + RX continuous.
+        let mc1 = self.read_register(REG_MODEM_CONFIG_1)?;
+        self.write_register(REG_MODEM_CONFIG_1, mc1 & 0xFE)?;
         self.set_op_mode(MODE_RX_CONTINUOUS)?;
-        std::thread::sleep(Duration::from_millis(2));
-
-        let op_mode = self.read_register(REG_OP_MODE)?;
-        let expected = LONG_RANGE_MODE | MODE_RX_CONTINUOUS;
-        if op_mode != expected {
-            log::error!(
-                "sx1276: failed to enter RX mode — wrote 0x{expected:02X}, read back 0x{op_mode:02X}"
-            );
-            return Err(LoRaError::Chipset(format!(
-                "failed to enter RX mode: wrote 0x{expected:02X}, read back 0x{op_mode:02X}"
-            )));
-        }
 
         self.rx_active = true;
         self.tx_active = false;
@@ -628,24 +584,30 @@ impl LoRaChipset for SX1276 {
             ));
         }
 
-        log::trace!("sx1276: IRQ flags = 0x{irq:02X}");
+        log::trace!("sx1276: IRQ flags = 0x{:02X}", irq);
 
         // Handle CRC errors
         if irq & IRQ_CRC_ERR != 0 {
             log::warn!("sx1276: CRC error in received packet");
         }
 
+        // Handle ValidHeader — fires when a LoRa header is decoded
+        if irq & 0x10 != 0 {
+            log::info!("sx1276: ValidHeader IRQ");
+        }
+
         // Handle RX done
         if irq & IRQ_RX_DONE != 0 {
-            log::trace!("sx1276: RX received");
+            log::info!("sx1276: RX received");
             // If CRC failed, skip the payload
             if irq & IRQ_CRC_ERR == 0 {
                 let payload = self.read_fifo_payload()?;
+                let pkt_len = payload.len();
                 if !payload.is_empty() {
                     let (rssi, snr) = self.get_packet_rssi_snr()?;
                     packets.push(ReceivedPacket { payload, rssi, snr });
                 }
-                log::trace!("sx1276: RX complete");
+                log::info!("sx1276: RX complete ({} bytes)", pkt_len);
             }
         }
 
