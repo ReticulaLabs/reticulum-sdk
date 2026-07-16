@@ -31,13 +31,16 @@ const CMD_WRITE_BUFFER: u8 = 0x0E;
 const CMD_READ_BUFFER: u8 = 0x1E;
 const CMD_WRITE_REGISTER: u8 = 0x0D;
 const CMD_READ_REGISTER: u8 = 0x1D;
+const CMD_CALIBRATE: u8 = 0x89;
 
 // ── Register addresses ────────────────────────────────────────────────────
 
 const REG_IQ_POLARITY_SETUP: u16 = 0x0736;
 const REG_LORA_SYNC_WORD_MSB: u16 = 0x0740;
+const REG_LNA: u16 = 0x08AC;
 const REG_TX_MODULATION: u16 = 0x0889;
 const REG_TX_CLAMP_CONFIG: u16 = 0x08D8;
+const REG_OCP: u16 = 0x08E7;
 const REG_RTC_CONTROL: u16 = 0x0902;
 const REG_EVENT_MASK: u16 = 0x0944;
 
@@ -62,6 +65,15 @@ const IRQ_HEADER_ERR: u16 = 0x0020;
 const IRQ_CRC_ERR: u16 = 0x0040;
 const IRQ_TIMEOUT: u16 = 0x0200;
 const IRQ_MASK_ALL: u16 = IRQ_TX_DONE | IRQ_RX_DONE | IRQ_HEADER_ERR | IRQ_CRC_ERR | IRQ_TIMEOUT;
+
+// ── Calibration masks ─────────────────────────────────────────────────────
+
+const MASK_CALIBRATE_ALL: u8 = 0x7F;
+
+// ── OCP value ─────────────────────────────────────────────────────────────
+// Over-current protection threshold: 125 mA (SX1262 typical at 22 dBm).
+// Formula: I = 5 + 5 * N, so N = (125 - 5) / 5 = 24 = 0x18.
+const OCP_125MA: u8 = 0x18;
 
 // ── PA ramp times ─────────────────────────────────────────────────────────
 
@@ -265,7 +277,12 @@ impl SX1262 {
                 iq,
                 0, 0, 0,
             ],
-        )
+        )?;
+
+        // SX1262 errata 15.4: SetPacketParams resets register 0x0736 to an
+        // incorrect default.  Re-apply the correct IQ polarity after every
+        // call, otherwise LoRa RX demodulation fails silently.
+        self.fix_inverted_iq(iq != 0)
     }
 
     fn set_tx_params(&mut self, power_dbm: i8) -> Result<(), LoRaError> {
@@ -279,6 +296,10 @@ impl SX1262 {
         } else {
             clamped as u8
         };
+
+        // Set over-current protection — matches RNode OCP_TUNED
+        self.write_register(REG_OCP, &[OCP_125MA])?;
+
         self.write_command(CMD_SET_TX_PARAMS, &[power, RAMP_800U])
     }
 
@@ -352,6 +373,18 @@ impl SX1262 {
             CMD_SET_DIO3_AS_TCXO_CTRL,
             &[code, (delay >> 16) as u8, (delay >> 8) as u8, delay as u8],
         )
+    }
+
+    fn calibrate(&mut self) -> Result<(), LoRaError> {
+        // Put in STDBY_RC before calibration (XO must be stopped)
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+
+        // Calibrate RC64k, RC13M, PLL, ADC and image
+        self.write_command(CMD_CALIBRATE, &[MASK_CALIBRATE_ALL])?;
+
+        std::thread::sleep(Duration::from_millis(5));
+        self.wait_ready()?;
+        Ok(())
     }
 
     fn calibrate_image(&mut self, freq_hz: u64) -> Result<(), LoRaError> {
@@ -514,8 +547,16 @@ impl LoRaChipset for SX1262 {
         // Errata workarounds
         self.fix_resistance_antenna()?;
 
-        // Calibrate image rejection for the target frequency band
+        // Full calibration: RC64k, RC13M, PLL, ADC (recommended after
+        // power-on per SX1262 datasheet)
+        self.calibrate()?;
+
+        // Band-specific image calibration
         self.calibrate_image(config.frequency)?;
+
+        // Switch to STDBY_XOSC for a stable XO reference before frequency
+        // synthesis and TX/RX operations.
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
 
         // Set PA config based on TX power
         self.set_pa_config(config.tx_power)?;
@@ -528,8 +569,11 @@ impl LoRaChipset for SX1262 {
             config.coding_rate,
         )?;
 
-        // Set TX parameters
+        // Set TX parameters (also applies OCP)
         self.set_tx_params(config.tx_power)?;
+
+        // LNA boost — improves receiver sensitivity
+        self.write_register(REG_LNA, &[0x96])?;
 
         // Set buffer base addresses
         self.set_buffer_base_address()?;
@@ -542,6 +586,12 @@ impl LoRaChipset for SX1262 {
 
         // BW500 workaround
         self.fix_lora_bw500(config.bandwidth as u32 * 1000)?;
+
+        // Initial packet params (triggers IQ polarity fix internally)
+        let header_mode = if config.implicit_header { 0x01 } else { 0x00 };
+        let crc = if config.crc_enabled { 0x01 } else { 0x00 };
+        let iq = if config.iq_inverted { 0x01 } else { 0x00 };
+        self.set_packet_params(config.preamble_length, header_mode, 0xFF, crc, iq)?;
 
         self.config = Some(config.clone());
 
@@ -583,7 +633,8 @@ impl LoRaChipset for SX1262 {
         self.fix_lora_bw500(cfg.bandwidth as u32 * 1000)?;
 
         // CMD_SET_TX requires the device to be in STDBY / FS mode, not RX.
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+        // Use STDBY_XOSC so the PLL has a stable reference before TX.
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
 
         // Trigger TX with no timeout
         self.write_command(CMD_SET_TX, &[0x00, 0x00, 0x00])?;
@@ -606,10 +657,8 @@ impl LoRaChipset for SX1262 {
         self.fix_lora_bw500(cfg.bandwidth as u32 * 1000)?;
 
         // Set packet params (payload len 0xFF, ignored in explicit header mode)
+        // NOTE: IQ polarity errata fix is applied inside set_packet_params.
         self.set_packet_params(cfg.preamble_length, header_mode, 0xFF, crc, iq)?;
-
-        // IQ inversion register fix (Errata 2.7)
-        self.fix_inverted_iq(cfg.iq_inverted)?;
 
         // RX timeout workaround
         self.fix_rx_timeout()?;
