@@ -45,6 +45,7 @@ const LONG_RANGE_MODE: u8 = 0x80;
 const MODE_SLEEP: u8 = 0x00;
 const MODE_STDBY: u8 = 0x01;
 const MODE_TX: u8 = 0x03;
+const MODE_FSRX: u8 = 0x04;
 const MODE_RX_CONTINUOUS: u8 = 0x05;
 
 // ── PA config ──────────────────────────────────────────────────────────────
@@ -475,9 +476,9 @@ impl LoRaChipset for SX1276 {
         self.write_register(REG_FIFO_TX_BASE_ADDR, 0)?;
         self.write_register(REG_FIFO_RX_BASE_ADDR, 0)?;
 
-        // 6. Configure LNA (max gain + boost)
-        let lna_val = self.read_register(REG_LNA)?;
-        self.write_register(REG_LNA, lna_val | 0x03)?;
+        // 6. Configure LNA: max gain (G1), HF boost, reserved bits
+        //    G1=0b000 + LnaBoostHf=1 + reserved=011 → 0x1B
+        self.write_register(REG_LNA, 0x1B)?;
 
         // 7. Set LoRa modulation parameters
         let bw_khz = config.bandwidth as u32;
@@ -587,8 +588,25 @@ impl LoRaChipset for SX1276 {
         // Clear any pending IRQs
         self.clear_irq_flags(0xFF)?;
 
-        // Enter continuous RX
+        // Enter RX via FSRX (frequency synthesis) so the PLL locks before
+        // the receiver is enabled.  The SX1276 datasheet recommends this
+        // two-step transition from STDBY to RX.
+        self.set_op_mode(MODE_FSRX)?;
+        std::thread::sleep(Duration::from_millis(2));
+
         self.set_op_mode(MODE_RX_CONTINUOUS)?;
+        std::thread::sleep(Duration::from_millis(2));
+
+        let op_mode = self.read_register(REG_OP_MODE)?;
+        let expected = LONG_RANGE_MODE | MODE_RX_CONTINUOUS;
+        if op_mode != expected {
+            log::error!(
+                "sx1276: failed to enter RX mode — wrote 0x{expected:02X}, read back 0x{op_mode:02X}"
+            );
+            return Err(LoRaError::Chipset(format!(
+                "failed to enter RX mode: wrote 0x{expected:02X}, read back 0x{op_mode:02X}"
+            )));
+        }
 
         self.rx_active = true;
         self.tx_active = false;
@@ -619,6 +637,7 @@ impl LoRaChipset for SX1276 {
 
         // Handle RX done
         if irq & IRQ_RX_DONE != 0 {
+            log::trace!("sx1276: RX received");
             // If CRC failed, skip the payload
             if irq & IRQ_CRC_ERR == 0 {
                 let payload = self.read_fifo_payload()?;
@@ -626,6 +645,7 @@ impl LoRaChipset for SX1276 {
                     let (rssi, snr) = self.get_packet_rssi_snr()?;
                     packets.push(ReceivedPacket { payload, rssi, snr });
                 }
+                log::trace!("sx1276: RX complete");
             }
         }
 
