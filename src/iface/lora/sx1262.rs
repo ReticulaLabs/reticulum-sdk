@@ -44,6 +44,10 @@ const REG_OCP: u16 = 0x08E7;
 const REG_RTC_CONTROL: u16 = 0x0902;
 const REG_EVENT_MASK: u16 = 0x0944;
 
+// ── Maximum payload length ─────────────────────────────────────────────────
+// SX1262 FIFO is 256 bytes; payload length field in SetPacketParams is 8 bits.
+const MAX_PAYLOAD_LEN: usize = 255;
+
 // ── Packet types ──────────────────────────────────────────────────────────
 
 const PACKET_TYPE_LORA: u8 = 0x01;
@@ -107,13 +111,12 @@ fn lora_bandwidth_code(bw_hz: u32) -> u8 {
 }
 
 fn lora_coding_rate_code(cr: u8) -> u8 {
-    // Python: cr = cr - 4; if cr > 4 { cr = 0 }
-    match cr {
-        5 => 0x01, // 4/5
-        6 => 0x01, // 4/6 (same code as 4/5 per SX1262)
-        7 => 0x01, // 4/7
-        8 => 0x01, // 4/8
-        _ => 0x00, // invalid → 4/4 (no coding)
+    // SX1262 SetModulationParams CR field:
+    // 0x01 = 4/5, 0x02 = 4/6, 0x03 = 4/7, 0x04 = 4/8
+    if (5..=8).contains(&cr) {
+        cr - 4
+    } else {
+        0x00 // invalid → 4/4 (no coding)
     }
 }
 
@@ -614,6 +617,19 @@ impl LoRaChipset for SX1262 {
             .config
             .clone()
             .ok_or_else(|| LoRaError::Chipset("not initialised".into()))?;
+
+        // SX1262 FIFO is 256 bytes and the packet params payload length field
+        // is 8 bits. Clamp to the maximum, matching the reference HAL.
+        let payload = if payload.len() > MAX_PAYLOAD_LEN {
+            log::warn!(
+                "sx1262: payload too large ({} bytes > max {}) – truncating",
+                payload.len(),
+                MAX_PAYLOAD_LEN,
+            );
+            &payload[..MAX_PAYLOAD_LEN]
+        } else {
+            payload
+        };
 
         self.tx_active = true;
         self.rx_active = false;
