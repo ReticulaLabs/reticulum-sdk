@@ -197,15 +197,30 @@ impl SX1276 {
         Ok(())
     }
 
+    fn sync_word_byte(word: u16) -> u8 {
+        // SX127x uses an 8-bit sync word.  RNode standard is 0x12.
+        // Map the 16-bit LoRaConfig value:
+        //   - 0x1424 (Reticulum SX1262 default) → 0x12 (RNode standard)
+        //   - 0x00XX                            → XX (explicit 8-bit value)
+        //   - Otherwise                         → upper byte
+        if word == 0x1424 {
+            0x12
+        } else if (word >> 8) == 0 {
+            word as u8
+        } else {
+            (word >> 8) as u8
+        }
+    }
+
     fn validate_communication(&mut self, sync_word: u16) -> Result<(), LoRaError> {
-        let written = (sync_word >> 8) as u8;
+        let expected = Self::sync_word_byte(sync_word);
         let read_back = self.read_register(REG_SYNC_WORD)?;
-        if read_back != written {
+        if read_back != expected {
             return Err(LoRaError::Chipset(format!(
-                "SPI validation failed: wrote sync word 0x{written:02X} but read back 0x{read_back:02X}"
+                "SPI validation failed: wrote sync word 0x{expected:02X} but read back 0x{read_back:02X}"
             )));
         }
-        log::debug!("sx1276: SPI communication validated (sync word 0x{written:02X})");
+        log::debug!("sx1276: SPI communication validated (sync word 0x{expected:02X})");
         Ok(())
     }
 
@@ -320,9 +335,9 @@ impl SX1276 {
     // ── Sync word ──────────────────────────────────────────────────────────
 
     fn set_sync_word(&mut self, word: u16) -> Result<(), LoRaError> {
-        // SX1276 uses an 8-bit sync word.  Take the upper byte to maximise
-        // compatibility with code that uses the RNS default 0x1424.
-        self.write_register(REG_SYNC_WORD, (word >> 8) as u8)
+        let byte = Self::sync_word_byte(word);
+        log::info!("sx1276: sync word 0x{byte:02X} (from config 0x{word:04X})");
+        self.write_register(REG_SYNC_WORD, byte)
     }
 
     // ── Preamble ───────────────────────────────────────────────────────────
