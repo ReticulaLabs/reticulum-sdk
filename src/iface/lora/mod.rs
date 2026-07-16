@@ -383,7 +383,7 @@ impl LoRaConfig {
             iq_inverted: false,
             dio2_rf_switch: false,
             tcxo_voltage: None,
-            spi_speed: 4_000_000,
+            spi_speed: 1_000_000,
             command_delay: DEFAULT_COMMAND_DELAY,
             rx_poll_interval: DEFAULT_RX_POLL_INTERVAL,
             flow_control: false,

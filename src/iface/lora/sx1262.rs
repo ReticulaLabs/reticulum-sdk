@@ -7,6 +7,7 @@ use super::{
 // ── Command opcodes ───────────────────────────────────────────────────────
 
 const CMD_SET_STANDBY: u8 = 0x80;
+const CMD_SET_FS: u8 = 0x81;
 const CMD_SET_TX: u8 = 0x83;
 const CMD_SET_RX: u8 = 0x82;
 const CMD_SET_PACKET_TYPE: u8 = 0x8A;
@@ -47,6 +48,7 @@ const PACKET_TYPE_LORA: u8 = 0x01;
 // ── Standby modes ─────────────────────────────────────────────────────────
 
 const STANDBY_RC: u8 = 0x00;
+const STANDBY_XOSC: u8 = 0x01;
 
 // ── Regulator modes ───────────────────────────────────────────────────────
 
@@ -192,6 +194,8 @@ impl SX1262 {
         Ok(())
     }
 
+
+
     fn read_command(
         &mut self,
         opcode: u8,
@@ -298,7 +302,10 @@ impl SX1262 {
     }
 
     fn set_buffer_base_address(&mut self) -> Result<(), LoRaError> {
-        self.write_command(CMD_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x80])
+        // Both TX and RX start at 0 — the FIFO is 256 bytes and these are
+        // mutually exclusive operations.  Using RxBase=0 allows TX payloads
+        // up to 255 bytes without overlapping the RX reservation.
+        self.write_command(CMD_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x00])
     }
 
     fn set_sync_word(&mut self, word: u16) -> Result<(), LoRaError> {
@@ -575,6 +582,9 @@ impl LoRaChipset for SX1262 {
         // BW500 workaround for TX
         self.fix_lora_bw500(cfg.bandwidth as u32 * 1000)?;
 
+        // CMD_SET_TX requires the device to be in STDBY / FS mode, not RX.
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+
         // Trigger TX with no timeout
         self.write_command(CMD_SET_TX, &[0x00, 0x00, 0x00])?;
 
@@ -635,6 +645,25 @@ impl LoRaChipset for SX1262 {
 
         let irq_status = (irq_data[0] as u16) << 8 | irq_data[1] as u16;
 
+        // Sanity: TX_DONE + RX_DONE are mutually exclusive.  If both are set
+        // the chip is in a fault state.  Clear everything and re-enter RX without
+        // processing events.
+        if irq_status & IRQ_TX_DONE != 0 && irq_status & IRQ_RX_DONE != 0 {
+            log::trace!(
+                "sx1262: IRQ fault — TX_DONE+RX_DONE simultaneous (0x{irq_status:04X}), \
+                 resetting",
+            );
+            self.clear_irq_status(0xFFFF)?;
+            self.start_receive()?;
+            return Ok(packets);
+        }
+
+        log::trace!(
+            "sx1262: IRQ status = 0x{irq_status:04X} (raw bytes [{:02X}, {:02X}])",
+            irq_data[0],
+            irq_data[1],
+        );
+
         if irq_status == 0 {
             return Ok(packets);
         }
@@ -670,7 +699,12 @@ impl LoRaChipset for SX1262 {
         // Clear IRQ
         self.clear_irq_status(irq_status)?;
 
-        // Re-enter RX after any completion, timeout, or error
+        // Re-enter RX after any completion, timeout, or error.
+        // Add a short delay after errors so RF reflections from TX can decay
+        // before we listen again — otherwise the chip detects its own echo.
+        if irq_status & (IRQ_HEADER_ERR | IRQ_CRC_ERR) != 0 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         if irq_status
             & (IRQ_RX_DONE | IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_HEADER_ERR | IRQ_CRC_ERR)
             != 0
