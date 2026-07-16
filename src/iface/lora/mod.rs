@@ -1,5 +1,6 @@
 pub mod lr1121;
 pub mod sx1262;
+pub mod sx1276;
 
 use std::collections::VecDeque;
 use std::fmt;
