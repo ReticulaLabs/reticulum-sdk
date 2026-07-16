@@ -173,6 +173,14 @@ impl PathRequests {
 
         data.safe_write(tag.unwrap_or_else(|| create_random_tag()).as_slice());
 
+        log::trace!(
+            "path_requests({}): generate destination={} data_len={} raw_data={:02x?}",
+            self.name,
+            destination,
+            data.len(),
+            data.as_slice(),
+        );
+
         let destination = self.controlled_destination.desc.address_hash.clone();
 
         Packet {

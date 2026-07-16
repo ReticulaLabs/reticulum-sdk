@@ -1663,6 +1663,11 @@ async fn handle_shared_rpc_request_path(
     hash.copy_from_slice(&dest_bytes[..crate::hash::ADDRESS_HASH_SIZE]);
     let address_hash = AddressHash::new(hash);
 
+    log::trace!(
+        "tp(shared_instance): RPC request_path destination_hash={:02x?}",
+        hash,
+    );
+
     {
         // RPC handlers are called infrequently; send directly.
         let mut h = handler.lock().await;
@@ -2941,6 +2946,18 @@ async fn handle_data(
                 .is_some();
             if has_next_hop {
                 handler.reverse_table.add(packet, iface);
+            } else {
+                let enough_time_passed = handler
+                    .last_path_requests
+                    .get(&packet.destination)
+                    .map(|last| last.elapsed() > PATH_REQUEST_MI)
+                    .unwrap_or(true);
+
+                if enough_time_passed {
+                    handler
+                        .request_path(&packet.destination, pending, Some(iface), None)
+                        .await;
+                }
             }
 
             data_handled = send_to_next_hop(packet, handler, pending, None).await;
@@ -3125,6 +3142,12 @@ is_path_response={}",
                 let _ = handler.discovery_tx.send(discovered);
             }
         }
+    } else {
+        log::debug!(
+            "tp({}): dropped invalid announce for dst={}",
+            handler.config.name,
+            packet.destination,
+        );
     }
 }
 
