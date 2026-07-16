@@ -635,6 +635,8 @@ async fn init_radio<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    write_command(writer, kiss::CMD_RADIO_STATE, &[kiss::RADIO_STATE_OFF]).await?;
+
     write_command(
         writer,
         kiss::CMD_FREQUENCY,
