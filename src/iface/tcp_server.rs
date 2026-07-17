@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 
 use crate::error::RnsError;
-use crate::iface::{DEFAULT_HW_MTU, configured_bitrate};
+use crate::iface::{DEFAULT_HW_MTU, InterfaceMode, configured_bitrate};
 
 use super::tcp_client::TcpClient;
 use super::{Interface, InterfaceContext, InterfaceManager};
@@ -18,6 +18,7 @@ pub struct TcpServer {
     accept_trace_label: Option<String>,
     bitrate: Option<f64>,
     max_connections: Option<usize>,
+    mode: InterfaceMode,
 }
 
 impl TcpServer {
@@ -32,6 +33,7 @@ impl TcpServer {
             accept_trace_label: None,
             bitrate: None,
             max_connections: Some(128),
+            mode: InterfaceMode::Full,
         }
     }
 
@@ -47,6 +49,7 @@ impl TcpServer {
             accept_trace_label: None,
             bitrate: None,
             max_connections: Some(128),
+            mode: InterfaceMode::Full,
         }
     }
 
@@ -67,6 +70,11 @@ impl TcpServer {
 
     pub fn with_accept_trace_label<T: Into<String>>(mut self, label: T) -> Self {
         self.accept_trace_label = Some(label.into());
+        self
+    }
+
+    pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -210,6 +218,10 @@ impl Interface for TcpServer {
 
     fn autoconfigure_mtu(&self) -> bool {
         true
+    }
+
+    fn interface_mode(&self) -> InterfaceMode {
+        self.mode
     }
 }
 

@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::iface::{
-    DEFAULT_HW_MTU, Interface, InterfaceContext, MAX_AUTOCONFIGURED_HW_MTU, RxMessage,
-    configured_bitrate,
+    DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU,
+    RxMessage, configured_bitrate,
 };
 use crate::packet::Packet;
 use crate::serde::Serialize;
@@ -54,6 +54,7 @@ pub struct Modem73Interface {
     auto_fragmentation: bool,
     current_mtu: Arc<AtomicUsize>,
     fragmentation_target: Arc<AtomicBool>,
+    mode: InterfaceMode,
 }
 
 impl Default for Modem73Interface {
@@ -72,6 +73,7 @@ impl Modem73Interface {
             auto_fragmentation: true,
             current_mtu: Arc::new(AtomicUsize::new(RETICULUM_BASE_MTU)),
             fragmentation_target: Arc::new(AtomicBool::new(false)),
+            mode: InterfaceMode::Full,
         }
     }
 
@@ -91,6 +93,11 @@ impl Modem73Interface {
 
     pub fn with_auto_fragmentation(mut self, auto_fragmentation: bool) -> Self {
         self.auto_fragmentation = auto_fragmentation;
+        self
+    }
+
+    pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -226,6 +233,10 @@ impl Interface for Modem73Interface {
 
     fn hw_mtu_source(&self) -> Option<Arc<AtomicUsize>> {
         Some(self.current_mtu.clone())
+    }
+
+    fn interface_mode(&self) -> InterfaceMode {
+        self.mode
     }
 }
 

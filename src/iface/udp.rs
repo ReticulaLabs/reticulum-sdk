@@ -5,7 +5,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
-use crate::iface::{DEFAULT_HW_MTU, Interface, InterfaceContext, RxMessage, configured_bitrate};
+use crate::iface::{
+    DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode, RxMessage, configured_bitrate,
+};
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -16,6 +18,7 @@ pub struct UdpInterface {
     bind_addr: String,
     forward_addr: Option<String>,
     bitrate: Option<f64>,
+    mode: InterfaceMode,
 }
 
 impl UdpInterface {
@@ -24,11 +27,17 @@ impl UdpInterface {
             bind_addr: bind_addr.into(),
             forward_addr: forward_addr.map(Into::into),
             bitrate: None,
+            mode: InterfaceMode::Full,
         }
     }
 
     pub fn with_bitrate(mut self, bitrate: f64) -> Self {
         self.bitrate = configured_bitrate(bitrate);
+        self
+    }
+
+    pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -167,6 +176,10 @@ impl Interface for UdpInterface {
 
     fn bitrate(&self) -> Option<f64> {
         self.bitrate
+    }
+
+    fn interface_mode(&self) -> InterfaceMode {
+        self.mode
     }
 }
 

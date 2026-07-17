@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
 use crate::iface::{
-    DEFAULT_HW_MTU, Interface, InterfaceContext, MAX_AUTOCONFIGURED_HW_MTU, RxMessage,
-    configured_bitrate,
+    DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU,
+    RxMessage, configured_bitrate,
 };
 use crate::packet::{
     Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
@@ -87,6 +87,7 @@ pub struct TcpClient {
     addr: String,
     stream: Option<TcpStream>,
     bitrate: Option<f64>,
+    mode: InterfaceMode,
 }
 
 impl TcpClient {
@@ -95,6 +96,7 @@ impl TcpClient {
             addr: addr.into(),
             stream: None,
             bitrate: None,
+            mode: InterfaceMode::Full,
         }
     }
 
@@ -103,11 +105,17 @@ impl TcpClient {
             addr: addr.into(),
             stream: Some(stream),
             bitrate: None,
+            mode: InterfaceMode::Full,
         }
     }
 
     pub fn with_bitrate(mut self, bitrate: f64) -> Self {
         self.bitrate = configured_bitrate(bitrate);
+        self
+    }
+
+    pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -381,6 +389,10 @@ impl Interface for TcpClient {
 
     fn bitrate(&self) -> Option<f64> {
         self.bitrate
+    }
+
+    fn interface_mode(&self) -> InterfaceMode {
+        self.mode
     }
 
     fn autoconfigure_mtu(&self) -> bool {

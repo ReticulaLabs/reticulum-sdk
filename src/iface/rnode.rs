@@ -9,7 +9,7 @@ use tokio_serial::{DataBits, SerialPortBuilderExt, SerialStream, StopBits};
 use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
-use crate::iface::{Interface, InterfaceContext, RxMessage};
+use crate::iface::{Interface, InterfaceContext, InterfaceMode, RxMessage};
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -192,11 +192,20 @@ fn validate_airtime_limit(limit: f32, name: &'static str) -> Result<(), RNodeCon
 
 pub struct RNodeInterface {
     config: RNodeConfig,
+    mode: InterfaceMode,
 }
 
 impl RNodeInterface {
     pub fn new(config: RNodeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            mode: InterfaceMode::Full,
+        }
+    }
+
+    pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -334,6 +343,10 @@ impl Interface for RNodeInterface {
         }
 
         Some(sf * ((4.0 / cr) / (2.0_f64.powf(sf) / (bandwidth / 1000.0))) * 1000.0)
+    }
+
+    fn interface_mode(&self) -> InterfaceMode {
+        self.mode
     }
 }
 

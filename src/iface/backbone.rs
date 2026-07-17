@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
 use crate::iface::{
-    Interface, InterfaceContext, MAX_AUTOCONFIGURED_HW_MTU, RxMessage, configured_bitrate,
+    Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, RxMessage,
+    configured_bitrate,
 };
 use crate::packet::{
     Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
@@ -95,6 +96,7 @@ pub struct BackboneServer {
     hw_mtu: usize,
     ifac_netname: Option<String>,
     ifac_netkey: Option<String>,
+    mode: InterfaceMode,
 }
 
 impl BackboneServer {
@@ -110,6 +112,7 @@ impl BackboneServer {
             hw_mtu: BACKBONE_DEFAULT_HW_MTU,
             ifac_netname: None,
             ifac_netkey: None,
+            mode: InterfaceMode::Full,
         }
     }
 
@@ -126,6 +129,7 @@ impl BackboneServer {
             hw_mtu: BACKBONE_DEFAULT_HW_MTU,
             ifac_netname: None,
             ifac_netkey: None,
+            mode: InterfaceMode::Full,
         }
     }
 
@@ -142,6 +146,11 @@ impl BackboneServer {
     pub fn with_ifac(mut self, netname: Option<String>, netkey: Option<String>) -> Self {
         self.ifac_netname = netname;
         self.ifac_netkey = netkey;
+        self
+    }
+
+    pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -265,6 +274,10 @@ impl Interface for BackboneServer {
     fn supports_discovery(&self) -> bool {
         true
     }
+
+    fn interface_mode(&self) -> InterfaceMode {
+        self.mode
+    }
 }
 
 /// Per-connection client handler for the BackboneInterface.
@@ -276,6 +289,7 @@ pub struct BackboneClient {
     hw_mtu: usize,
     ifac_netname: Option<String>,
     ifac_netkey: Option<String>,
+    mode: InterfaceMode,
 }
 
 impl BackboneClient {
@@ -287,6 +301,7 @@ impl BackboneClient {
             hw_mtu: BACKBONE_DEFAULT_HW_MTU,
             ifac_netname: None,
             ifac_netkey: None,
+            mode: InterfaceMode::Full,
         }
     }
 
@@ -298,6 +313,7 @@ impl BackboneClient {
             hw_mtu: BACKBONE_DEFAULT_HW_MTU,
             ifac_netname: None,
             ifac_netkey: None,
+            mode: InterfaceMode::Full,
         }
     }
 
@@ -319,6 +335,11 @@ impl BackboneClient {
     pub fn with_ifac(mut self, netname: Option<String>, netkey: Option<String>) -> Self {
         self.ifac_netname = netname;
         self.ifac_netkey = netkey;
+        self
+    }
+
+    pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -587,6 +608,10 @@ impl Interface for BackboneClient {
 
     fn autoconfigure_mtu(&self) -> bool {
         true
+    }
+
+    fn interface_mode(&self) -> InterfaceMode {
+        self.mode
     }
 }
 
