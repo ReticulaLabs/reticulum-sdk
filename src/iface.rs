@@ -673,7 +673,24 @@ impl InterfaceManager {
             .and_then(|iface| iface.hw_mtu.as_ref().map(|mtu| mtu.load(Ordering::Relaxed)))
     }
 
+    /// Convenience wrapper: computes pacing delay, sleeps, then flushes.
+    /// This is equivalent to calling `send_pacing_delay` + `send_flush`
+    /// and is provided for backward compatibility.
     pub async fn send(&self, message: TxMessage) {
+        let wait = self.send_pacing_delay(&message).await;
+        if wait > Duration::ZERO {
+            time::sleep(wait).await;
+        }
+        self.send_flush(message).await;
+    }
+
+    /// Compute the pacing delay for this message across all matching
+    /// interfaces and update the per-interface `last_data_send` timestamps.
+    /// The caller should sleep for the returned duration (if non-zero)
+    /// *before* calling `send_flush`, so that the pacing sleep does not
+    /// hold the `InterfaceManager` lock and block other interfaces.
+    pub async fn send_pacing_delay(&self, message: &TxMessage) -> Duration {
+        let mut max_wait = Duration::ZERO;
         for iface in &self.ifaces {
             let should_send = match message.tx_type {
                 TxMessageType::Broadcast(address) => {
@@ -681,110 +698,109 @@ impl InterfaceManager {
                     if let Some(address) = address {
                         should_send = address != iface.address;
                     }
-
                     should_send
                 }
                 TxMessageType::Direct(address) => address == iface.address,
             };
 
-            if should_send && !iface.stop.is_cancelled() {
-                let mut message = message.clone();
+            if !should_send || iface.stop.is_cancelled() {
+                continue;
+            }
 
-                // Apply IFAC if configured for this interface
-                if let Some(ifac_config) = &iface.ifac_config {
-                    if let Err(err) = ifac_config.attach(&mut message.packet) {
-                        log::warn!(
-                            "iface: failed to attach IFAC for iface={} err={:?}",
-                            iface.address,
-                            err,
-                        );
-                        continue;
-                    }
-                }
+            // Announces have their own dedicated pacer.
+            if AnnouncePacer::should_pace(message) {
+                continue;
+            }
 
-                if let Some(pacer) = iface
-                    .announce_pacer
-                    .as_ref()
-                    .filter(|_| AnnouncePacer::should_pace(&message))
-                {
-                    pacer
-                        .send(
-                            iface.tx_send.clone(),
-                            iface.stop.clone(),
-                            iface.saturated_queue_logger.clone(),
-                            message,
-                        )
-                        .await;
+            let Some(bitrate) = iface.bitrate else { continue };
+            if bitrate <= 0.0 { continue; }
+
+            let transport_size = if message.packet.header.header_type == HeaderType::Type2 {
+                ADDRESS_HASH_SIZE
+            } else {
+                0
+            };
+            let packet_len = 2 + transport_size + ADDRESS_HASH_SIZE + 1
+                + message.packet.data.len();
+            let tx_time = (packet_len as f64 * 8.0) / bitrate;
+            let min_interval = Duration::from_secs_f64(tx_time * 2.0);
+
+            iface.last_pacing_interval_us
+                .store(min_interval.as_micros() as u64, Ordering::Relaxed);
+
+            let wait = {
+                let mut last_send = iface.last_data_send.lock().unwrap();
+                let now = Instant::now();
+                let deadline = *last_send + min_interval;
+                if now >= deadline {
+                    *last_send = now;
+                    Duration::ZERO
                 } else {
-                    // Pace data/link packets on slow interfaces to avoid
-                    // flooding the radio with packets faster than it can
-                    // transmit. The minimum interval between packets is
-                    // derived from the interface bitrate plus a safety
-                    // margin to account for LoRa preamble, CRC, KISS
-                    // framing, and CSMA overhead.
-                    if let Some(bitrate) = iface.bitrate {
-                        if bitrate > 0.0 {
-                            // Estimate on-air packet size: header (2 bytes)
-                            // + optional transport address (Type2 only)
-                            // + destination + context + payload.
-                            let transport_size = if message.packet.header.header_type
-                                == HeaderType::Type2
-                            {
-                                ADDRESS_HASH_SIZE
-                            } else {
-                                0
-                            };
-                            let packet_len = 2
-                                + transport_size
-                                + ADDRESS_HASH_SIZE
-                                + 1
-                                + message.packet.data.len();
-                            let tx_time =
-                                (packet_len as f64 * 8.0) / bitrate;
-                            // 2.0x margin accounts for LoRa preamble
-                            // (~135ms), CRC, coding artefacts, and CSMA
-                            // contention that the raw bitrate formula
-                            // does not capture.
-                            let min_interval = Duration::from_secs_f64(
-                                tx_time * 2.0,
-                            );
-
-                            iface
-                                .last_pacing_interval_us
-                                .store(min_interval.as_micros() as u64, Ordering::Relaxed);
-
-                            let wait = {
-                                let mut last_send = iface
-                                    .last_data_send
-                                    .lock()
-                                    .unwrap();
-                                let now = Instant::now();
-                                let deadline =
-                                    *last_send + min_interval;
-                                if now >= deadline {
-                                    *last_send = now;
-                                    Duration::ZERO
-                                } else {
-                                    let remaining = deadline - now;
-                                    *last_send = deadline;
-                                    remaining
-                                }
-                            };
-
-                            if wait > Duration::ZERO {
-                                iface
-                                    .pacing_wait_us
-                                    .fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
-                                time::sleep(wait).await;
-                            }
-                        }
-                    }
-
-                    send_or_drop(&iface.tx_send, message, Some(&iface.saturated_queue_logger))
-                        .await;
-
-                    iface.packets_tx.fetch_add(1, Ordering::Relaxed);
+                    let remaining = deadline - now;
+                    *last_send = deadline;
+                    remaining
                 }
+            };
+
+            if wait > max_wait {
+                max_wait = wait;
+            }
+        }
+        max_wait
+    }
+
+    /// Send a message without any pacing sleep.  The caller is responsible
+    /// for having called `send_pacing_delay` beforehand and slept for the
+    /// returned duration so that the `InterfaceManager` lock is not held
+    /// during the sleep.  Pacing delay computation is NOT repeated here.
+    pub async fn send_flush(&self, message: TxMessage) {
+        for iface in &self.ifaces {
+            let should_send = match message.tx_type {
+                TxMessageType::Broadcast(address) => {
+                    let mut should_send = true;
+                    if let Some(address) = address {
+                        should_send = address != iface.address;
+                    }
+                    should_send
+                }
+                TxMessageType::Direct(address) => address == iface.address,
+            };
+
+            if !should_send || iface.stop.is_cancelled() {
+                continue;
+            }
+
+            let mut message = message.clone();
+
+            if let Some(ifac_config) = &iface.ifac_config {
+                if let Err(err) = ifac_config.attach(&mut message.packet) {
+                    log::warn!(
+                        "iface: failed to attach IFAC for iface={} err={:?}",
+                        iface.address,
+                        err,
+                    );
+                    continue;
+                }
+            }
+
+            if let Some(pacer) = iface
+                .announce_pacer
+                .as_ref()
+                .filter(|_| AnnouncePacer::should_pace(&message))
+            {
+                pacer
+                    .send(
+                        iface.tx_send.clone(),
+                        iface.stop.clone(),
+                        iface.saturated_queue_logger.clone(),
+                        message,
+                    )
+                    .await;
+            } else {
+                send_or_drop(&iface.tx_send, message, Some(&iface.saturated_queue_logger))
+                    .await;
+
+                iface.packets_tx.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

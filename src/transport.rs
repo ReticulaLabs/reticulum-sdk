@@ -350,12 +350,30 @@ impl SendCtx {
             self.packet_cache.lock().unwrap().update(&message.packet);
             message
         };
-        self.iface_manager.lock().await.send(message).await;
+
+        // Compute pacing delay before locking so the sleep does not
+        // block the InterfaceManager for other interfaces.
+        let wait = {
+            let mgr = self.iface_manager.lock().await;
+            mgr.send_pacing_delay(&message).await
+        };
+        if wait > Duration::ZERO {
+            time::sleep(wait).await;
+        }
+        self.iface_manager.lock().await.send_flush(message).await;
     }
 
     async fn send(&self, message: TxMessage) {
         self.packet_cache.lock().unwrap().update(&message.packet);
-        self.iface_manager.lock().await.send(message).await;
+
+        let wait = {
+            let mgr = self.iface_manager.lock().await;
+            mgr.send_pacing_delay(&message).await
+        };
+        if wait > Duration::ZERO {
+            time::sleep(wait).await;
+        }
+        self.iface_manager.lock().await.send_flush(message).await;
     }
 
     fn prepare_send_packet(&self, packet: Packet) -> TxMessage {
