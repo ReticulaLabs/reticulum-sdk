@@ -109,6 +109,14 @@ const INTERVAL_PATH_TABLE_CULL: Duration = Duration::from_secs(30);
 
 const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
 
+// Interface mode path expiry times (matching Python Reticulum):
+// Full / Gateway / Boundary / Internal / PointToPoint → 1 week
+const PATH_EXPIRY_FULL: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+// Access Point → 1 day
+const PATH_EXPIRY_AP: Duration = Duration::from_secs(60 * 60 * 24);
+// Roaming → 6 hours
+const PATH_EXPIRY_ROAMING: Duration = Duration::from_secs(60 * 60 * 6);
+
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 
@@ -3275,6 +3283,24 @@ async fn handle_path_request(
             );
 
             return;
+        }
+
+        // If the requesting interface is in a mode we should actively
+        // discover paths for (Gateway, AccessPoint, Roaming, Internal),
+        // and we have transport enabled, try to discover the unknown
+        // destination.
+        if handler.config.retransmit {
+            let should_discover =
+                handler.send_ctx.iface_manager.lock().await.should_discover_paths_for(&iface);
+            if should_discover {
+                log::trace!(
+                    "tp({}): attempting to discover unknown path to {} via discover_paths_for mode",
+                    handler.config.name,
+                    request.destination,
+                );
+                // The recursive forwarding below will handle the
+                // discovery — fall through to the retransmit logic.
+            }
         }
 
         if handler.config.retransmit {

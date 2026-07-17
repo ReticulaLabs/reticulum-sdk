@@ -974,6 +974,34 @@ impl InterfaceManager {
         }
     }
 
+    /// Return the interface mode for the given interface address, or
+    /// `InterfaceMode::Full` if the interface is not found or cancelled.
+    pub fn interface_mode(&self, address: &AddressHash) -> InterfaceMode {
+        self.ifaces
+            .iter()
+            .find(|i| i.address == *address && !i.stop.is_cancelled())
+            .map(|i| i.mode)
+            .unwrap_or(InterfaceMode::Full)
+    }
+
+    /// Return the path expiry duration appropriate for the interface
+    /// mode at `address`.  AccessPoint → 1 day, Roaming → 6 hours,
+    /// everything else → 7 days.
+    pub fn path_expiry_for_iface(&self, address: &AddressHash) -> Duration {
+        match self.interface_mode(address) {
+            InterfaceMode::AccessPoint => Duration::from_secs(60 * 60 * 24),
+            InterfaceMode::Roaming => Duration::from_secs(60 * 60 * 6),
+            _ => Duration::from_secs(60 * 60 * 24 * 7),
+        }
+    }
+
+    /// Returns `true` if the interface at `address` has a mode that
+    /// a Transport Node should actively discover paths for (matching
+    /// Python's `DISCOVER_PATHS_FOR`).
+    pub fn should_discover_paths_for(&self, address: &AddressHash) -> bool {
+        InterfaceMode::DISCOVER_PATHS_FOR.contains(&self.interface_mode(address))
+    }
+
     pub fn active_interface_addresses(&self) -> Vec<AddressHash> {
         self.ifaces
             .iter()
@@ -1095,6 +1123,14 @@ impl InterfaceManager {
             };
 
             if !should_send || iface.stop.is_cancelled() {
+                continue;
+            }
+
+            // Interface mode filtering: Access Point interfaces do not
+            // rebroadcast announces (they only originate their own).
+            if iface.mode == InterfaceMode::AccessPoint
+                && AnnouncePacer::should_pace(&message)
+            {
                 continue;
             }
 
