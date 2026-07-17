@@ -351,10 +351,6 @@ impl PathEntry {
                 return true;
             }
 
-            if announce_emitted == path_timebase && self.state == PathState::Unresponsive {
-                return true;
-            }
-
             log::trace!(
                 "path_table reject stale announce for {} at timebase {}, current {}",
                 destination,

@@ -3285,24 +3285,6 @@ async fn handle_path_request(
             return;
         }
 
-        // If the requesting interface is in a mode we should actively
-        // discover paths for (Gateway, AccessPoint, Roaming, Internal),
-        // and we have transport enabled, try to discover the unknown
-        // destination.
-        if handler.config.retransmit {
-            let should_discover =
-                handler.send_ctx.iface_manager.lock().await.should_discover_paths_for(&iface);
-            if should_discover {
-                log::trace!(
-                    "tp({}): attempting to discover unknown path to {} via discover_paths_for mode",
-                    handler.config.name,
-                    request.destination,
-                );
-                // The recursive forwarding below will handle the
-                // discovery — fall through to the retransmit logic.
-            }
-        }
-
         if handler.config.retransmit {
             let (received_from, hops) = {
                 let pt = handler.send_ctx.path_table.read().unwrap();
@@ -3343,48 +3325,48 @@ async fn handle_path_request(
                     request.destination,
                 );
             }
-        }
 
-        if let Some(packet) = handler.path_requests.generate_recursive(
-            &request.destination,
-            iface,
-            Some(request.tag_bytes.clone()),
-        ) {
-            // Apply egress PR limiting: only forward to non-hot
-            // interfaces, excluding the originating interface.
-            let ifaces = {
-                let mgr = handler.send_ctx.iface_manager.lock().await;
-                mgr.active_interface_addresses()
-            };
-            let mut sent_any = false;
-            for iface_addr in &ifaces {
-                if *iface_addr == iface {
-                    continue;
-                }
-                let is_hot = {
+            if let Some(packet) = handler.path_requests.generate_recursive(
+                &request.destination,
+                iface,
+                Some(request.tag_bytes.clone()),
+            ) {
+                // Apply egress PR limiting: only forward to non-hot
+                // interfaces, excluding the originating interface.
+                let ifaces = {
                     let mgr = handler.send_ctx.iface_manager.lock().await;
-                    mgr.egress_record_pr(iface_addr)
+                    mgr.active_interface_addresses()
                 };
-                if is_hot {
-                    log::trace!(
-                        "tp({}): egress PR limit hit on iface {}, dropping recursive PR to {}",
-                        handler.config.name,
-                        iface_addr,
-                        request.destination,
-                    );
-                    continue;
+                let mut sent_any = false;
+                for iface_addr in &ifaces {
+                    if *iface_addr == iface {
+                        continue;
+                    }
+                    let is_hot = {
+                        let mgr = handler.send_ctx.iface_manager.lock().await;
+                        mgr.egress_record_pr(iface_addr)
+                    };
+                    if is_hot {
+                        log::trace!(
+                            "tp({}): egress PR limit hit on iface {}, dropping recursive PR to {}",
+                            handler.config.name,
+                            iface_addr,
+                            request.destination,
+                        );
+                        continue;
+                    }
+                    pending.push(TxMessage {
+                        tx_type: TxMessageType::Direct(*iface_addr),
+                        packet: packet.clone(),
+                    });
+                    sent_any = true;
                 }
-                pending.push(TxMessage {
-                    tx_type: TxMessageType::Direct(*iface_addr),
-                    packet: packet.clone(),
-                });
-                sent_any = true;
-            }
-            if !sent_any {
-                pending.push(TxMessage {
-                    tx_type: TxMessageType::Broadcast(Some(iface)),
-                    packet,
-                });
+                if !sent_any {
+                    pending.push(TxMessage {
+                        tx_type: TxMessageType::Broadcast(Some(iface)),
+                        packet,
+                    });
+                }
             }
         }
     }
