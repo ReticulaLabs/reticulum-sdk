@@ -261,6 +261,15 @@ pub trait Interface {
         true
     }
 
+    /// Whether path requests received on this interface should be
+    /// recursively forwarded to other interfaces when the destination
+    /// is unknown.  When `false`, the transport only forwards recursive
+    /// path requests if the interface mode is in `DISCOVER_PATHS_FOR`.
+    /// Defaults to `false`.  Matches Python's `Interface.recursive_prs`.
+    fn recursive_prs(&self) -> bool {
+        false
+    }
+
     /// Whether this interface should auto-size its HW_MTU from the bitrate
     /// and participate in link MTU discovery / upgrades.
     fn autoconfigure_mtu(&self) -> bool {
@@ -418,6 +427,9 @@ struct LocalInterface {
     /// Whether announces from Internal-mode interfaces are forwarded
     /// through this interface.  Matches Python's `announces_from_internal`.
     announces_from_internal: bool,
+    /// Whether path requests received on this interface should be
+    /// recursively forwarded.  Matches Python's `recursive_prs`.
+    recursive_prs: bool,
     /// Timestamp of the last data packet send, used for inter-packet pacing.
     last_data_send: std::sync::Mutex<Instant>,
     /// Cumulative number of data packets sent through this interface.
@@ -720,7 +732,7 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, InterfaceMode::Full, true)
+        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, InterfaceMode::Full, true, false)
     }
 
     fn new_channel_with_pacer(
@@ -733,6 +745,7 @@ impl InterfaceManager {
         bitrate: Option<f64>,
         mode: InterfaceMode,
         announces_from_internal: bool,
+        recursive_prs: bool,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -761,6 +774,7 @@ impl InterfaceManager {
             bitrate,
             mode,
             announces_from_internal,
+            recursive_prs,
             ingress_created_at: Instant::now(),
             last_data_send: std::sync::Mutex::new(Instant::now()),
             packets_tx: AtomicU64::new(0),
@@ -809,6 +823,7 @@ impl InterfaceManager {
         };
         let mode = inner.interface_mode();
         let announces_from_internal = inner.announces_from_internal();
+        let recursive_prs = inner.recursive_prs();
         let channel = self.new_channel_with_pacer(
             DEFAULT_INTERFACE_TX_QUEUE_CAP,
             announce_pacer,
@@ -818,6 +833,7 @@ impl InterfaceManager {
             configured_bitrate(bitrate.unwrap_or(0.0)),
             mode,
             announces_from_internal,
+            recursive_prs,
         );
 
         let inner = Arc::new(Mutex::new(inner));
@@ -1034,6 +1050,17 @@ impl InterfaceManager {
     /// local destination on this node.
     pub fn is_local_destination(&self, hash: &AddressHash) -> bool {
         self.local_destinations.contains(hash)
+    }
+
+    /// Return whether the interface at `address` has recursive path
+    /// requests enabled.  Returns `false` if the interface is not found
+    /// or cancelled.  Matches Python's `Interface.recursive_prs`.
+    pub fn recursive_prs_for_iface(&self, address: &AddressHash) -> bool {
+        self.ifaces
+            .iter()
+            .find(|i| i.address == *address && !i.stop.is_cancelled())
+            .map(|i| i.recursive_prs)
+            .unwrap_or(false)
     }
 
     /// Return the interface mode for the given interface address, or
@@ -1412,7 +1439,7 @@ mod tests {
         // 1 kbps link – realistic for LoRa at SF11/BW250
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true,
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false,
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1459,7 +1486,7 @@ mod tests {
         // 10 Mbps – typical fast link, no meaningful pacing needed.
         let bitrate = 10_000_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true,
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false,
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1486,7 +1513,7 @@ mod tests {
         let mut manager = InterfaceManager::new(4);
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true,
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false,
         );
         let iface = channel.address;
 
@@ -1546,7 +1573,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -1658,7 +1685,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -1683,7 +1710,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;

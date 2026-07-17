@@ -51,6 +51,7 @@ use crate::hash::Hash;
 use crate::identity::{PUBLIC_KEY_LENGTH, PrivateIdentity};
 
 use crate::iface::InterfaceManager;
+use crate::iface::InterfaceMode;
 
 use crate::iface::InterfaceQueueLengths;
 use crate::iface::InterfaceRxReceiver;
@@ -3369,7 +3370,18 @@ async fn handle_path_request(
                 );
             }
 
-            if let Some(packet) = handler.path_requests.generate_recursive(
+            // Python: only forward recursive path requests when the
+            // requesting interface has `recursive_prs` enabled, or its
+            // mode is in DISCOVER_PATHS_FOR (AccessPoint, Gateway,
+            // Roaming, Internal).
+            let should_search = {
+                let mgr = handler.send_ctx.iface_manager.lock().await;
+                mgr.recursive_prs_for_iface(&iface)
+                    || InterfaceMode::DISCOVER_PATHS_FOR.contains(&mgr.interface_mode(&iface))
+            };
+
+            if should_search {
+                if let Some(packet) = handler.path_requests.generate_recursive(
                 &request.destination,
                 iface,
                 Some(request.tag_bytes.clone()),
@@ -3410,6 +3422,7 @@ async fn handle_path_request(
                         packet,
                     });
                 }
+            }
             }
         }
     }
