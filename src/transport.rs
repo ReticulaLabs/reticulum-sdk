@@ -305,6 +305,10 @@ pub struct TransportMetrics {
     pub pending_path_requests: usize,
     /// Number of entries in the blackhole table.
     pub blackhole_entries: usize,
+    /// Total data packets sent across all interfaces.
+    pub total_packets_tx: u64,
+    /// Total microseconds spent in pacing waits across all interfaces.
+    pub total_pacing_wait_us: u64,
 }
 
 /// Shared sending context: independently-locked resources used for
@@ -927,6 +931,9 @@ impl Transport {
             .active_interface_addresses()
             .len();
 
+        let total_packets_tx = interface_queues.interfaces.iter().map(|i| i.packets_tx).sum();
+        let total_pacing_wait_us = interface_queues.interfaces.iter().map(|i| i.pacing_wait_us).sum();
+
         TransportMetrics {
             interface_queues,
             path_table_entries,
@@ -945,6 +952,8 @@ impl Transport {
             active_interfaces,
             pending_path_requests: handler.path_requests.pending_discovery_len(),
             blackhole_entries: handler.blackhole_table.len(),
+            total_packets_tx,
+            total_pacing_wait_us,
         }
     }
 
@@ -4073,6 +4082,7 @@ async fn manage_transport(
                             }
                         }
 
+                        let transport_name = handler.config.name.clone();
                         let active_ifaces: HashSet<AddressHash> = handler
                             .send_ctx
                             .iface_manager
@@ -4082,6 +4092,27 @@ async fn manage_transport(
                             .into_iter()
                             .collect();
                         drop(handler);
+
+                        // Log interface pacing metrics at trace level
+                        // for troubleshooting packet flow.
+                        let queues = send_ctx
+                            .iface_manager
+                            .lock()
+                            .await
+                            .queue_lengths()
+                            .await;
+                        for iface_q in &queues.interfaces {
+                            if iface_q.packets_tx > 0 || iface_q.last_pacing_interval_us > 0 {
+                                log::trace!(
+                                    "tp({}): iface {} tx={} pacing_wait={}us interval={}us",
+                                    transport_name,
+                                    iface_q.address,
+                                    iface_q.packets_tx,
+                                    iface_q.pacing_wait_us,
+                                    iface_q.last_pacing_interval_us,
+                                );
+                            }
+                        }
 
                         send_ctx
                             .path_table

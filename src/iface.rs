@@ -11,7 +11,7 @@ pub mod udp;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
@@ -70,7 +70,7 @@ pub struct RxMessage {
 }
 
 /// Queue length snapshot for a single interface.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceQueueLength {
     /// Interface address the queue lengths belong to.
     pub address: AddressHash,
@@ -78,6 +78,12 @@ pub struct InterfaceQueueLength {
     pub tx: usize,
     /// Number of forwarded announces waiting in the interface announce pacer.
     pub announce: usize,
+    /// Cumulative number of data packets sent through this interface.
+    pub packets_tx: u64,
+    /// Cumulative microseconds spent in pacing waits for this interface.
+    pub pacing_wait_us: u64,
+    /// Last computed pacing interval in microseconds (0 if not pacing).
+    pub last_pacing_interval_us: u64,
 }
 
 /// Queue length snapshot for the interface manager.
@@ -213,6 +219,12 @@ struct LocalInterface {
     bitrate: Option<f64>,
     /// Timestamp of the last data packet send, used for inter-packet pacing.
     last_data_send: std::sync::Mutex<Instant>,
+    /// Cumulative number of data packets sent through this interface.
+    packets_tx: AtomicU64,
+    /// Cumulative microseconds spent in pacing waits for this interface.
+    pacing_wait_us: AtomicU64,
+    /// Last computed pacing interval in microseconds.
+    last_pacing_interval_us: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -509,6 +521,9 @@ impl InterfaceManager {
             ifac_config: ifac_config.clone(),
             bitrate,
             last_data_send: std::sync::Mutex::new(Instant::now()),
+            packets_tx: AtomicU64::new(0),
+            pacing_wait_us: AtomicU64::new(0),
+            last_pacing_interval_us: AtomicU64::new(0),
         });
 
         InterfaceChannel {
@@ -615,6 +630,9 @@ impl InterfaceManager {
                     Some(pacer) => pacer.queue_len().await,
                     None => 0,
                 },
+                packets_tx: iface.packets_tx.load(Ordering::Relaxed),
+                pacing_wait_us: iface.pacing_wait_us.load(Ordering::Relaxed),
+                last_pacing_interval_us: iface.last_pacing_interval_us.load(Ordering::Relaxed),
             });
         }
 
@@ -731,6 +749,10 @@ impl InterfaceManager {
                                 tx_time * 2.0,
                             );
 
+                            iface
+                                .last_pacing_interval_us
+                                .store(min_interval.as_micros() as u64, Ordering::Relaxed);
+
                             let wait = {
                                 let mut last_send = iface
                                     .last_data_send
@@ -750,6 +772,9 @@ impl InterfaceManager {
                             };
 
                             if wait > Duration::ZERO {
+                                iface
+                                    .pacing_wait_us
+                                    .fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
                                 time::sleep(wait).await;
                             }
                         }
@@ -757,6 +782,8 @@ impl InterfaceManager {
 
                     send_or_drop(&iface.tx_send, message, Some(&iface.saturated_queue_logger))
                         .await;
+
+                    iface.packets_tx.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
