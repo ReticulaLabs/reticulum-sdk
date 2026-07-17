@@ -30,13 +30,14 @@ pub struct AnnounceEntry {
     pub timeout: Instant,
     pub received_from: AddressHash,
     pub retries: u8,
+    pub local_rebroadcasts: u8,
     pub hops: u8,
     pub response_to_iface: Option<AddressHash>,
 }
 
 impl AnnounceEntry {
     pub fn retransmit(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
-        if self.retries >= LOCAL_REBROADCASTS_MAX {
+        if self.retries >= LOCAL_REBROADCASTS_MAX || self.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
             return None;
         }
 
@@ -53,7 +54,7 @@ impl AnnounceEntry {
     /// Retransmit immediately, bypassing the timeout check.
     /// Used by `new_packet` when a new announce arrives for an already-tracked destination.
     pub fn retransmit_now(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
-        if self.retries >= LOCAL_REBROADCASTS_MAX {
+        if self.retries >= LOCAL_REBROADCASTS_MAX || self.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
             return None;
         }
 
@@ -163,6 +164,7 @@ impl AnnounceTable {
             timeout: now + random_rw_jitter(),
             received_from,
             retries: 0,
+            local_rebroadcasts: 0,
             hops,
             response_to_iface: None,
         };
@@ -178,6 +180,7 @@ impl AnnounceTable {
         hops: u8,
     ) {
         response.retries = 0;
+        response.local_rebroadcasts = 0;
         response.hops = hops;
         response.timeout = Instant::now() + random_rw_jitter();
         response.response_to_iface = Some(to_iface);
@@ -223,6 +226,35 @@ impl AnnounceTable {
             entry.retries = 0;
             entry.timeout = Instant::now();
         }
+    }
+
+    pub fn contains_key(&self, destination: &AddressHash) -> bool {
+        self.map.contains_key(destination)
+    }
+
+    pub fn get_mut(&mut self, destination: &AddressHash) -> Option<&mut AnnounceEntry> {
+        self.map.get_mut(destination)
+    }
+
+    pub fn remove(&mut self, destination: &AddressHash) {
+        self.map.remove(destination);
+    }
+
+    /// Handle an echo of our own retransmission: increment the
+    /// local_rebroadcasts counter and remove the entry if the maximum
+    /// has been reached. Returns `true` if the entry was removed
+    /// (announce propagation complete).
+    pub fn echo_received(&mut self, destination: &AddressHash, hops: u8) -> bool {
+        if let Some(entry) = self.map.get_mut(destination) {
+            if entry.retries > 0 && hops > 0 && hops - 1 == entry.hops {
+                entry.local_rebroadcasts += 1;
+                if entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
+                    self.map.remove(destination);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn new_packet(

@@ -3165,9 +3165,29 @@ is_path_response={}",
                 .insert(packet.destination, destination.clone());
         }
 
-        handler
-            .announce_table
-            .add(packet, packet.destination, iface);
+        // Echo detection: if this destination is already in the announce
+        // table and we've previously retransmitted it, a peer is relaying
+        // our announce back to us.  Count the echo and stop retransmitting
+        // once LOCAL_REBROADCASTS_MAX is reached (matches Python behaviour).
+        let is_echo = handler.config.retransmit
+            && handler.announce_table.contains_key(&packet.destination);
+
+        if is_echo {
+            let completed = handler
+                .announce_table
+                .echo_received(&packet.destination, packet.header.hops);
+            if completed {
+                log::trace!(
+                    "tp({}): announce for {} completed by echo",
+                    handler.config.name,
+                    packet.destination,
+                );
+            }
+        } else {
+            handler
+                .announce_table
+                .add(packet, packet.destination, iface);
+        }
 
         let path_expiry = handler
             .send_ctx
@@ -3214,8 +3234,8 @@ is_path_response={}",
             );
         }
 
-        let retransmit = handler.config.retransmit;
-        if retransmit {
+        // Only trigger a new retransmit for the first announce, not echoes
+        if !is_echo && handler.config.retransmit {
             let transport_id = handler.config.identity.address_hash().clone();
             if let Some(message) = handler
                 .announce_table
