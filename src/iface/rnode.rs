@@ -320,6 +320,10 @@ impl Interface for RNodeInterface {
         RNODE_HW_MTU
     }
 
+    fn supports_discovery(&self) -> bool {
+        true
+    }
+
     fn bitrate(&self) -> Option<f64> {
         let sf = self.config.spreadingfactor as f64;
         let cr = self.config.codingrate as f64;

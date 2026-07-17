@@ -752,6 +752,10 @@ impl<C: LoRaChipset> Interface for LoRaInterface<C> {
         LORA_HW_MTU
     }
 
+    fn supports_discovery(&self) -> bool {
+        true
+    }
+
     fn bitrate(&self) -> Option<f64> {
         let bw = self.config.bandwidth;
         let sf = self.config.spreading_factor as f64;

@@ -192,6 +192,14 @@ impl InterfaceChannel {
 pub trait Interface {
     fn hw_mtu(&self) -> usize;
 
+    /// Whether this interface type supports the interface discovery
+    /// protocol. When `true`, the interface can be registered with
+    /// `Transport::register_discoverable_interface()` to announce its
+    /// presence to the network.
+    fn supports_discovery(&self) -> bool {
+        false
+    }
+
     fn bitrate(&self) -> Option<f64> {
         None
     }

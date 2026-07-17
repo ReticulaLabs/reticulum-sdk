@@ -43,6 +43,8 @@ const FLAG_ENCRYPTED: u8 = 0b0000_0010;
 pub enum DiscoveryInterfaceKind {
     TcpServer { reachable_on: String, port: u16 },
     Backbone { reachable_on: String, port: u16 },
+    RNode,
+    LoRa,
 }
 
 impl DiscoveryInterfaceKind {
@@ -50,6 +52,8 @@ impl DiscoveryInterfaceKind {
         match self {
             Self::TcpServer { .. } => "TCPServerInterface",
             Self::Backbone { .. } => "BackboneInterface",
+            Self::RNode => "RNodeInterface",
+            Self::LoRa => "LoRaInterface",
         }
     }
 }
@@ -100,6 +104,40 @@ impl DiscoveryInterfaceConfig {
                 reachable_on: sanitize(&reachable_on.into()),
                 port,
             },
+            announce_interval: DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL,
+            stamp_cost: DEFAULT_STAMP_COST,
+            latitude: None,
+            longitude: None,
+            height: None,
+            ifac_netname: None,
+            ifac_netkey: None,
+        }
+    }
+
+    pub fn rnode<TName>(name: TName) -> Self
+    where
+        TName: Into<String>,
+    {
+        Self {
+            name: sanitize(&name.into()),
+            kind: DiscoveryInterfaceKind::RNode,
+            announce_interval: DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL,
+            stamp_cost: DEFAULT_STAMP_COST,
+            latitude: None,
+            longitude: None,
+            height: None,
+            ifac_netname: None,
+            ifac_netkey: None,
+        }
+    }
+
+    pub fn lora<TName>(name: TName) -> Self
+    where
+        TName: Into<String>,
+    {
+        Self {
+            name: sanitize(&name.into()),
+            kind: DiscoveryInterfaceKind::LoRa,
             announce_interval: DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL,
             stamp_cost: DEFAULT_STAMP_COST,
             latitude: None,
@@ -172,6 +210,7 @@ impl DiscoveryInterfaceConfig {
                 ));
                 info.push((u8_value(KEY_PORT), Value::from(*port)));
             }
+            DiscoveryInterfaceKind::RNode | DiscoveryInterfaceKind::LoRa => {}
         }
 
         if let Some(ifac_netname) = &self.ifac_netname {
@@ -604,6 +643,52 @@ mod tests {
                 .unwrap()
                 .contains("[[København 測試]]")
         );
+    }
+
+    #[test]
+    fn discovery_rnode_roundtrip() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
+        let config = DiscoveryInterfaceConfig::rnode("RNode Device")
+            .with_position(Some(55.0), Some(12.0), Some(10.0));
+        let app_data = config.build_app_data(true, &transport_id).unwrap();
+
+        let decoded =
+            DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
+
+        assert_eq!(decoded.interface_type, "RNodeInterface");
+        assert_eq!(decoded.name, "RNode Device");
+        assert!(decoded.transport_enabled);
+        assert_eq!(decoded.transport_id, transport_id);
+        assert_eq!(decoded.reachable_on, None);
+        assert_eq!(decoded.port, None);
+        assert!(decoded.config_entry.is_none());
+        assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);
+    }
+
+    #[test]
+    fn discovery_lora_roundtrip() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
+        let config = DiscoveryInterfaceConfig::lora("LoRa Node")
+            .with_position(Some(55.0), Some(12.0), Some(10.0));
+        let app_data = config.build_app_data(true, &transport_id).unwrap();
+
+        let decoded =
+            DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
+
+        assert_eq!(decoded.interface_type, "LoRaInterface");
+        assert_eq!(decoded.name, "LoRa Node");
+        assert!(decoded.transport_enabled);
+        assert_eq!(decoded.transport_id, transport_id);
+        assert_eq!(decoded.reachable_on, None);
+        assert_eq!(decoded.port, None);
+        assert!(decoded.config_entry.is_none());
+        assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);
     }
 
     #[test]

@@ -200,6 +200,10 @@ impl Interface for TcpServer {
         DEFAULT_HW_MTU
     }
 
+    fn supports_discovery(&self) -> bool {
+        true
+    }
+
     fn bitrate(&self) -> Option<f64> {
         self.bitrate
     }
