@@ -47,6 +47,35 @@ const DEFAULT_ANNOUNCE_CAP: f64 = 0.02;
 const DEFAULT_INTERFACE_TX_QUEUE_CAP: usize = 16_384;
 const MAX_QUEUED_ANNOUNCES: usize = 16_384;
 const INTERFACE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+
+// --- Ingress burst limiting (ported from Python Reticulum) ---
+/// How many timestamps to keep for frequency calculation.
+const INGRESS_FREQ_SAMPLES: usize = 48;
+/// Minimum frequency floor for rate decay (Hz).
+const INGRESS_MIN_FREQ_HZ: f64 = 0.1;
+/// Announce burst threshold for interfaces < 2 hours old (Hz).
+const INGRESS_BURST_FREQ_NEW: f64 = 3.0;
+/// Announce burst threshold for established interfaces (Hz).
+const INGRESS_BURST_FREQ: f64 = 10.0;
+/// Path request burst threshold for new interfaces (Hz).
+const INGRESS_PR_BURST_FREQ_NEW: f64 = 3.0;
+/// Path request burst threshold for established interfaces (Hz).
+const INGRESS_PR_BURST_FREQ: f64 = 8.0;
+/// How long burst mode remains active after rate drops below threshold (s).
+const INGRESS_BURST_HOLD_S: u64 = 15;
+/// Penalty time before held announces can be released (s).
+const INGRESS_BURST_PENALTY_S: u64 = 15;
+/// Min samples before frequency can be computed.
+const INGRESS_DEQUE_MIN_SAMPLE: usize = 2;
+/// Min samples before burst can be deactivated.
+const INGRESS_BURST_MIN_SAMPLES: usize = 6;
+/// Maximum held announces per interface.
+const INGRESS_MAX_HELD: usize = 256;
+/// Egress path-request frequency threshold (Hz). When an interface's
+/// outgoing PR rate exceeds this, a warning is logged.
+const EGRESS_PR_FREQ: f64 = 5.0;
+/// How old an interface must be to be considered "established" (s).
+const INGRESS_NEW_TIME_S: u64 = 2 * 60 * 60; // 2 hours
 const SATURATED_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -201,6 +230,21 @@ pub(crate) fn configured_bitrate(bitrate: f64) -> Option<f64> {
     }
 }
 
+/// Compute the frequency (Hz) of events from a deque of timestamps.
+fn ingress_freq(deque: &VecDeque<Instant>, now: Instant) -> f64 {
+    let n = deque.len();
+    if n < INGRESS_DEQUE_MIN_SAMPLE {
+        return 0.0;
+    }
+    let oldest = deque.front().copied().unwrap_or(now);
+    let span = now.duration_since(oldest);
+    let span_s = span.as_secs_f64();
+    if span_s <= 0.0 {
+        return 0.0;
+    }
+    n as f64 / span_s
+}
+
 struct LocalInterface {
     address: AddressHash,
     tx_send: InterfaceTxSender,
@@ -225,6 +269,24 @@ struct LocalInterface {
     pacing_wait_us: AtomicU64,
     /// Last computed pacing interval in microseconds.
     last_pacing_interval_us: AtomicU64,
+
+    // --- Ingress burst limiting state ---
+    /// Timestamps of recently received announces for frequency tracking.
+    ia_freq_deque: std::sync::Mutex<VecDeque<Instant>>,
+    /// Timestamps of recently received path requests for frequency tracking.
+    ip_freq_deque: std::sync::Mutex<VecDeque<Instant>>,
+    /// Whether announce burst limiting is currently active.
+    ingress_burst_active: std::sync::Mutex<bool>,
+    /// When the current announce burst was activated.
+    ingress_burst_activated: std::sync::Mutex<Instant>,
+    /// Whether path-request burst limiting is currently active.
+    ingress_pr_burst_active: std::sync::Mutex<bool>,
+    /// When the current PR burst was activated.
+    ingress_pr_burst_activated: std::sync::Mutex<Instant>,
+
+    // --- Egress path-request tracking ---
+    /// Timestamps of recently sent path requests for frequency tracking.
+    op_freq_deque: std::sync::Mutex<VecDeque<Instant>>,
 }
 
 #[derive(Clone)]
@@ -524,6 +586,13 @@ impl InterfaceManager {
             packets_tx: AtomicU64::new(0),
             pacing_wait_us: AtomicU64::new(0),
             last_pacing_interval_us: AtomicU64::new(0),
+            ia_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
+            ip_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
+            ingress_burst_active: std::sync::Mutex::new(false),
+            ingress_burst_activated: std::sync::Mutex::new(Instant::now()),
+            ingress_pr_burst_active: std::sync::Mutex::new(false),
+            ingress_pr_burst_activated: std::sync::Mutex::new(Instant::now()),
+            op_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
         });
 
         InterfaceChannel {
@@ -644,6 +713,205 @@ impl InterfaceManager {
 
     pub fn cleanup(&mut self) {
         self.ifaces.retain(|iface| !iface.stop.is_cancelled());
+    }
+
+    /// Record an incoming announce on an interface and return `true` if the
+    /// announce should be dropped due to ingress burst limiting.
+    /// Only applied to interfaces with a known bitrate (slow links).
+    pub fn ingress_record_announce(&self, address: &AddressHash) -> bool {
+        let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) else {
+            return false;
+        };
+        if iface.stop.is_cancelled() || iface.bitrate.is_none() {
+            return false;
+        }
+
+        // Track the timestamp
+        let now = Instant::now();
+        let mut deque = iface.ia_freq_deque.lock().unwrap();
+        deque.push_back(now);
+        if deque.len() > INGRESS_FREQ_SAMPLES {
+            deque.pop_front();
+        }
+
+        // Compute frequency
+        let freq = ingress_freq(&deque, now);
+
+        // Evaluate burst state
+        let mut burst_active = iface.ingress_burst_active.lock().unwrap();
+        let mut burst_activated = iface.ingress_burst_activated.lock().unwrap();
+
+        if *burst_active {
+            // Already limiting: check if we can deactivate
+            let freq_threshold = INGRESS_BURST_FREQ; // conservative: always use established threshold
+            if freq < freq_threshold
+                && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
+                && deque.len() >= INGRESS_BURST_MIN_SAMPLES
+            {
+                *burst_active = false;
+                return false;
+            }
+            return true; // actively limiting
+        } else {
+            // Not limiting yet: check if threshold is crossed
+            let freq_threshold = INGRESS_BURST_FREQ;
+            if freq > freq_threshold {
+                *burst_active = true;
+                *burst_activated = now;
+                return true; // start limiting
+            }
+            return false;
+        }
+    }
+
+    /// Record an incoming path request on an interface and return `true`
+    /// if it should be dropped due to ingress burst limiting.
+    /// Only applied to interfaces with a known bitrate (slow links).
+    pub fn ingress_record_pr(&self, address: &AddressHash) -> bool {
+        let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) else {
+            return false;
+        };
+        if iface.stop.is_cancelled() || iface.bitrate.is_none() {
+            return false;
+        }
+
+        let now = Instant::now();
+        let mut deque = iface.ip_freq_deque.lock().unwrap();
+        deque.push_back(now);
+        if deque.len() > INGRESS_FREQ_SAMPLES {
+            deque.pop_front();
+        }
+
+        let freq = ingress_freq(&deque, now);
+
+        let mut burst_active = iface.ingress_pr_burst_active.lock().unwrap();
+        let mut burst_activated = iface.ingress_pr_burst_activated.lock().unwrap();
+
+        if *burst_active {
+            let freq_threshold = INGRESS_PR_BURST_FREQ;
+            if freq < freq_threshold
+                && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
+                && deque.len() >= INGRESS_BURST_MIN_SAMPLES
+            {
+                *burst_active = false;
+                return false;
+            }
+            return true;
+        } else {
+            let freq_threshold = INGRESS_PR_BURST_FREQ;
+            if freq > freq_threshold {
+                *burst_active = true;
+                *burst_activated = now;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /// Evaluate and update ingress burst state for all interfaces.
+    /// Should be called periodically (e.g. every ~10 seconds).
+    pub fn ingress_evaluate_all(&self) {
+        let now = Instant::now();
+        for iface in &self.ifaces {
+            if iface.stop.is_cancelled() || iface.bitrate.is_none() {
+                continue;
+            }
+
+            // Announce burst
+            {
+                let deque = iface.ia_freq_deque.lock().unwrap();
+                let freq = ingress_freq(&deque, now);
+                let mut burst_active = iface.ingress_burst_active.lock().unwrap();
+                let mut burst_activated = iface.ingress_burst_activated.lock().unwrap();
+                let freq_threshold = INGRESS_BURST_FREQ;
+
+                if *burst_active {
+                    if freq < freq_threshold
+                        && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
+                        && deque.len() >= INGRESS_BURST_MIN_SAMPLES
+                    {
+                        *burst_active = false;
+                    }
+                } else {
+                    if freq > freq_threshold {
+                        *burst_active = true;
+                        *burst_activated = now;
+                    }
+                }
+            }
+
+            // PR burst
+            {
+                let deque = iface.ip_freq_deque.lock().unwrap();
+                let freq = ingress_freq(&deque, now);
+                let mut burst_active = iface.ingress_pr_burst_active.lock().unwrap();
+                let mut burst_activated = iface.ingress_pr_burst_activated.lock().unwrap();
+                let freq_threshold = INGRESS_PR_BURST_FREQ;
+
+                if *burst_active {
+                    if freq < freq_threshold
+                        && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
+                        && deque.len() >= INGRESS_BURST_MIN_SAMPLES
+                    {
+                        *burst_active = false;
+                    }
+                } else {
+                    if freq > freq_threshold {
+                        *burst_active = true;
+                        *burst_activated = now;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record an outgoing path request on this interface and return
+    /// `true` if the egress PR frequency exceeds `EGRESS_PR_FREQ` (5
+    /// Hz), indicating excessive outgoing PR activity.
+    pub fn egress_record_pr(&self, address: &AddressHash) -> bool {
+        let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) else {
+            return false;
+        };
+        if iface.stop.is_cancelled() {
+            return false;
+        }
+
+        let now = Instant::now();
+
+        // Prune entries older than the decay window
+        {
+            let mut deque = iface.op_freq_deque.lock().unwrap();
+            deque.push_back(now);
+            if deque.len() > INGRESS_FREQ_SAMPLES {
+                deque.pop_front();
+            }
+        }
+
+        let freq = {
+            let deque = iface.op_freq_deque.lock().unwrap();
+            ingress_freq(&deque, now)
+        };
+
+        freq > EGRESS_PR_FREQ
+    }
+
+    /// Sweep stale outgoing PR timestamps for all interfaces.
+    pub fn egress_evaluate_all(&self) {
+        let now = Instant::now();
+        for iface in &self.ifaces {
+            if iface.stop.is_cancelled() {
+                continue;
+            }
+            let mut deque = iface.op_freq_deque.lock().unwrap();
+            // Remove entries older than the decay window (10 seconds).
+            while let Some(&t) = deque.front() {
+                if now.duration_since(t).as_secs_f64() > 10.0 {
+                    deque.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn active_interface_addresses(&self) -> Vec<AddressHash> {

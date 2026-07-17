@@ -2628,15 +2628,65 @@ impl TransportHandler {
         on_iface: Option<AddressHash>,
         tag: Option<TagBytes>,
     ) {
-        let packet = self.path_requests.generate(address, tag);
-
-        pending.push(TxMessage {
-            tx_type: TxMessageType::Broadcast(on_iface),
-            packet,
-        });
-
+        // Per-destination rate limit: at most one path request per
+        // destination every PATH_REQUEST_MI (20s).
+        if let Some(last) = self.last_path_requests.get(address) {
+            if last.elapsed() <= PATH_REQUEST_MI {
+                return;
+            }
+        }
         self.last_path_requests
             .insert(*address, time::Instant::now());
+
+        let packet = self.path_requests.generate(address, tag);
+
+        // Per-interface egress path-request limiting: only send to
+        // interfaces whose outgoing PR rate is below the threshold
+        // (EGRESS_PR_FREQ, default 5 Hz).
+        let ifaces = {
+            let mgr = self.send_ctx.iface_manager.lock().await;
+            mgr.active_interface_addresses()
+        };
+
+        let mut sent_any = false;
+        for iface_addr in &ifaces {
+            if let Some(ref on) = on_iface {
+                if iface_addr == on {
+                    continue;
+                }
+            }
+
+            let is_hot = {
+                let mgr = self.send_ctx.iface_manager.lock().await;
+                mgr.egress_record_pr(iface_addr)
+            };
+
+            if is_hot {
+                log::trace!(
+                    "tp({}): egress PR limit hit on iface {}, dropping path request to {}",
+                    self.config.name,
+                    iface_addr,
+                    address,
+                );
+                continue;
+            }
+
+            pending.push(TxMessage {
+                tx_type: TxMessageType::Direct(*iface_addr),
+                packet: packet.clone(),
+            });
+            sent_any = true;
+        }
+
+        // Fallback: if no interface accepted the PR (e.g. all were hot
+        // or only the originating interface existed), send a normal
+        // broadcast so the request doesn't get completely lost.
+        if !sent_any {
+            pending.push(TxMessage {
+                tx_type: TxMessageType::Broadcast(on_iface),
+                packet,
+            });
+        }
     }
 
     async fn build_discovery_packet(&mut self, iface: &AddressHash) -> Result<Packet, RnsError> {
@@ -3026,6 +3076,17 @@ async fn handle_announce(
             );
             return;
         }
+
+        // Ingress burst limiting: drop announces that arrive faster than
+        // the interface can reasonably process (default threshold ~10 Hz).
+        if handler.send_ctx.iface_manager.lock().await.ingress_record_announce(&iface) {
+            log::trace!(
+                "tp({}): dropping announce from {} due to ingress burst limiting",
+                handler.config.name,
+                packet.destination,
+            );
+            return;
+        }
     }
 
     if log::log_enabled!(log::Level::Trace) {
@@ -3184,6 +3245,16 @@ async fn handle_path_request(
     pending: &mut PendingSends,
     iface: AddressHash,
 ) {
+    // Ingress burst limiting for path requests
+    if handler.send_ctx.iface_manager.lock().await.ingress_record_pr(&iface) {
+        log::trace!(
+            "tp({}): dropping path request from {} due to ingress PR burst limiting",
+            handler.config.name,
+            packet.destination,
+        );
+        return;
+    }
+
     if let Some(request) = handler.path_requests.decode(packet.data.as_slice()) {
         if let Some(dest) = handler.single_in_destinations.get(&request.destination) {
             let response = dest
@@ -3253,10 +3324,42 @@ async fn handle_path_request(
             iface,
             Some(request.tag_bytes.clone()),
         ) {
-            pending.push(TxMessage {
-                tx_type: TxMessageType::Broadcast(Some(iface)),
-                packet,
-            });
+            // Apply egress PR limiting: only forward to non-hot
+            // interfaces, excluding the originating interface.
+            let ifaces = {
+                let mgr = handler.send_ctx.iface_manager.lock().await;
+                mgr.active_interface_addresses()
+            };
+            let mut sent_any = false;
+            for iface_addr in &ifaces {
+                if *iface_addr == iface {
+                    continue;
+                }
+                let is_hot = {
+                    let mgr = handler.send_ctx.iface_manager.lock().await;
+                    mgr.egress_record_pr(iface_addr)
+                };
+                if is_hot {
+                    log::trace!(
+                        "tp({}): egress PR limit hit on iface {}, dropping recursive PR to {}",
+                        handler.config.name,
+                        iface_addr,
+                        request.destination,
+                    );
+                    continue;
+                }
+                pending.push(TxMessage {
+                    tx_type: TxMessageType::Direct(*iface_addr),
+                    packet: packet.clone(),
+                });
+                sent_any = true;
+            }
+            if !sent_any {
+                pending.push(TxMessage {
+                    tx_type: TxMessageType::Broadcast(Some(iface)),
+                    packet,
+                });
+            }
         }
     }
 }
@@ -3442,6 +3545,16 @@ async fn handle_link_request(
     handler: &mut TransportHandler,
     pending: &mut PendingSends,
 ) {
+    // Ingress burst limiting for link requests (which carry path requests)
+    if handler.send_ctx.iface_manager.lock().await.ingress_record_pr(&iface) {
+        log::trace!(
+            "tp({}): dropping link request from {} due to ingress PR burst limiting",
+            handler.config.name,
+            packet.destination,
+        );
+        return;
+    }
+
     if let Some(destination) = handler
         .single_in_destinations
         .get(&packet.destination)
@@ -3698,7 +3811,10 @@ async fn handle_keep_links(
 async fn handle_cleanup(
     handler: &TransportHandler,
 ) {
-    handler.send_ctx.iface_manager.lock().await.cleanup();
+    let mut mgr = handler.send_ctx.iface_manager.lock().await;
+    mgr.cleanup();
+    mgr.ingress_evaluate_all();
+    mgr.egress_evaluate_all();
 }
 
 async fn handle_discovery(
