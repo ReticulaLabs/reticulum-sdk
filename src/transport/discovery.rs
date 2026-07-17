@@ -27,6 +27,10 @@ const KEY_HEIGHT: u8 = 0x05;
 const KEY_PORT: u8 = 0x06;
 const KEY_IFAC_NETNAME: u8 = 0x07;
 const KEY_IFAC_NETKEY: u8 = 0x08;
+const KEY_FREQUENCY: u8 = 0x09;
+const KEY_BANDWIDTH: u8 = 0x0A;
+const KEY_SPREADINGFACTOR: u8 = 0x0B;
+const KEY_CODINGRATE: u8 = 0x0C;
 
 pub const DISCOVERY_APP_NAME: &str = "rnstransport";
 pub const DISCOVERY_ASPECTS: &str = "discovery.interface";
@@ -43,8 +47,8 @@ const FLAG_ENCRYPTED: u8 = 0b0000_0010;
 pub enum DiscoveryInterfaceKind {
     TcpServer { reachable_on: String, port: u16 },
     Backbone { reachable_on: String, port: u16 },
-    RNode,
-    LoRa,
+    RNode { frequency: u64, bandwidth: u32, spreadingfactor: u8, codingrate: u8 },
+    LoRa { frequency: u64, bandwidth: f64, spreadingfactor: u8, codingrate: u8 },
 }
 
 impl DiscoveryInterfaceKind {
@@ -52,8 +56,8 @@ impl DiscoveryInterfaceKind {
         match self {
             Self::TcpServer { .. } => "TCPServerInterface",
             Self::Backbone { .. } => "BackboneInterface",
-            Self::RNode => "RNodeInterface",
-            Self::LoRa => "LoRaInterface",
+            Self::RNode { .. } => "RNodeInterface",
+            Self::LoRa { .. } => "LoRaInterface",
         }
     }
 }
@@ -114,13 +118,13 @@ impl DiscoveryInterfaceConfig {
         }
     }
 
-    pub fn rnode<TName>(name: TName) -> Self
+    pub fn rnode<TName>(name: TName, frequency: u64, bandwidth: u32, spreadingfactor: u8, codingrate: u8) -> Self
     where
         TName: Into<String>,
     {
         Self {
             name: sanitize(&name.into()),
-            kind: DiscoveryInterfaceKind::RNode,
+            kind: DiscoveryInterfaceKind::RNode { frequency, bandwidth, spreadingfactor, codingrate },
             announce_interval: DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL,
             stamp_cost: DEFAULT_STAMP_COST,
             latitude: None,
@@ -131,13 +135,13 @@ impl DiscoveryInterfaceConfig {
         }
     }
 
-    pub fn lora<TName>(name: TName) -> Self
+    pub fn lora<TName>(name: TName, frequency: u64, bandwidth: f64, spreadingfactor: u8, codingrate: u8) -> Self
     where
         TName: Into<String>,
     {
         Self {
             name: sanitize(&name.into()),
-            kind: DiscoveryInterfaceKind::LoRa,
+            kind: DiscoveryInterfaceKind::LoRa { frequency, bandwidth, spreadingfactor, codingrate },
             announce_interval: DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL,
             stamp_cost: DEFAULT_STAMP_COST,
             latitude: None,
@@ -210,7 +214,18 @@ impl DiscoveryInterfaceConfig {
                 ));
                 info.push((u8_value(KEY_PORT), Value::from(*port)));
             }
-            DiscoveryInterfaceKind::RNode | DiscoveryInterfaceKind::LoRa => {}
+            DiscoveryInterfaceKind::RNode { frequency, bandwidth, spreadingfactor, codingrate } => {
+                info.push((u8_value(KEY_FREQUENCY), Value::from(*frequency)));
+                info.push((u8_value(KEY_BANDWIDTH), Value::from(*bandwidth)));
+                info.push((u8_value(KEY_SPREADINGFACTOR), Value::from(*spreadingfactor)));
+                info.push((u8_value(KEY_CODINGRATE), Value::from(*codingrate)));
+            }
+            DiscoveryInterfaceKind::LoRa { frequency, bandwidth, spreadingfactor, codingrate } => {
+                info.push((u8_value(KEY_FREQUENCY), Value::from(*frequency)));
+                info.push((u8_value(KEY_BANDWIDTH), Value::from(*bandwidth)));
+                info.push((u8_value(KEY_SPREADINGFACTOR), Value::from(*spreadingfactor)));
+                info.push((u8_value(KEY_CODINGRATE), Value::from(*codingrate)));
+            }
         }
 
         if let Some(ifac_netname) = &self.ifac_netname {
@@ -279,6 +294,10 @@ pub struct DiscoveredInterface {
     pub stamp_value: u8,
     pub encrypted: bool,
     pub config_entry: Option<String>,
+    pub frequency: Option<u64>,
+    pub bandwidth: Option<f64>,
+    pub spreadingfactor: Option<u8>,
+    pub codingrate: Option<u8>,
 }
 
 impl DiscoveredInterface {
@@ -356,6 +375,11 @@ impl DiscoveredInterface {
             return Err(RnsError::IncorrectHash);
         }
 
+        let frequency = get_u64(map, KEY_FREQUENCY)?;
+        let bandwidth = get_f64(map, KEY_BANDWIDTH)?;
+        let spreadingfactor = get_u8(map, KEY_SPREADINGFACTOR)?;
+        let codingrate = get_u8(map, KEY_CODINGRATE)?;
+
         let config_entry = match (interface_type.as_str(), reachable_on.as_deref(), port) {
             ("TCPServerInterface", Some(reachable_on), Some(port)) => {
                 let identity = transport_id.to_hex_string();
@@ -383,6 +407,24 @@ impl DiscoveredInterface {
                 }
                 Some(entry)
             }
+            ("RNodeInterface", _, _) => {
+                let identity = transport_id.to_hex_string();
+                let freq = frequency.unwrap_or(0);
+                let bw = bandwidth.unwrap_or(0.0);
+                let sf = spreadingfactor.unwrap_or(0);
+                let cr = codingrate.unwrap_or(0);
+                let mut entry = format!(
+                    "[[{name}]]\n type = RNodeInterface\n enabled = yes\n port = \n frequency = {freq}\n bandwidth = {bw}\n spreadingfactor = {sf}\n codingrate = {cr}"
+                );
+                if let Some(ifac_netname) = &ifac_netname {
+                    entry.push_str(&format!("\n network_name = {ifac_netname}"));
+                }
+                if let Some(ifac_netkey) = &ifac_netkey {
+                    entry.push_str(&format!("\n passphrase = {ifac_netkey}"));
+                }
+                entry.push_str(&format!("\n transport_identity = {identity}"));
+                Some(entry)
+            }
             _ => None,
         };
 
@@ -403,6 +445,10 @@ impl DiscoveredInterface {
             stamp_value,
             encrypted: false,
             config_entry,
+            frequency,
+            bandwidth,
+            spreadingfactor,
+            codingrate,
         })
     }
 }
@@ -552,6 +598,24 @@ fn get_u16(map: &[(Value, Value)], key: u8) -> Result<Option<u16>, RnsError> {
     }
 }
 
+fn get_u64(map: &[(Value, Value)], key: u8) -> Result<Option<u64>, RnsError> {
+    match map_value(map, key) {
+        Some(Value::Nil) | None => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or(RnsError::PacketError),
+    }
+}
+
+fn get_u8(map: &[(Value, Value)], key: u8) -> Result<Option<u8>, RnsError> {
+    match map_value(map, key) {
+        Some(Value::Nil) | None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|v| u8::try_from(v).ok())
+            .map(Some)
+            .ok_or(RnsError::PacketError),
+    }
+}
+
 fn get_address_hash(map: &[(Value, Value)], key: u8) -> Result<Option<AddressHash>, RnsError> {
     match map_value(map, key) {
         Some(Value::Nil) | None => Ok(None),
@@ -651,7 +715,7 @@ mod tests {
         let source_desc = create_discovery_destination(identity).desc;
         let transport_id = source_desc.identity.address_hash;
 
-        let config = DiscoveryInterfaceConfig::rnode("RNode Device")
+        let config = DiscoveryInterfaceConfig::rnode("RNode Device", 868_000_000, 125_000, 7, 5)
             .with_position(Some(55.0), Some(12.0), Some(10.0));
         let app_data = config.build_app_data(true, &transport_id).unwrap();
 
@@ -664,7 +728,11 @@ mod tests {
         assert_eq!(decoded.transport_id, transport_id);
         assert_eq!(decoded.reachable_on, None);
         assert_eq!(decoded.port, None);
-        assert!(decoded.config_entry.is_none());
+        assert_eq!(decoded.frequency, Some(868_000_000));
+        assert_eq!(decoded.bandwidth, Some(125_000.0));
+        assert_eq!(decoded.spreadingfactor, Some(7));
+        assert_eq!(decoded.codingrate, Some(5));
+        assert!(decoded.config_entry.is_some());
         assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);
     }
 
@@ -674,7 +742,7 @@ mod tests {
         let source_desc = create_discovery_destination(identity).desc;
         let transport_id = source_desc.identity.address_hash;
 
-        let config = DiscoveryInterfaceConfig::lora("LoRa Node")
+        let config = DiscoveryInterfaceConfig::lora("LoRa Node", 915_000_000, 250_000.0, 10, 6)
             .with_position(Some(55.0), Some(12.0), Some(10.0));
         let app_data = config.build_app_data(true, &transport_id).unwrap();
 
@@ -687,6 +755,10 @@ mod tests {
         assert_eq!(decoded.transport_id, transport_id);
         assert_eq!(decoded.reachable_on, None);
         assert_eq!(decoded.port, None);
+        assert_eq!(decoded.frequency, Some(915_000_000));
+        assert_eq!(decoded.bandwidth, Some(250_000.0));
+        assert_eq!(decoded.spreadingfactor, Some(10));
+        assert_eq!(decoded.codingrate, Some(6));
         assert!(decoded.config_entry.is_none());
         assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);
     }
