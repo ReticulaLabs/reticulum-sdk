@@ -869,6 +869,175 @@ mod tests {
         }
     }
 
+    /// Create a Type2 data packet directed at a specific interface.
+    /// The header includes a transport address (as Type2 requires) and
+    /// the payload has `data_len` zeroed bytes.
+    fn data_tx(iface: AddressHash, data_len: usize) -> TxMessage {
+        TxMessage {
+            tx_type: TxMessageType::Direct(iface),
+            packet: Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type2,
+                    context_flag: ContextFlag::Unset,
+                    propagation_type: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                    hops: 0,
+                },
+                ifac: None,
+                destination: AddressHash::new([1; 16]),
+                transport: Some(AddressHash::new([2; 16])),
+                context: PacketContext::None,
+                data: PacketDataBuffer::new_from_slice(&vec![0u8; data_len]),
+            },
+        }
+    }
+
+    /// Helper: expected min_interval for a data packet sent over a link
+    /// with the given `bitrate` and `data_len` payload bytes.
+    fn expected_data_interval(bitrate: f64, data_len: usize) -> Duration {
+        let packet_len = 2 + ADDRESS_HASH_SIZE + ADDRESS_HASH_SIZE + 1 + data_len;
+        let tx_time = (packet_len as f64 * 8.0) / bitrate;
+        Duration::from_secs_f64(tx_time * 2.0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_pacing_delays_packets_on_low_bandwidth_link() {
+        let mut manager = InterfaceManager::new(4);
+        // 1 kbps link – realistic for LoRa at SF11/BW250
+        let bitrate = 1_000.0;
+        let channel = manager.new_channel_with_pacer(
+            4, None, false, None, None, Some(bitrate),
+        );
+        let iface = channel.address;
+        let mut receiver = channel.tx_channel;
+
+        let data_len = 100;
+        let interval = expected_data_interval(bitrate, data_len);
+
+        // Advance well past the initial last_data_send so the first
+        // packet is not mistakenly delayed.
+        time::advance(Duration::from_secs(10)).await;
+        task::yield_now().await;
+
+        // --- first packet: should go through immediately ---
+        let msg1 = data_tx(iface, data_len);
+        let wait1 = manager.send_pacing_delay(&msg1).await;
+        assert_eq!(wait1, Duration::ZERO);
+        manager.send_flush(msg1).await;
+        assert!(receiver.try_recv().is_ok(), "first packet should arrive immediately");
+
+        // --- second packet sent right away: must be paced ---
+        let msg2 = data_tx(iface, data_len);
+        let wait2 = manager.send_pacing_delay(&msg2).await;
+        let tolerance = Duration::from_millis(50);
+        assert!(
+            wait2 >= interval.saturating_sub(tolerance) && wait2 <= interval + tolerance,
+            "expected wait ≈ {interval:?}, got {wait2:?}",
+        );
+        // Without advancing time the tx channel stays empty.
+        assert!(
+            receiver.try_recv().is_err(),
+            "second packet should be delayed by pacing",
+        );
+
+        // Advance by the computed wait and flush.
+        time::advance(wait2).await;
+        task::yield_now().await;
+        manager.send_flush(msg2).await;
+        assert!(receiver.try_recv().is_ok(), "second packet should arrive after the pacing delay");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_pacing_does_not_delay_on_high_bandwidth_link() {
+        let mut manager = InterfaceManager::new(4);
+        // 10 Mbps – typical fast link, no meaningful pacing needed.
+        let bitrate = 10_000_000.0;
+        let channel = manager.new_channel_with_pacer(
+            4, None, false, None, None, Some(bitrate),
+        );
+        let iface = channel.address;
+        let mut receiver = channel.tx_channel;
+
+        time::advance(Duration::from_secs(10)).await;
+        task::yield_now().await;
+
+        for i in 0..5 {
+            let msg = data_tx(iface, 100);
+            let wait = manager.send_pacing_delay(&msg).await;
+            // For 10 Mbps, the computed interval is ~200 µs – well below
+            // any meaningful threshold.  We accept anything < 1 ms.
+            assert!(
+                wait < Duration::from_millis(1),
+                "high-bandwidth link should produce negligible pacing delay, got {wait:?} for packet {i}",
+            );
+            manager.send_flush(msg).await;
+            assert!(receiver.try_recv().is_ok(), "packet {i} should arrive immediately on fast link");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_pacing_interval_scales_with_packet_size() {
+        let mut manager = InterfaceManager::new(4);
+        let bitrate = 1_000.0;
+        let channel = manager.new_channel_with_pacer(
+            4, None, false, None, None, Some(bitrate),
+        );
+        let iface = channel.address;
+
+        time::advance(Duration::from_secs(10)).await;
+        task::yield_now().await;
+
+        // First packet (small) after advancing time: no delay.
+        let msg_small = data_tx(iface, 10);
+        let wait_small = manager.send_pacing_delay(&msg_small).await;
+        assert_eq!(wait_small, Duration::ZERO, "first packet after idle should not be delayed");
+
+        // Flush the small packet, then immediately send a large one.
+        manager.send_flush(msg_small).await;
+
+        let msg_large = data_tx(iface, 500);
+        let wait_large = manager.send_pacing_delay(&msg_large).await;
+        let interval_large = expected_data_interval(bitrate, 500);
+        let tolerance = Duration::from_millis(50);
+        assert!(
+            wait_large >= interval_large.saturating_sub(tolerance)
+                && wait_large <= interval_large + tolerance,
+            "large packet wait {wait_large:?} should be ≈ {interval_large:?}",
+        );
+        assert!(
+            wait_large > wait_small,
+            "larger payload should produce a longer pacing interval ({} > {})",
+            wait_large.as_micros(),
+            wait_small.as_micros(),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_pacing_skipped_when_bitrate_is_not_set() {
+        let mut manager = InterfaceManager::new(4);
+        // No bitrate → no data pacing.
+        let channel = manager.new_channel(4);
+        let iface = channel.address;
+        let mut receiver = channel.tx_channel;
+
+        time::advance(Duration::from_secs(10)).await;
+        task::yield_now().await;
+
+        for i in 0..5 {
+            let msg = data_tx(iface, 100);
+            let wait = manager.send_pacing_delay(&msg).await;
+            assert_eq!(
+                wait,
+                Duration::ZERO,
+                "no pacing when bitrate is absent (packet {i})",
+            );
+            manager.send_flush(msg).await;
+            assert!(receiver.try_recv().is_ok());
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
