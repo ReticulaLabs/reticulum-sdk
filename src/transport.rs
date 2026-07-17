@@ -4083,6 +4083,7 @@ async fn manage_transport(
                         }
 
                         let transport_name = handler.config.name.clone();
+                        let link_fwd_max = handler.link_table.forward_stats();
                         let active_ifaces: HashSet<AddressHash> = handler
                             .send_ctx
                             .iface_manager
@@ -4112,6 +4113,14 @@ async fn manage_transport(
                                     iface_q.last_pacing_interval_us,
                                 );
                             }
+                        }
+                        if link_fwd_max.0 > 0 {
+                            log::trace!(
+                                "tp({}): link_table forwards total={} max_per_link={}",
+                                transport_name,
+                                link_fwd_max.1,
+                                link_fwd_max.0,
+                            );
                         }
 
                         send_ctx

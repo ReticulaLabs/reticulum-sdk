@@ -14,6 +14,8 @@ pub struct LinkEntry {
     pub taken_hops: u8,
     pub remaining_hops: u8,
     pub validated: bool,
+    /// Cumulative number of data packets forwarded through this link entry.
+    pub forward_count: u64,
 }
 
 fn propagate(packet: &Packet, iface: AddressHash) -> (Packet, AddressHash) {
@@ -69,6 +71,7 @@ impl LinkTable {
             taken_hops,
             remaining_hops,
             validated: false,
+            forward_count: 0,
         };
 
         self.0.insert(link_id, entry);
@@ -187,6 +190,7 @@ impl LinkTable {
                 iface,
             );
             entry.timestamp = Instant::now();
+            entry.forward_count += 1;
             propagate(packet, iface)
         })
     }
@@ -213,17 +217,33 @@ impl LinkTable {
         }
     }
 
+    /// Returns the maximum forward count across all validated entries,
+    /// and the total number of forwards. Useful for detecting links
+    /// with unusually high forwarding activity.
+    pub fn forward_stats(&self) -> (u64, u64) {
+        let mut max_fwd = 0u64;
+        let mut total_fwd = 0u64;
+        for entry in self.0.values() {
+            if entry.validated {
+                max_fwd = max_fwd.max(entry.forward_count);
+                total_fwd += entry.forward_count;
+            }
+        }
+        (max_fwd, total_fwd)
+    }
+
     pub fn remove_stale(&mut self, max_age: Duration) {
         let mut stale = vec![];
         let now = Instant::now();
 
         for (link_id, entry) in &self.0 {
-            if entry.validated {
+                if entry.validated {
                 if entry.timestamp + max_age <= now {
                     log::debug!(
-                        "link_table: remove stale validated entry for link {} (idle for {}s)",
+                        "link_table: remove stale validated entry for link {} (idle for {}s, forwarded {}x)",
                         link_id,
                         now.duration_since(entry.timestamp).as_secs(),
+                        entry.forward_count,
                     );
                     stale.push(link_id.clone());
                 }
