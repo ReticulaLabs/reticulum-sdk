@@ -178,11 +178,12 @@ impl AnnounceTable {
         destination: AddressHash,
         to_iface: AddressHash,
         hops: u8,
+        grace: Duration,
     ) {
         response.retries = 0;
         response.local_rebroadcasts = 0;
         response.hops = hops;
-        response.timeout = Instant::now() + random_rw_jitter();
+        response.timeout = Instant::now() + grace + random_rw_jitter();
         response.response_to_iface = Some(to_iface);
 
         self.responses.insert(destination, response);
@@ -193,14 +194,15 @@ impl AnnounceTable {
         destination: AddressHash,
         to_iface: AddressHash,
         hops: u8,
+        grace: Duration,
     ) -> bool {
         if let Some(entry) = self.map.get(&destination) {
-            self.do_add_response(entry.clone(), destination, to_iface, hops);
+            self.do_add_response(entry.clone(), destination, to_iface, hops, grace);
             return true;
         }
 
         if let Some(entry) = self.cache.get(&destination) {
-            self.do_add_response(entry.clone(), destination, to_iface, hops);
+            self.do_add_response(entry.clone(), destination, to_iface, hops, grace);
             return true;
         }
 

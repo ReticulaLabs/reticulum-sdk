@@ -298,6 +298,96 @@ fn ingress_freq(deque: &VecDeque<Instant>, now: Instant) -> f64 {
     n as f64 / span_s
 }
 
+/// Select the ingress frequency threshold based on the interface age.
+/// New interfaces (age < INGRESS_NEW_TIME_S) get a lower threshold.
+fn ingress_threshold(created_at: Instant, new_threshold: f64, mature_threshold: f64) -> f64 {
+    if Instant::now().duration_since(created_at) < Duration::from_secs(INGRESS_NEW_TIME_S) {
+        new_threshold
+    } else {
+        mature_threshold
+    }
+}
+
+/// Shared ingress burst recording logic for both announces and path requests.
+/// Records a timestamp, computes frequency, evaluates burst state, and returns
+/// `true` if the packet should be dropped.
+#[allow(clippy::too_many_arguments)]
+fn ingress_record_impl(
+    freq_deque: &std::sync::Mutex<VecDeque<Instant>>,
+    burst_active: &std::sync::Mutex<bool>,
+    burst_activated: &std::sync::Mutex<Instant>,
+    created_at: Instant,
+    new_threshold: f64,
+    mature_threshold: f64,
+) -> bool {
+    let now = Instant::now();
+
+    let mut deque = freq_deque.lock().unwrap();
+    deque.push_back(now);
+    if deque.len() > INGRESS_FREQ_SAMPLES {
+        deque.pop_front();
+    }
+
+    let freq = ingress_freq(&deque, now);
+    let threshold = ingress_threshold(created_at, new_threshold, mature_threshold);
+
+    let mut burst_active = burst_active.lock().unwrap();
+    let mut burst_activated = burst_activated.lock().unwrap();
+
+    if *burst_active {
+        if freq < threshold
+            && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
+            && deque.len() >= INGRESS_BURST_MIN_SAMPLES
+        {
+            *burst_active = false;
+            return false;
+        }
+        true
+    } else {
+        if freq > threshold {
+            *burst_active = true;
+            *burst_activated = now;
+            return true;
+        }
+        false
+    }
+}
+
+/// Shared ingress burst evaluation for periodic cleanup.
+fn ingress_evaluate_impl(
+    freq_deque: &std::sync::Mutex<VecDeque<Instant>>,
+    burst_active: &std::sync::Mutex<bool>,
+    burst_activated: &std::sync::Mutex<Instant>,
+    created_at: Instant,
+    new_threshold: f64,
+    mature_threshold: f64,
+) {
+    let now = Instant::now();
+    let deque = freq_deque.lock().unwrap();
+    let freq = ingress_freq(&deque, now);
+    let threshold = ingress_threshold(created_at, new_threshold, mature_threshold);
+    drop(deque);
+
+    let mut burst_active = burst_active.lock().unwrap();
+    let mut burst_activated = burst_activated.lock().unwrap();
+
+    if *burst_active {
+        if freq < threshold
+            && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
+        {
+            let deque = freq_deque.lock().unwrap();
+            if deque.len() >= INGRESS_BURST_MIN_SAMPLES {
+                *burst_active = false;
+            }
+        }
+    } else {
+        if freq > threshold {
+            *burst_active = true;
+            *burst_activated = now;
+        }
+    }
+}
+
 struct LocalInterface {
     address: AddressHash,
     tx_send: InterfaceTxSender,
@@ -327,6 +417,9 @@ struct LocalInterface {
     last_pacing_interval_us: AtomicU64,
 
     // --- Ingress burst limiting state ---
+    /// When this interface was created, used to distinguish new vs established
+    /// interfaces for ingress burst threshold selection.
+    ingress_created_at: Instant,
     /// Timestamps of recently received announces for frequency tracking.
     ia_freq_deque: std::sync::Mutex<VecDeque<Instant>>,
     /// Timestamps of recently received path requests for frequency tracking.
@@ -516,13 +609,24 @@ async fn process_announce_queue(
                 continue;
             }
 
-            match state.announce_queue.pop_front() {
-                Some(dest) => {
-                    if let Some(message) = state.announce_data.remove(&dest) {
-                        if let Some(wait_time) = pacer.wait_time(&message.packet) {
-                            state.announce_allowed_at = now + wait_time;
+            // Pop the queued announce with the lowest hop count,
+            // matching Python's hop-prioritized announce queue.
+            let min_idx = state.announce_queue.iter().enumerate().filter_map(|(i, dest)| {
+                state.announce_data.get(dest).map(|msg| (i, msg.packet.header.hops))
+            }).min_by_key(|&(_, hops)| hops);
+
+            match min_idx {
+                Some((idx, _)) => {
+                    if let Some(dest) = state.announce_queue.remove(idx) {
+                        if let Some(message) = state.announce_data.remove(&dest) {
+                            if let Some(wait_time) = pacer.wait_time(&message.packet) {
+                                state.announce_allowed_at = now + wait_time;
+                            }
+                            Some(message)
+                        } else {
+                            state.timer_active = false;
+                            None
                         }
-                        Some(message)
                     } else {
                         state.timer_active = false;
                         None
@@ -640,6 +744,7 @@ impl InterfaceManager {
             ifac_config: ifac_config.clone(),
             bitrate,
             mode,
+            ingress_created_at: Instant::now(),
             last_data_send: std::sync::Mutex::new(Instant::now()),
             packets_tx: AtomicU64::new(0),
             pacing_wait_us: AtomicU64::new(0),
@@ -786,42 +891,14 @@ impl InterfaceManager {
             return false;
         }
 
-        // Track the timestamp
-        let now = Instant::now();
-        let mut deque = iface.ia_freq_deque.lock().unwrap();
-        deque.push_back(now);
-        if deque.len() > INGRESS_FREQ_SAMPLES {
-            deque.pop_front();
-        }
-
-        // Compute frequency
-        let freq = ingress_freq(&deque, now);
-
-        // Evaluate burst state
-        let mut burst_active = iface.ingress_burst_active.lock().unwrap();
-        let mut burst_activated = iface.ingress_burst_activated.lock().unwrap();
-
-        if *burst_active {
-            // Already limiting: check if we can deactivate
-            let freq_threshold = INGRESS_BURST_FREQ; // conservative: always use established threshold
-            if freq < freq_threshold
-                && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
-                && deque.len() >= INGRESS_BURST_MIN_SAMPLES
-            {
-                *burst_active = false;
-                return false;
-            }
-            return true; // actively limiting
-        } else {
-            // Not limiting yet: check if threshold is crossed
-            let freq_threshold = INGRESS_BURST_FREQ;
-            if freq > freq_threshold {
-                *burst_active = true;
-                *burst_activated = now;
-                return true; // start limiting
-            }
-            return false;
-        }
+        ingress_record_impl(
+            &iface.ia_freq_deque,
+            &iface.ingress_burst_active,
+            &iface.ingress_burst_activated,
+            iface.ingress_created_at,
+            INGRESS_BURST_FREQ_NEW,
+            INGRESS_BURST_FREQ,
+        )
     }
 
     /// Record an incoming path request on an interface and return `true`
@@ -835,93 +912,41 @@ impl InterfaceManager {
             return false;
         }
 
-        let now = Instant::now();
-        let mut deque = iface.ip_freq_deque.lock().unwrap();
-        deque.push_back(now);
-        if deque.len() > INGRESS_FREQ_SAMPLES {
-            deque.pop_front();
-        }
-
-        let freq = ingress_freq(&deque, now);
-
-        let mut burst_active = iface.ingress_pr_burst_active.lock().unwrap();
-        let mut burst_activated = iface.ingress_pr_burst_activated.lock().unwrap();
-
-        if *burst_active {
-            let freq_threshold = INGRESS_PR_BURST_FREQ;
-            if freq < freq_threshold
-                && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
-                && deque.len() >= INGRESS_BURST_MIN_SAMPLES
-            {
-                *burst_active = false;
-                return false;
-            }
-            return true;
-        } else {
-            let freq_threshold = INGRESS_PR_BURST_FREQ;
-            if freq > freq_threshold {
-                *burst_active = true;
-                *burst_activated = now;
-                return true;
-            }
-            return false;
-        }
+        ingress_record_impl(
+            &iface.ip_freq_deque,
+            &iface.ingress_pr_burst_active,
+            &iface.ingress_pr_burst_activated,
+            iface.ingress_created_at,
+            INGRESS_PR_BURST_FREQ_NEW,
+            INGRESS_PR_BURST_FREQ,
+        )
     }
 
     /// Evaluate and update ingress burst state for all interfaces.
     /// Should be called periodically (e.g. every ~10 seconds).
     pub fn ingress_evaluate_all(&self) {
-        let now = Instant::now();
         for iface in &self.ifaces {
             if iface.stop.is_cancelled() || iface.bitrate.is_none() {
                 continue;
             }
 
-            // Announce burst
-            {
-                let deque = iface.ia_freq_deque.lock().unwrap();
-                let freq = ingress_freq(&deque, now);
-                let mut burst_active = iface.ingress_burst_active.lock().unwrap();
-                let mut burst_activated = iface.ingress_burst_activated.lock().unwrap();
-                let freq_threshold = INGRESS_BURST_FREQ;
+            ingress_evaluate_impl(
+                &iface.ia_freq_deque,
+                &iface.ingress_burst_active,
+                &iface.ingress_burst_activated,
+                iface.ingress_created_at,
+                INGRESS_BURST_FREQ_NEW,
+                INGRESS_BURST_FREQ,
+            );
 
-                if *burst_active {
-                    if freq < freq_threshold
-                        && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
-                        && deque.len() >= INGRESS_BURST_MIN_SAMPLES
-                    {
-                        *burst_active = false;
-                    }
-                } else {
-                    if freq > freq_threshold {
-                        *burst_active = true;
-                        *burst_activated = now;
-                    }
-                }
-            }
-
-            // PR burst
-            {
-                let deque = iface.ip_freq_deque.lock().unwrap();
-                let freq = ingress_freq(&deque, now);
-                let mut burst_active = iface.ingress_pr_burst_active.lock().unwrap();
-                let mut burst_activated = iface.ingress_pr_burst_activated.lock().unwrap();
-                let freq_threshold = INGRESS_PR_BURST_FREQ;
-
-                if *burst_active {
-                    if freq < freq_threshold
-                        && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
-                        && deque.len() >= INGRESS_BURST_MIN_SAMPLES
-                    {
-                        *burst_active = false;
-                    }
-                } else {
-                    if freq > freq_threshold {
-                        *burst_active = true;
-                        *burst_activated = now;
-                    }
-                }
-            }
+            ingress_evaluate_impl(
+                &iface.ip_freq_deque,
+                &iface.ingress_pr_burst_active,
+                &iface.ingress_pr_burst_activated,
+                iface.ingress_created_at,
+                INGRESS_PR_BURST_FREQ_NEW,
+                INGRESS_PR_BURST_FREQ,
+            );
         }
     }
 

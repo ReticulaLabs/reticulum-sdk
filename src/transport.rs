@@ -108,6 +108,8 @@ const INTERVAL_KEEP_REVERSE_PATH: Duration = Duration::from_secs(8 * 60);
 const INTERVAL_PATH_TABLE_CULL: Duration = Duration::from_secs(30);
 
 const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
+const PATH_REQUEST_GRACE: Duration = Duration::from_millis(400);
+const PATH_REQUEST_RG: Duration = Duration::from_millis(1500);
 
 // Interface mode path expiry times (matching Python Reticulum):
 // Full / Gateway / Boundary / Internal / PointToPoint → 1 week
@@ -3330,16 +3332,24 @@ async fn handle_path_request(
                     }
                 }
 
+                let mut grace = PATH_REQUEST_GRACE;
+                if handler.send_ctx.iface_manager.lock().await.interface_mode(&iface)
+                    == crate::iface::InterfaceMode::Roaming
+                {
+                    grace += PATH_REQUEST_RG;
+                }
+
                 if handler
                     .announce_table
-                    .add_response(request.destination, iface, hops)
+                    .add_response(request.destination, iface, hops, grace)
                 {
                     log::trace!(
-                        "tp({}): scheduled remote path response to {} ({} hops) over {}",
+                        "tp({}): scheduled remote path response to {} ({} hops) over {} with {}ms grace",
                         handler.config.name,
                         request.destination,
                         hops,
-                        iface
+                        iface,
+                        grace.as_millis(),
                     );
 
                     return;
