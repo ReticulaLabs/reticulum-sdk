@@ -209,6 +209,10 @@ struct LocalInterface {
     /// Interface Access Code configuration. When set, outbound packets
     /// will have an Ed25519 IFAC signature attached before transmission.
     ifac_config: Option<IfacConfig>,
+    /// Interface bitrate in bps, used for data pacing on slow links.
+    bitrate: Option<f64>,
+    /// Timestamp of the last data packet send, used for inter-packet pacing.
+    last_data_send: std::sync::Mutex<Instant>,
 }
 
 #[derive(Clone)]
@@ -467,7 +471,7 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false, None, None)
+        self.new_channel_with_pacer(tx_cap, None, false, None, None, None)
     }
 
     fn new_channel_with_pacer(
@@ -477,6 +481,7 @@ impl InterfaceManager {
         shared_instance_client: bool,
         hw_mtu: Option<Arc<AtomicUsize>>,
         ifac_config: Option<IfacConfig>,
+        bitrate: Option<f64>,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -502,6 +507,8 @@ impl InterfaceManager {
             shared_instance_client,
             hw_mtu,
             ifac_config: ifac_config.clone(),
+            bitrate,
+            last_data_send: std::sync::Mutex::new(Instant::now()),
         });
 
         InterfaceChannel {
@@ -542,6 +549,7 @@ impl InterfaceManager {
             shared_instance_client,
             hw_mtu,
             None,
+            configured_bitrate(bitrate.unwrap_or(0.0)),
         );
 
         let inner = Arc::new(Mutex::new(inner));
@@ -690,6 +698,63 @@ impl InterfaceManager {
                         )
                         .await;
                 } else {
+                    // Pace data/link packets on slow interfaces to avoid
+                    // flooding the radio with packets faster than it can
+                    // transmit. The minimum interval between packets is
+                    // derived from the interface bitrate plus a safety
+                    // margin to account for LoRa preamble, CRC, KISS
+                    // framing, and CSMA overhead.
+                    if let Some(bitrate) = iface.bitrate {
+                        if bitrate > 0.0 {
+                            // Estimate on-air packet size: header (2 bytes)
+                            // + optional transport address (Type2 only)
+                            // + destination + context + payload.
+                            let transport_size = if message.packet.header.header_type
+                                == HeaderType::Type2
+                            {
+                                ADDRESS_HASH_SIZE
+                            } else {
+                                0
+                            };
+                            let packet_len = 2
+                                + transport_size
+                                + ADDRESS_HASH_SIZE
+                                + 1
+                                + message.packet.data.len();
+                            let tx_time =
+                                (packet_len as f64 * 8.0) / bitrate;
+                            // 2.0x margin accounts for LoRa preamble
+                            // (~135ms), CRC, coding artefacts, and CSMA
+                            // contention that the raw bitrate formula
+                            // does not capture.
+                            let min_interval = Duration::from_secs_f64(
+                                tx_time * 2.0,
+                            );
+
+                            let wait = {
+                                let mut last_send = iface
+                                    .last_data_send
+                                    .lock()
+                                    .unwrap();
+                                let now = Instant::now();
+                                let deadline =
+                                    *last_send + min_interval;
+                                if now >= deadline {
+                                    *last_send = now;
+                                    Duration::ZERO
+                                } else {
+                                    let remaining = deadline - now;
+                                    *last_send = deadline;
+                                    remaining
+                                }
+                            };
+
+                            if wait > Duration::ZERO {
+                                time::sleep(wait).await;
+                            }
+                        }
+                    }
+
                     send_or_drop(&iface.tx_send, message, Some(&iface.saturated_queue_logger))
                         .await;
                 }
@@ -765,7 +830,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -877,7 +942,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -902,7 +967,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;

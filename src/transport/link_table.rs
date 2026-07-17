@@ -117,7 +117,15 @@ impl LinkTable {
         }
 
         let outbound_iface = if entry.next_hop_iface == entry.received_from {
-            if packet.header.hops == entry.remaining_hops || packet.header.hops == entry.taken_hops
+            if entry.next_hop_iface == received_on {
+                log::trace!(
+                    "link_table: skipping forward link data {} to iface {} (same as received_on)",
+                    packet.destination,
+                    received_on,
+                );
+                None
+            } else if packet.header.hops == entry.remaining_hops
+                || packet.header.hops == entry.taken_hops
             {
                 Some(entry.next_hop_iface)
             } else {
