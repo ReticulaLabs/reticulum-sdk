@@ -762,7 +762,14 @@ impl Transport {
         };
         let mut single_in_destinations = HashMap::new();
         let probe_destination = probe_destination.map(|(address_hash, destination)| {
-            single_in_destinations.insert(address_hash, destination);
+            single_in_destinations.insert(address_hash, destination.clone());
+            // Register local destination so interface-mode filtering
+            // exempts it (matching Python's local_destination check).
+            let cloned = iface_manager.clone();
+            let hash = address_hash;
+            tokio::task::spawn(async move {
+                cloned.lock().await.add_local_destination(hash);
+            });
             address_hash
         });
         let probe_destination = probe_destination

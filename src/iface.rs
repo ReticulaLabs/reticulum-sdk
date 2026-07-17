@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task;
@@ -253,6 +253,14 @@ pub trait Interface {
         DEFAULT_ANNOUNCE_CAP
     }
 
+    /// Whether announces received on an Internal-mode interface should be
+    /// forwarded through this interface.  When `false`, announces originating
+    /// from an Internal-mode interface are blocked.  Defaults to `true`.
+    /// Matches Python's `Interface.announces_from_internal`.
+    fn announces_from_internal(&self) -> bool {
+        true
+    }
+
     /// Whether this interface should auto-size its HW_MTU from the bitrate
     /// and participate in link MTU discovery / upgrades.
     fn autoconfigure_mtu(&self) -> bool {
@@ -407,6 +415,9 @@ struct LocalInterface {
     /// Interface mode controlling announce propagation, path expiry
     /// and discovery behaviour.
     mode: InterfaceMode,
+    /// Whether announces from Internal-mode interfaces are forwarded
+    /// through this interface.  Matches Python's `announces_from_internal`.
+    announces_from_internal: bool,
     /// Timestamp of the last data packet send, used for inter-packet pacing.
     last_data_send: std::sync::Mutex<Instant>,
     /// Cumulative number of data packets sent through this interface.
@@ -688,6 +699,9 @@ pub struct InterfaceManager {
     rx_send: InterfaceRxSender,
     cancel: CancellationToken,
     ifaces: Vec<LocalInterface>,
+    /// Set of destination hashes that are registered locally on this node.
+    /// Used to exempt local destinations from interface-mode filtering.
+    local_destinations: HashSet<AddressHash>,
 }
 
 impl InterfaceManager {
@@ -701,11 +715,12 @@ impl InterfaceManager {
             rx_send,
             cancel: CancellationToken::new(),
             ifaces: Vec::new(),
+            local_destinations: HashSet::new(),
         }
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, InterfaceMode::Full)
+        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, InterfaceMode::Full, true)
     }
 
     fn new_channel_with_pacer(
@@ -717,6 +732,7 @@ impl InterfaceManager {
         ifac_config: Option<IfacConfig>,
         bitrate: Option<f64>,
         mode: InterfaceMode,
+        announces_from_internal: bool,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -744,6 +760,7 @@ impl InterfaceManager {
             ifac_config: ifac_config.clone(),
             bitrate,
             mode,
+            announces_from_internal,
             ingress_created_at: Instant::now(),
             last_data_send: std::sync::Mutex::new(Instant::now()),
             packets_tx: AtomicU64::new(0),
@@ -791,6 +808,7 @@ impl InterfaceManager {
             None
         };
         let mode = inner.interface_mode();
+        let announces_from_internal = inner.announces_from_internal();
         let channel = self.new_channel_with_pacer(
             DEFAULT_INTERFACE_TX_QUEUE_CAP,
             announce_pacer,
@@ -799,6 +817,7 @@ impl InterfaceManager {
             None,
             configured_bitrate(bitrate.unwrap_or(0.0)),
             mode,
+            announces_from_internal,
         );
 
         let inner = Arc::new(Mutex::new(inner));
@@ -999,6 +1018,24 @@ impl InterfaceManager {
         }
     }
 
+    /// Register a destination hash as locally owned.  Local destinations
+    /// are exempt from certain interface-mode announce filtering rules
+    /// (matching Python's `local_destination` check in `Transport.outbound()`).
+    pub fn add_local_destination(&mut self, hash: AddressHash) {
+        self.local_destinations.insert(hash);
+    }
+
+    /// Unregister a previously registered local destination hash.
+    pub fn remove_local_destination(&mut self, hash: &AddressHash) {
+        self.local_destinations.remove(hash);
+    }
+
+    /// Returns `true` if the given destination hash is registered as a
+    /// local destination on this node.
+    pub fn is_local_destination(&self, hash: &AddressHash) -> bool {
+        self.local_destinations.contains(hash)
+    }
+
     /// Return the interface mode for the given interface address, or
     /// `InterfaceMode::Full` if the interface is not found or cancelled.
     pub fn interface_mode(&self, address: &AddressHash) -> InterfaceMode {
@@ -1154,28 +1191,54 @@ impl InterfaceManager {
             // Interface mode-based announce propagation filtering.
             // Matches Python RNS/Transport.py outbound() lines 1207-1264.
             if AnnouncePacer::should_pace(&message) {
+                let is_local = self.is_local_destination(&message.packet.destination);
                 let source_mode = match &message.tx_type {
                     TxMessageType::Broadcast(Some(addr)) => Some(self.interface_mode(addr)),
                     _ => None,
                 };
 
-                match iface.mode {
-                    InterfaceMode::AccessPoint => {
-                        log::trace!("iface: blocking announce on AP iface {}", iface.address);
+                // Python: "elif not local_destination and interface.announces_from_internal == False
+                //          and from_interface.mode == MODE_INTERNAL: block"
+                // This filter applies on ANY outgoing interface (regardless of its own mode)
+                // when the announce originated on an Internal-mode interface.
+                if !is_local
+                    && !iface.announces_from_internal
+                    && source_mode == Some(InterfaceMode::Internal)
+                {
+                    log::trace!(
+                        "iface: blocking announce on {} from internal-mode iface",
+                        iface.address,
+                    );
+                    continue;
+                }
+
+                // Python: "elif interface.mode == MODE_ACCESS_POINT: block"
+                if iface.mode == InterfaceMode::AccessPoint {
+                    log::trace!("iface: blocking announce on AP iface {}", iface.address);
+                    continue;
+                }
+
+                // Python: "elif not local_destination and interface.mode == MODE_INTERNAL:"
+                if !is_local && iface.mode == InterfaceMode::Internal {
+                    // Block if source interface mode is Boundary (Python line 1233:
+                    // "if from_interface.mode == MODE_BOUNDARY: should_transmit = False")
+                    // In the Rust code, Broadcast(None) always means a locally-originated
+                    // announce (hops == 0) so it never reaches this path.
+                    if source_mode == Some(InterfaceMode::Boundary) {
+                        log::trace!(
+                            "iface: blocking announce on internal iface {} from boundary-mode iface",
+                            iface.address,
+                        );
                         continue;
                     }
-                    InterfaceMode::Internal => {
-                        let blocked = !matches!(source_mode, Some(InterfaceMode::Boundary));
-                        if blocked {
-                            log::trace!(
-                                "iface: blocking announce on internal iface {} from {:?}",
-                                iface.address,
-                                source_mode,
-                            );
-                            continue;
-                        }
-                    }
-                    InterfaceMode::Roaming => {
+                }
+
+                // Python: "elif interface.mode == MODE_ROAMING:"
+                if iface.mode == InterfaceMode::Roaming {
+                    if is_local {
+                        // Python: "if local_destination != None: pass" → allow
+                    } else {
+                        // Python: block if source is Roaming or Boundary
                         let blocked = matches!(
                             source_mode,
                             Some(InterfaceMode::Roaming) | Some(InterfaceMode::Boundary)
@@ -1189,19 +1252,26 @@ impl InterfaceManager {
                             continue;
                         }
                     }
-                    InterfaceMode::Boundary => {
-                        let blocked = matches!(source_mode, Some(InterfaceMode::Roaming));
-                        if blocked {
+                }
+
+                // Python: "elif interface.mode == MODE_BOUNDARY:"
+                if iface.mode == InterfaceMode::Boundary {
+                    if is_local {
+                        // Python: "if local_destination != None: pass" → allow
+                    } else {
+                        // Python: block if source is Roaming
+                        if source_mode == Some(InterfaceMode::Roaming) {
                             log::trace!(
-                                "iface: blocking announce on boundary iface {} from {:?}",
+                                "iface: blocking announce on boundary iface {} from roaming-mode iface",
                                 iface.address,
-                                source_mode,
                             );
                             continue;
                         }
                     }
-                    _ => {}
                 }
+
+                // Full / PointToPoint / Gateway fall through to normal
+                // announce pacing and cap-based queuing below.
             }
 
             let mut message = message.clone();
@@ -1342,7 +1412,7 @@ mod tests {
         // 1 kbps link – realistic for LoRa at SF11/BW250
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full,
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true,
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1389,7 +1459,7 @@ mod tests {
         // 10 Mbps – typical fast link, no meaningful pacing needed.
         let bitrate = 10_000_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full,
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true,
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1416,7 +1486,7 @@ mod tests {
         let mut manager = InterfaceManager::new(4);
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full,
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true,
         );
         let iface = channel.address;
 
@@ -1476,7 +1546,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -1588,7 +1658,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -1613,7 +1683,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;
