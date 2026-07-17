@@ -261,6 +261,10 @@ impl Interface for BackboneServer {
     fn autoconfigure_mtu(&self) -> bool {
         true
     }
+
+    fn supports_discovery(&self) -> bool {
+        true
+    }
 }
 
 /// Per-connection client handler for the BackboneInterface.
