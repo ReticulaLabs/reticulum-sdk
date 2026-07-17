@@ -189,6 +189,45 @@ impl InterfaceChannel {
     }
 }
 
+/// Interface modes control how Reticulum handles announce propagation,
+/// path discovery and path expiry for a given interface.  These match
+/// the modes defined in the Python Reticulum reference implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceMode {
+    /// Default mode.  All discovery, meshing and transport functionality
+    /// is available.  Paths have the standard expiry time (1 week).
+    Full = 0x01,
+    /// Intended for interfaces with exactly one reachable peer.
+    PointToPoint = 0x02,
+    /// Network access point.  Announces are not automatically broadcast
+    /// on this interface, and paths have a shorter expiry time (1 day).
+    AccessPoint = 0x03,
+    /// Roaming (physically mobile) interface.  Paths have a shorter
+    /// expiry time (6 hours).
+    Roaming = 0x04,
+    /// Connects to network segments that are significantly different
+    /// from the local one (e.g. a high-speed Internet link from a
+    /// LoRa-based network).  Affects announce propagation rules.
+    Boundary = 0x05,
+    /// Gateway interface that actively discovers unknown paths on
+    /// behalf of nodes connected via this interface.
+    Gateway = 0x06,
+    /// Internal interface – part of a network distinct from any
+    /// `Boundary` interface.  Affects announce propagation rules.
+    Internal = 0x07,
+}
+
+impl InterfaceMode {
+    /// Which interface modes a transport node should actively discover
+    /// paths for (matching Python's `DISCOVER_PATHS_FOR`).
+    pub const DISCOVER_PATHS_FOR: &'static [InterfaceMode] = &[
+        InterfaceMode::AccessPoint,
+        InterfaceMode::Gateway,
+        InterfaceMode::Roaming,
+        InterfaceMode::Internal,
+    ];
+}
+
 pub trait Interface {
     fn hw_mtu(&self) -> usize;
 
@@ -202,6 +241,12 @@ pub trait Interface {
 
     fn bitrate(&self) -> Option<f64> {
         None
+    }
+
+    /// The interface mode, which controls announce propagation,
+    /// path expiry and discovery behaviour.
+    fn interface_mode(&self) -> InterfaceMode {
+        InterfaceMode::Full
     }
 
     fn announce_cap(&self) -> f64 {
@@ -269,6 +314,9 @@ struct LocalInterface {
     ifac_config: Option<IfacConfig>,
     /// Interface bitrate in bps, used for data pacing on slow links.
     bitrate: Option<f64>,
+    /// Interface mode controlling announce propagation, path expiry
+    /// and discovery behaviour.
+    mode: InterfaceMode,
     /// Timestamp of the last data packet send, used for inter-packet pacing.
     last_data_send: std::sync::Mutex<Instant>,
     /// Cumulative number of data packets sent through this interface.
@@ -553,7 +601,7 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false, None, None, None)
+        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, InterfaceMode::Full)
     }
 
     fn new_channel_with_pacer(
@@ -564,6 +612,7 @@ impl InterfaceManager {
         hw_mtu: Option<Arc<AtomicUsize>>,
         ifac_config: Option<IfacConfig>,
         bitrate: Option<f64>,
+        mode: InterfaceMode,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -590,6 +639,7 @@ impl InterfaceManager {
             hw_mtu,
             ifac_config: ifac_config.clone(),
             bitrate,
+            mode,
             last_data_send: std::sync::Mutex::new(Instant::now()),
             packets_tx: AtomicU64::new(0),
             pacing_wait_us: AtomicU64::new(0),
@@ -635,6 +685,7 @@ impl InterfaceManager {
         } else {
             None
         };
+        let mode = inner.interface_mode();
         let channel = self.new_channel_with_pacer(
             DEFAULT_INTERFACE_TX_QUEUE_CAP,
             announce_pacer,
@@ -642,6 +693,7 @@ impl InterfaceManager {
             hw_mtu,
             None,
             configured_bitrate(bitrate.unwrap_or(0.0)),
+            mode,
         );
 
         let inner = Arc::new(Mutex::new(inner));
@@ -1184,7 +1236,7 @@ mod tests {
         // 1 kbps link – realistic for LoRa at SF11/BW250
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate),
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full,
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1231,7 +1283,7 @@ mod tests {
         // 10 Mbps – typical fast link, no meaningful pacing needed.
         let bitrate = 10_000_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate),
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full,
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1258,7 +1310,7 @@ mod tests {
         let mut manager = InterfaceManager::new(4);
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate),
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full,
         );
         let iface = channel.address;
 
@@ -1318,7 +1370,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -1430,7 +1482,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -1455,7 +1507,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full);
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;
