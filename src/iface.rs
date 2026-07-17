@@ -1126,12 +1126,57 @@ impl InterfaceManager {
                 continue;
             }
 
-            // Interface mode filtering: Access Point interfaces do not
-            // rebroadcast announces (they only originate their own).
-            if iface.mode == InterfaceMode::AccessPoint
-                && AnnouncePacer::should_pace(&message)
-            {
-                continue;
+            // Interface mode-based announce propagation filtering.
+            // Matches Python RNS/Transport.py outbound() lines 1207-1264.
+            if AnnouncePacer::should_pace(&message) {
+                let source_mode = match &message.tx_type {
+                    TxMessageType::Broadcast(Some(addr)) => Some(self.interface_mode(addr)),
+                    _ => None,
+                };
+
+                match iface.mode {
+                    InterfaceMode::AccessPoint => {
+                        log::trace!("iface: blocking announce on AP iface {}", iface.address);
+                        continue;
+                    }
+                    InterfaceMode::Internal => {
+                        let blocked = !matches!(source_mode, Some(InterfaceMode::Boundary));
+                        if blocked {
+                            log::trace!(
+                                "iface: blocking announce on internal iface {} from {:?}",
+                                iface.address,
+                                source_mode,
+                            );
+                            continue;
+                        }
+                    }
+                    InterfaceMode::Roaming => {
+                        let blocked = matches!(
+                            source_mode,
+                            Some(InterfaceMode::Roaming) | Some(InterfaceMode::Boundary)
+                        );
+                        if blocked {
+                            log::trace!(
+                                "iface: blocking announce on roaming iface {} from {:?}",
+                                iface.address,
+                                source_mode,
+                            );
+                            continue;
+                        }
+                    }
+                    InterfaceMode::Boundary => {
+                        let blocked = matches!(source_mode, Some(InterfaceMode::Roaming));
+                        if blocked {
+                            log::trace!(
+                                "iface: blocking announce on boundary iface {} from {:?}",
+                                iface.address,
+                                source_mode,
+                            );
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             let mut message = message.clone();

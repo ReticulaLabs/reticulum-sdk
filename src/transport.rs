@@ -3169,12 +3169,18 @@ is_path_response={}",
             .announce_table
             .add(packet, packet.destination, iface);
 
+        let path_expiry = handler
+            .send_ctx
+            .iface_manager
+            .lock()
+            .await
+            .path_expiry_for_iface(&iface);
         handler
             .send_ctx
             .path_table
             .write()
             .unwrap()
-            .handle_announce(packet, packet.transport, iface);
+            .handle_announce(packet, packet.transport, iface, path_expiry);
 
         if let Some(response_iface) = handler.path_requests.take_discovery(&packet.destination) {
             let transport_id = handler.config.identity.address_hash().clone();

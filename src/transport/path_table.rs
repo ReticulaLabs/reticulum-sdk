@@ -135,6 +135,7 @@ impl PathTable {
         announce: &Packet,
         transport_id: Option<AddressHash>,
         iface: AddressHash,
+        path_expiry: Duration,
     ) {
         let hops = announce.header.hops;
 
@@ -184,7 +185,7 @@ self_referential_transport={}",
             hops,
             iface,
             packet_hash: announce.hash(),
-            expires: Instant::now() + PATHFINDER_E,
+            expires: Instant::now() + path_expiry,
             random_blobs: self
                 .map
                 .get(&announce.destination)
@@ -439,7 +440,7 @@ mod tests {
             PacketType, PropagationType,
         },
     };
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn direct_path_forwarding_strips_transport_header() {
@@ -460,7 +461,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface);
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
 
         let original = Packet {
             header: Header {
@@ -509,7 +510,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, Some(transport), iface);
+        table.handle_announce(&announce, Some(transport), iface, Duration::from_secs(60 * 60 * 24 * 7));
 
         let original = Packet {
             header: Header {
@@ -556,7 +557,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface);
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
 
         let original = Packet {
             header: Header {
@@ -597,7 +598,7 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface);
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
         table.map.get_mut(&destination).unwrap().expires = Instant::now();
 
         assert_eq!(table.remove_stale(|_| true), 1);
@@ -623,7 +624,7 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface);
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
 
         assert_eq!(table.remove_stale(|_| false), 1);
         assert_eq!(table.len(), 0);
@@ -648,7 +649,7 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface);
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
         table.map.get_mut(&destination).unwrap().expires = Instant::now();
         table.refresh(&destination);
 
@@ -700,11 +701,13 @@ mod tests {
             &announce_with_random_blob(destination, 2, blob),
             None,
             first_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
         );
         table.handle_announce(
             &announce_with_random_blob(destination, 1, blob),
             None,
             second_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
         );
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
@@ -723,11 +726,13 @@ mod tests {
             &announce_with_random_blob(destination, 2, random_blob(1, 100)),
             None,
             first_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
         );
         table.handle_announce(
             &announce_with_random_blob(destination, 1, random_blob(2, 99)),
             None,
             second_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
         );
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
@@ -746,11 +751,13 @@ mod tests {
             &announce_with_random_blob(destination, 1, random_blob(1, 100)),
             None,
             first_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
         );
         table.handle_announce(
             &announce_with_random_blob(destination, 1, random_blob(2, 101)),
             None,
             second_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
         );
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
@@ -777,7 +784,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface);
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
 
         let packet = Packet {
             header: Header {
@@ -826,7 +833,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, Some(next_hop), iface);
+        table.handle_announce(&announce, Some(next_hop), iface, Duration::from_secs(60 * 60 * 24 * 7));
 
         let packet = Packet {
             header: Header {
