@@ -164,6 +164,7 @@ impl BackboneServer {
         let ifac_netname = { context.inner.lock().unwrap().ifac_netname.clone() };
         let ifac_netkey = { context.inner.lock().unwrap().ifac_netkey.clone() };
 
+        let server_address = context.channel.address;
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
@@ -239,7 +240,7 @@ impl BackboneServer {
 
                             let mut iface_manager = iface_manager.lock().await;
 
-                            iface_manager.spawn(
+                            let iface_addr = iface_manager.spawn(
                                 BackboneClient::new_from_stream(client.1.to_string(), client.0)
                                     .with_optional_bitrate(bitrate)
                                     .with_hw_mtu(hw_mtu)
@@ -248,6 +249,11 @@ impl BackboneServer {
                                     BackboneClient::spawn(context).await;
                                 },
                             );
+
+                            // Track the parent-child relationship so the
+                            // transport can aggregate ingress burst state
+                            // and announce caps across the backbone group.
+                            iface_manager.set_parent_interface(&iface_addr, &server_address);
                         }
                     }
                 }

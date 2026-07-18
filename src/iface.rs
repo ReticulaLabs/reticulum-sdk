@@ -407,6 +407,11 @@ fn ingress_evaluate_impl(
 
 struct LocalInterface {
     address: AddressHash,
+    /// If this interface was spawned by a parent (e.g. BackboneClient by
+    /// BackboneServer), this field holds the parent's interface address.
+    /// Matches Python's `Interface.parent_interface`.  Used for aggregated
+    /// ingress burst control and traffic accounting.
+    parent_interface: Option<AddressHash>,
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
     announce_pacer: Option<AnnouncePacer>,
@@ -764,6 +769,7 @@ impl InterfaceManager {
 
         self.ifaces.push(LocalInterface {
             address,
+            parent_interface: None,
             tx_send,
             stop: stop.clone(),
             announce_pacer,
@@ -918,6 +924,9 @@ impl InterfaceManager {
     /// Record an incoming announce on an interface and return `true` if the
     /// announce should be dropped due to ingress burst limiting.
     /// Only applied to interfaces with a known bitrate (slow links).
+    /// Matches Python's aggregated ingress control: if the interface has a
+    /// parent, and any sibling (same parent) is in burst state, the burst
+    /// is considered active across the group (BackboneInterface.py:165).
     pub fn ingress_record_announce(&self, address: &AddressHash) -> bool {
         let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) else {
             return false;
@@ -926,19 +935,37 @@ impl InterfaceManager {
             return false;
         }
 
-        ingress_record_impl(
+        let dropped = ingress_record_impl(
             &iface.ia_freq_deque,
             &iface.ingress_burst_active,
             &iface.ingress_burst_activated,
             iface.ingress_created_at,
             INGRESS_BURST_FREQ_NEW,
             INGRESS_BURST_FREQ,
-        )
+        );
+
+        // Aggregated ingress burst control: if any sibling (same parent)
+        // is in burst state, treat this interface as burst-active too.
+        if !dropped {
+            if let Some(parent) = iface.parent_interface {
+                for sibling in &self.ifaces {
+                    if sibling.address != *address
+                        && sibling.parent_interface == Some(parent)
+                        && *sibling.ingress_burst_active.lock().unwrap()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        dropped
     }
 
     /// Record an incoming path request on an interface and return `true`
     /// if it should be dropped due to ingress burst limiting.
     /// Only applied to interfaces with a known bitrate (slow links).
+    /// Uses the same sibling-aggregation pattern as `ingress_record_announce`.
     pub fn ingress_record_pr(&self, address: &AddressHash) -> bool {
         let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) else {
             return false;
@@ -947,14 +974,29 @@ impl InterfaceManager {
             return false;
         }
 
-        ingress_record_impl(
+        let dropped = ingress_record_impl(
             &iface.ip_freq_deque,
             &iface.ingress_pr_burst_active,
             &iface.ingress_pr_burst_activated,
             iface.ingress_created_at,
             INGRESS_PR_BURST_FREQ_NEW,
             INGRESS_PR_BURST_FREQ,
-        )
+        );
+
+        if !dropped {
+            if let Some(parent) = iface.parent_interface {
+                for sibling in &self.ifaces {
+                    if sibling.address != *address
+                        && sibling.parent_interface == Some(parent)
+                        && *sibling.ingress_pr_burst_active.lock().unwrap()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        dropped
     }
 
     /// Evaluate and update ingress burst state for all interfaces.
@@ -1393,6 +1435,23 @@ impl InterfaceManager {
             .iter()
             .find(|iface| iface.address == *address)
             .and_then(|iface| iface.ifac_config.as_ref())
+    }
+
+    /// Set the parent interface for an interface.
+    /// Matches Python's `Interface.parent_interface` used by
+    /// `BackboneInterface` and `I2PInterface` for their spawned children.
+    pub fn set_parent_interface(&mut self, address: &AddressHash, parent: &AddressHash) {
+        if let Some(iface) = self.ifaces.iter_mut().find(|iface| iface.address == *address) {
+            iface.parent_interface = Some(*parent);
+        }
+    }
+
+    /// Return the parent_interface for a given interface, if any.
+    pub fn parent_interface_of(&self, address: &AddressHash) -> Option<AddressHash> {
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == *address)
+            .and_then(|iface| iface.parent_interface)
     }
 }
 
