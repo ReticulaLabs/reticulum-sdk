@@ -344,3 +344,107 @@ impl AnnounceTable {
         messages
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{ContextFlag, PacketDataBuffer};
+    use tokio::time;
+
+    /// A response added with a very long grace is not sent, and is
+    /// retained for a later cycle instead of being silently cleared.
+    #[tokio::test(start_paused = true)]
+    async fn unsent_path_response_is_retained_across_cycles() {
+        let mut table = AnnounceTable::new();
+        let transport_id = AddressHash::new([0x01; 16]);
+        let dest = AddressHash::new([0xaa; 16]);
+        let iface = AddressHash::new([0xbb; 16]);
+
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type2,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Transport,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 1,
+            },
+            ifac: None,
+            destination: dest,
+            transport: Some(transport_id.clone()),
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(&[1, 2, 3]),
+        };
+
+        table.add(&packet, dest, iface);
+        // Grace is short enough to expire in the second cycle (after
+        // advancing 2s) but long enough that the first to_retransmit
+        // (at T=0) cannot possibly reach it (100ms + 0..500ms jitter).
+        table.add_response(dest, iface, 1, Duration::from_millis(100));
+
+        // First to_retransmit at T=0: neither announce (pending response)
+        // nor response (100ms + 0..500ms grace jitter has not expired).
+        // BUG: responses.clear() silently deletes the response here.
+        // FIX: responses.retain() keeps the unsent response.
+        let msgs = table.to_retransmit(&transport_id);
+        assert!(msgs.is_empty(), "neither announce nor response ready");
+
+        // Advance past grace + max jitter so the response matures.
+        time::advance(Duration::from_secs(2)).await;
+
+        // Second to_retransmit at T=2s:
+        // BUG:  response cleared in cycle 1 → announce sends instead
+        //       (context=None, not a PathResponse)
+        // FIX:  response retained in cycle 1 → now expired → IS sent
+        //       (context=PathResponse)
+        let msgs = table.to_retransmit(&transport_id);
+        assert!(
+            msgs.iter().any(|m| m.packet.context == PacketContext::PathResponse),
+            "response (not announce) must be sent after grace expiry – it was retained",
+        );
+    }
+
+    /// A response whose grace timeout expires IS sent on the next cycle.
+    #[tokio::test(start_paused = true)]
+    async fn expired_path_response_is_sent() {
+        let mut table = AnnounceTable::new();
+        let transport_id = AddressHash::new([0x01; 16]);
+        let dest = AddressHash::new([0xaa; 16]);
+        let iface = AddressHash::new([0xbb; 16]);
+
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type2,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Transport,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 1,
+            },
+            ifac: None,
+            destination: dest,
+            transport: Some(transport_id.clone()),
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(&[4, 5, 6]),
+        };
+
+        table.add(&packet, dest, iface);
+        table.add_response(dest, iface, 1, Duration::from_millis(10));
+
+        // First call — time is frozen, response timeout has not expired.
+        let msgs = table.to_retransmit(&transport_id);
+        assert!(msgs.is_empty(), "nothing should be sent yet");
+
+        // Advance past the response's grace + jitter (10ms + 0..500ms).
+        time::advance(Duration::from_secs(1)).await;
+
+        // Second call — response should now be sent.
+        let msgs = table.to_retransmit(&transport_id);
+        assert!(
+            msgs.iter().any(|m| m.packet.context == PacketContext::PathResponse),
+            "response must be sent after grace expiry",
+        );
+    }
+}
