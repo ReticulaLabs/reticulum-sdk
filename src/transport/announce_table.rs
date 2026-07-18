@@ -295,7 +295,10 @@ impl AnnounceTable {
 
         let n_responses = messages.len() - n_announces;
 
-        self.responses.clear(); // every response is only retransmitted once
+        // Remove path responses that were actually sent.  Keep any that
+        // haven't reached their grace timeout yet — they will be sent on
+        // the next `to_retransmit` cycle instead of being silently lost.
+        self.responses.retain(|_, entry| entry.retries == 0);
 
         if !(messages.is_empty() && completed.is_empty()) {
             log::trace!(
