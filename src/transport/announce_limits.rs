@@ -100,6 +100,18 @@ impl AnnounceLimits {
         None
     }
 
+    /// Remove entries whose `last_announce` is older than `max_age`.
+    /// Returns the number of pruned entries.
+    pub fn prune(&mut self, max_age: Duration) -> usize {
+        let now = Instant::now();
+        let before = self.limits.len();
+        self.limits.retain(|_, entry| {
+            let age = now.saturating_duration_since(entry.last_announce);
+            age < max_age
+        });
+        before - self.limits.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn force_block(&mut self, destination: AddressHash, duration: Duration) {
         let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit::default()));

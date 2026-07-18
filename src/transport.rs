@@ -3874,12 +3874,27 @@ async fn handle_keep_links(
 }
 
 async fn handle_cleanup(
-    handler: &TransportHandler,
+    handler: &mut TransportHandler,
 ) {
     let mut mgr = handler.send_ctx.iface_manager.lock().await;
     mgr.cleanup();
     mgr.ingress_evaluate_all();
     mgr.egress_evaluate_all();
+    drop(mgr);
+
+    /// Prune announce rate-limit entries that have not been updated
+    /// within the default rate-limit target (1 hour).  Without this,
+    /// entries accumulate forever in long-running transport nodes.
+    const MAX_AGE: Duration = Duration::from_secs(3600);
+    let pruned = handler.announce_limits.prune(MAX_AGE);
+    if pruned > 0 {
+        log::trace!(
+            "tp({}): pruned {} stale announce rate-limit entr{}",
+            handler.config.name,
+            pruned,
+            if pruned == 1 { "y" } else { "ies" },
+        );
+    }
 }
 
 async fn handle_discovery(
@@ -4239,7 +4254,7 @@ async fn manage_transport(
                         break;
                     },
                     _ = time::sleep(INTERVAL_IFACE_CLEANUP) => {
-                        handle_cleanup(&*handler.lock().await).await;
+                        handle_cleanup(&mut *handler.lock().await).await;
                     }
                 }
             }
