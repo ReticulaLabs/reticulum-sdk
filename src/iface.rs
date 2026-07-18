@@ -1301,6 +1301,25 @@ impl InterfaceManager {
                 // announce pacing and cap-based queuing below.
             }
 
+            // For AccessPoint interfaces, block non-announce broadcasts
+            // that originated from other interfaces.  This prevents the
+            // AP from relaying unrelated network noise to its clients,
+            // matching the design intent of AccessPoint mode as a
+            // network boundary rather than a transparent bridge.
+            if iface.mode == InterfaceMode::AccessPoint {
+                let from_other_iface = match &message.tx_type {
+                    TxMessageType::Broadcast(Some(addr)) => *addr != iface.address,
+                    _ => false,
+                };
+                if from_other_iface {
+                    log::trace!(
+                        "iface: blocking non-announce broadcast on AP iface {}",
+                        iface.address,
+                    );
+                    continue;
+                }
+            }
+
             let mut message = message.clone();
 
             if let Some(ifac_config) = &iface.ifac_config {
