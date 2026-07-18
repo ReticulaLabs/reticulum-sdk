@@ -1303,9 +1303,7 @@ impl InterfaceManager {
 
             // For AccessPoint interfaces, block non-announce broadcasts
             // that originated from other interfaces.  This prevents the
-            // AP from relaying unrelated network noise to its clients,
-            // matching the design intent of AccessPoint mode as a
-            // network boundary rather than a transparent bridge.
+            // AP from relaying unrelated network noise to its clients.
             if iface.mode == InterfaceMode::AccessPoint {
                 let from_other_iface = match &message.tx_type {
                     TxMessageType::Broadcast(Some(addr)) => *addr != iface.address,
@@ -1314,6 +1312,27 @@ impl InterfaceManager {
                 if from_other_iface {
                     log::trace!(
                         "iface: blocking non-announce broadcast on AP iface {}",
+                        iface.address,
+                    );
+                    continue;
+                }
+            }
+
+            // For Internal interfaces, block non-announce broadcasts
+            // that originated from a Boundary interface.  This protects
+            // the internal (typically low-bandwidth) side from being
+            // flooded by traffic from the boundary (typically high-speed)
+            // side, matching the intent described in the Reticulum docs.
+            if iface.mode == InterfaceMode::Internal {
+                let from_boundary = match &message.tx_type {
+                    TxMessageType::Broadcast(Some(addr)) => {
+                        self.interface_mode(addr) == InterfaceMode::Boundary
+                    }
+                    _ => false,
+                };
+                if from_boundary {
+                    log::trace!(
+                        "iface: blocking non-announce broadcast on internal iface {} from boundary",
                         iface.address,
                     );
                     continue;
