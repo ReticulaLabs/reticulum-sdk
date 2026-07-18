@@ -25,7 +25,7 @@ use crate::hash::ADDRESS_HASH_SIZE;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 use crate::iface::ifac::IfacConfig;
-use crate::packet::{HeaderType, Packet, PacketType};
+use crate::packet::{HeaderType, Packet, PacketContext, PacketType};
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
 pub type InterfaceTxReceiver = mpsc::Receiver<TxMessage>;
@@ -1260,124 +1260,138 @@ impl InterfaceManager {
             // Interface mode-based announce propagation filtering.
             // Matches Python RNS/Transport.py outbound() lines 1207-1264.
             if AnnouncePacer::should_pace(&message) {
-                let is_local = self.is_local_destination(&message.packet.destination);
-                let source_mode = match &message.tx_type {
-                    TxMessageType::Broadcast(Some(addr)) => Some(self.interface_mode(addr)),
-                    _ => None,
-                };
+                // Path responses are solicited replies to client path
+                // requests.  They must cross all interface mode boundaries
+                // regardless of normal announce propagation rules,
+                // otherwise clients cannot resolve paths across modes
+                // such as Boundary ↔ Internal.
+                if message.packet.context == PacketContext::PathResponse {
+                    // fall through — no mode restrictions
+                } else {
+                    let is_local = self.is_local_destination(&message.packet.destination);
+                    let source_mode = match &message.tx_type {
+                        TxMessageType::Broadcast(Some(addr)) => Some(self.interface_mode(addr)),
+                        _ => None,
+                    };
 
-                // Python: "elif not local_destination and interface.announces_from_internal == False
-                //          and from_interface.mode == MODE_INTERNAL: block"
-                // This filter applies on ANY outgoing interface (regardless of its own mode)
-                // when the announce originated on an Internal-mode interface.
-                if !is_local
-                    && !iface.announces_from_internal
-                    && source_mode == Some(InterfaceMode::Internal)
-                {
-                    log::trace!(
-                        "iface: blocking announce on {} from internal-mode iface",
-                        iface.address,
-                    );
-                    continue;
-                }
-
-                // Python: "elif interface.mode == MODE_ACCESS_POINT: block"
-                if iface.mode == InterfaceMode::AccessPoint {
-                    log::trace!("iface: blocking announce on AP iface {}", iface.address);
-                    continue;
-                }
-
-                // Python: "elif not local_destination and interface.mode == MODE_INTERNAL:"
-                if !is_local && iface.mode == InterfaceMode::Internal {
-                    // Block if source interface mode is Boundary (Python line 1233:
-                    // "if from_interface.mode == MODE_BOUNDARY: should_transmit = False")
-                    // In the Rust code, Broadcast(None) always means a locally-originated
-                    // announce (hops == 0) so it never reaches this path.
-                    if source_mode == Some(InterfaceMode::Boundary) {
+                    // Python: "elif not local_destination and interface.announces_from_internal == False
+                    //          and from_interface.mode == MODE_INTERNAL: block"
+                    // This filter applies on ANY outgoing interface (regardless of its own mode)
+                    // when the announce originated on an Internal-mode interface.
+                    if !is_local
+                        && !iface.announces_from_internal
+                        && source_mode == Some(InterfaceMode::Internal)
+                    {
                         log::trace!(
-                            "iface: blocking announce on internal iface {} from boundary-mode iface",
+                            "iface: blocking announce on {} from internal-mode iface",
+                            iface.address,
+                        );
+                        continue;
+                    }
+
+                    // Python: "elif interface.mode == MODE_ACCESS_POINT: block"
+                    if iface.mode == InterfaceMode::AccessPoint {
+                        log::trace!("iface: blocking announce on AP iface {}", iface.address);
+                        continue;
+                    }
+
+                    // Python: "elif not local_destination and interface.mode == MODE_INTERNAL:"
+                    if !is_local && iface.mode == InterfaceMode::Internal {
+                        // Block if source interface mode is Boundary (Python line 1233:
+                        // "if from_interface.mode == MODE_BOUNDARY: should_transmit = False")
+                        // In the Rust code, Broadcast(None) always means a locally-originated
+                        // announce (hops == 0) so it never reaches this path.
+                        if source_mode == Some(InterfaceMode::Boundary) {
+                            log::trace!(
+                                "iface: blocking announce on internal iface {} from boundary-mode iface",
+                                iface.address,
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Python: "elif interface.mode == MODE_ROAMING:"
+                    if iface.mode == InterfaceMode::Roaming {
+                        if is_local {
+                            // Python: "if local_destination != None: pass" → allow
+                        } else {
+                            // Python: block if source is Roaming or Boundary
+                            let blocked = matches!(
+                                source_mode,
+                                Some(InterfaceMode::Roaming) | Some(InterfaceMode::Boundary)
+                            );
+                            if blocked {
+                                log::trace!(
+                                    "iface: blocking announce on roaming iface {} from {:?}",
+                                    iface.address,
+                                    source_mode,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Python: "elif interface.mode == MODE_BOUNDARY:"
+                    if iface.mode == InterfaceMode::Boundary {
+                        if is_local {
+                            // Python: "if local_destination != None: pass" → allow
+                        } else {
+                            // Python: block if source is Roaming
+                            if source_mode == Some(InterfaceMode::Roaming) {
+                                log::trace!(
+                                    "iface: blocking announce on boundary iface {} from roaming-mode iface",
+                                    iface.address,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Full / PointToPoint / Gateway fall through to normal
+                    // announce pacing and cap-based queuing below.
+                    }
+            }
+
+            // Path responses are solicited replies to client path requests
+            // and must cross all interface mode boundaries freely, even
+            // though they technically carry a Broadcast tx_type.
+            if message.packet.context != PacketContext::PathResponse {
+                // For AccessPoint interfaces, block non-announce broadcasts
+                // that originated from other interfaces.  This prevents the
+                // AP from relaying unrelated network noise to its clients.
+                if iface.mode == InterfaceMode::AccessPoint {
+                    let from_other_iface = match &message.tx_type {
+                        TxMessageType::Broadcast(Some(addr)) => *addr != iface.address,
+                        _ => false,
+                    };
+                    if from_other_iface {
+                        log::trace!(
+                            "iface: blocking non-announce broadcast on AP iface {}",
                             iface.address,
                         );
                         continue;
                     }
                 }
 
-                // Python: "elif interface.mode == MODE_ROAMING:"
-                if iface.mode == InterfaceMode::Roaming {
-                    if is_local {
-                        // Python: "if local_destination != None: pass" → allow
-                    } else {
-                        // Python: block if source is Roaming or Boundary
-                        let blocked = matches!(
-                            source_mode,
-                            Some(InterfaceMode::Roaming) | Some(InterfaceMode::Boundary)
+                // For Internal interfaces, block non-announce broadcasts
+                // that originated from a Boundary interface.  This protects
+                // the internal (typically low-bandwidth) side from being
+                // flooded by traffic from the boundary (typically high-speed)
+                // side, matching the intent described in the Reticulum docs.
+                if iface.mode == InterfaceMode::Internal {
+                    let from_boundary = match &message.tx_type {
+                        TxMessageType::Broadcast(Some(addr)) => {
+                            self.interface_mode(addr) == InterfaceMode::Boundary
+                        }
+                        _ => false,
+                    };
+                    if from_boundary {
+                        log::trace!(
+                            "iface: blocking non-announce broadcast on internal iface {} from boundary",
+                            iface.address,
                         );
-                        if blocked {
-                            log::trace!(
-                                "iface: blocking announce on roaming iface {} from {:?}",
-                                iface.address,
-                                source_mode,
-                            );
-                            continue;
-                        }
+                        continue;
                     }
-                }
-
-                // Python: "elif interface.mode == MODE_BOUNDARY:"
-                if iface.mode == InterfaceMode::Boundary {
-                    if is_local {
-                        // Python: "if local_destination != None: pass" → allow
-                    } else {
-                        // Python: block if source is Roaming
-                        if source_mode == Some(InterfaceMode::Roaming) {
-                            log::trace!(
-                                "iface: blocking announce on boundary iface {} from roaming-mode iface",
-                                iface.address,
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                // Full / PointToPoint / Gateway fall through to normal
-                // announce pacing and cap-based queuing below.
-            }
-
-            // For AccessPoint interfaces, block non-announce broadcasts
-            // that originated from other interfaces.  This prevents the
-            // AP from relaying unrelated network noise to its clients.
-            if iface.mode == InterfaceMode::AccessPoint {
-                let from_other_iface = match &message.tx_type {
-                    TxMessageType::Broadcast(Some(addr)) => *addr != iface.address,
-                    _ => false,
-                };
-                if from_other_iface {
-                    log::trace!(
-                        "iface: blocking non-announce broadcast on AP iface {}",
-                        iface.address,
-                    );
-                    continue;
-                }
-            }
-
-            // For Internal interfaces, block non-announce broadcasts
-            // that originated from a Boundary interface.  This protects
-            // the internal (typically low-bandwidth) side from being
-            // flooded by traffic from the boundary (typically high-speed)
-            // side, matching the intent described in the Reticulum docs.
-            if iface.mode == InterfaceMode::Internal {
-                let from_boundary = match &message.tx_type {
-                    TxMessageType::Broadcast(Some(addr)) => {
-                        self.interface_mode(addr) == InterfaceMode::Boundary
-                    }
-                    _ => false,
-                };
-                if from_boundary {
-                    log::trace!(
-                        "iface: blocking non-announce broadcast on internal iface {} from boundary",
-                        iface.address,
-                    );
-                    continue;
                 }
             }
 
@@ -2121,6 +2135,30 @@ mod tests {
         // Internal receives (no restriction: Internal only blocks from Boundary).
         for (lbl, _addr, rx) in &mut h.ifaces {
             let should = *lbl == "full" || *lbl == "internal";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn path_response_crosses_boundary_to_internal() {
+        let mut h = ModeTestHarness::new();
+        let boundary_addr = h.ifaces.iter().find(|(l, _, _)| *l == "boundary").unwrap().1;
+
+        // Create a PathResponse packet from Boundary source.
+        let mut msg = forwarded_announce(0xab);
+        msg.packet.context = PacketContext::PathResponse;
+        msg.tx_type = TxMessageType::Broadcast(Some(boundary_addr));
+
+        h.mgr.send_flush(msg).await;
+
+        // PathResponse must be delivered to Internal even though it
+        // originated from Boundary — it is a solicited reply.
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl != "boundary"; // source excluded; all others receive
             assert_eq!(
                 rx.try_recv().is_ok(),
                 should,
