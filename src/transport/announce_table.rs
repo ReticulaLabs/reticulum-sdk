@@ -68,7 +68,10 @@ impl AnnounceEntry {
         let context = if self.response_to_iface.is_some() {
             PacketContext::PathResponse
         } else {
-            PacketContext::None
+            // Preserve the original announce's context (e.g. PathResponse
+            // from a remote peer) so that outbound mode-based filtering
+            // in send_flush can correctly identify solicited responses.
+            self.packet.context
         };
 
         let packet = Packet {
