@@ -480,6 +480,7 @@ struct TransportHandler {
     blackhole_table: BlackholeTable,
 }
 
+#[derive(Clone)]
 pub struct Transport {
     name: String,
     discovery_tx: broadcast::Sender<DiscoveredInterface>,

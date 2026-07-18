@@ -8,6 +8,10 @@ pub enum RnsError {
     PacketError,
     ConnectionError,
     LinkClosed,
+    ChannelError,
+    ChannelLinkNotReady,
+    ChannelMessageTooBig,
+    ChannelUnknownMessageType,
 }
 
 impl core::fmt::Display for RnsError {
@@ -21,6 +25,10 @@ impl core::fmt::Display for RnsError {
             Self::PacketError => f.write_str("packet error"),
             Self::ConnectionError => f.write_str("connection error"),
             Self::LinkClosed => f.write_str("link is closed"),
+            Self::ChannelError => f.write_str("channel error"),
+            Self::ChannelLinkNotReady => f.write_str("channel link not ready"),
+            Self::ChannelMessageTooBig => f.write_str("channel message too big"),
+            Self::ChannelUnknownMessageType => f.write_str("unknown channel message type"),
         }
     }
 }

@@ -241,6 +241,7 @@ pub struct Link {
     next_channel_sequence: u16,
     next_rx_channel_sequence: u16,
     channel_rx_ring: Vec<ChannelEnvelope>,
+    channel_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 }
 
 impl Link {
@@ -263,6 +264,7 @@ impl Link {
             next_channel_sequence: 0,
             next_rx_channel_sequence: 0,
             channel_rx_ring: Vec::new(),
+            channel_tx: None,
         }
     }
 
@@ -317,6 +319,7 @@ impl Link {
             next_channel_sequence: 0,
             next_rx_channel_sequence: 0,
             channel_rx_ring: Vec::new(),
+            channel_tx: None,
         };
 
         link.handshake(peer_identity);
@@ -483,6 +486,13 @@ impl Link {
             PacketContext::Channel => {
                 let mut buffer = vec![0u8; decrypt_buf_len];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    if let Some(ref tx) = self.channel_tx {
+                        let _ = tx.send(plain_text.to_vec());
+                        self.request_time = Instant::now();
+                        return LinkHandleResult::MessageReceived(Some(
+                            self.message_proof(packet.hash()),
+                        ));
+                    }
                     match ChannelEnvelope::unpack(plain_text) {
                         Ok(envelope) => {
                             self.request_time = Instant::now();
@@ -613,6 +623,20 @@ impl Link {
 
     pub fn channel_mdu(&self) -> usize {
         self.mdu().saturating_sub(CHANNEL_HEADER_SIZE)
+    }
+
+    /// Bind this link to a channel consumer. Returns a receiver for raw decrypted
+    /// payloads of packets sent with `PacketContext::Channel`. Only one binding
+    /// is allowed per link; returns `Err(ChannelError)` if already bound.
+    pub fn bind_to_channel(
+        &mut self,
+    ) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>, RnsError> {
+        if self.channel_tx.is_some() {
+            return Err(RnsError::ChannelError);
+        }
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        self.channel_tx = Some(tx);
+        Ok(rx)
     }
 
     pub fn channel_packet<M: ChannelMessage>(&mut self, message: &M) -> Result<Packet, RnsError> {
