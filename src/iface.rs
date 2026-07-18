@@ -1825,4 +1825,307 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap().packet.data.as_slice(), &[2]);
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
+
+    // ------------------------------------------------------------------
+    // Interface mode broadcast filter tests
+    // ------------------------------------------------------------------
+
+    /// Create a non-announce (Data) broadcast message, optionally
+    /// specifying the source interface address.
+    fn data_broadcast(source: Option<AddressHash>, data: &[u8]) -> TxMessage {
+        TxMessage {
+            tx_type: match source {
+                Some(addr) => TxMessageType::Broadcast(Some(addr)),
+                None => TxMessageType::Broadcast(None),
+            },
+            packet: Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type1,
+                    context_flag: ContextFlag::Unset,
+                    propagation_type: PropagationType::Broadcast,
+                    destination_type: DestinationType::Plain,
+                    packet_type: PacketType::Data,
+                    hops: 0,
+                },
+                ifac: None,
+                destination: AddressHash::new([0xdd; 16]),
+                transport: None,
+                context: PacketContext::None,
+                data: PacketDataBuffer::new_from_slice(data),
+            },
+        }
+    }
+
+    /// Create a forwarded (hops > 0) announce message.
+    fn forwarded_announce(destination: u8) -> TxMessage {
+        TxMessage {
+            tx_type: TxMessageType::Broadcast(None),
+            packet: Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type1,
+                    context_flag: ContextFlag::Unset,
+                    propagation_type: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Announce,
+                    hops: 1, // forwarded
+                },
+                ifac: None,
+                destination: AddressHash::new([destination; 16]),
+                transport: None,
+                context: PacketContext::None,
+                data: PacketDataBuffer::new_from_slice(&[]),
+            },
+        }
+    }
+
+    /// Create a four-interface harness (Full, Boundary, Internal, AP)
+    /// with a high dummy bitrate so pacing never interferes.
+    struct ModeTestHarness {
+        mgr: InterfaceManager,
+        ifaces: Vec<(&'static str, AddressHash, mpsc::Receiver<TxMessage>)>,
+    }
+
+    impl ModeTestHarness {
+        fn new() -> Self {
+            let mut mgr = InterfaceManager::new(4);
+            let mut ifaces = Vec::new();
+
+            for (label, mode) in &[
+                ("full", InterfaceMode::Full),
+                ("boundary", InterfaceMode::Boundary),
+                ("internal", InterfaceMode::Internal),
+                ("ap", InterfaceMode::AccessPoint),
+            ] {
+                let ch = mgr.new_channel_with_pacer(
+                    4, None, false, None, None, Some(1_000_000.0),
+                    *mode, true, false,
+                );
+                ifaces.push((*label, ch.address, ch.tx_channel));
+            }
+
+            Self { mgr, ifaces }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_announce_broadcast_from_full_reaches_boundary_and_internal() {
+        let mut h = ModeTestHarness::new();
+        let full_addr = h.ifaces.iter().find(|(l, _, _)| *l == "full").unwrap().1;
+
+        h.mgr
+            .send_flush(data_broadcast(Some(full_addr), &[1]))
+            .await;
+
+        // Full (source) excluded by should_send.
+        // AP blocked by AccessPoint non-announce filter.
+        // Boundary and Internal are not filtered → receive.
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl == "boundary" || *lbl == "internal";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_announce_broadcast_from_boundary_blocked_on_internal_and_ap() {
+        let mut h = ModeTestHarness::new();
+        let boundary_addr = h.ifaces.iter().find(|(l, _, _)| *l == "boundary").unwrap().1;
+
+        h.mgr
+            .send_flush(data_broadcast(Some(boundary_addr), &[1]))
+            .await;
+
+        // Boundary (source) excluded by should_send.
+        // Internal blocked by Internal filter (broadcast from Boundary).
+        // AP blocked by AP filter (broadcast from other interface).
+        // Full receives (no filter).
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl == "full";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_announce_broadcast_from_internal_blocked_on_ap() {
+        let mut h = ModeTestHarness::new();
+        let internal_addr = h.ifaces.iter().find(|(l, _, _)| *l == "internal").unwrap().1;
+
+        h.mgr
+            .send_flush(data_broadcast(Some(internal_addr), &[1]))
+            .await;
+
+        // Internal (source) excluded by should_send.
+        // AP blocked by AP filter (broadcast from other interface).
+        // Full and Boundary receive (no filter).
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl == "full" || *lbl == "boundary";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_announce_broadcast_from_ap_excluded_by_should_send() {
+        let mut h = ModeTestHarness::new();
+        let ap_addr = h.ifaces.iter().find(|(l, _, _)| *l == "ap").unwrap().1;
+
+        h.mgr
+            .send_flush(data_broadcast(Some(ap_addr), &[1]))
+            .await;
+
+        // AP (source) excluded by should_send.
+        // AP filter doesn't matter (message never reaches it).
+        // All other interfaces receive it.
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl != "ap";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_message_always_reaches_target_interface() {
+        let mut h = ModeTestHarness::new();
+        let ap_addr = h.ifaces.iter().find(|(l, _, _)| *l == "ap").unwrap().1;
+
+        h.mgr
+            .send_flush(TxMessage {
+                tx_type: TxMessageType::Direct(ap_addr),
+                packet: Packet {
+                    header: Header {
+                        ifac_flag: IfacFlag::Open,
+                        header_type: HeaderType::Type1,
+                        context_flag: ContextFlag::Unset,
+                        propagation_type: PropagationType::Broadcast,
+                        destination_type: DestinationType::Plain,
+                        packet_type: PacketType::Data,
+                        hops: 0,
+                    },
+                    ifac: None,
+                    destination: AddressHash::new([0xdd; 16]),
+                    transport: None,
+                    context: PacketContext::None,
+                    data: PacketDataBuffer::new_from_slice(&[1]),
+                },
+            })
+            .await;
+
+        // Only the AP interface should receive a Direct message
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                *lbl == "ap",
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_announce_blocked_on_ap() {
+        let mut h = ModeTestHarness::new();
+        let full_addr = h.ifaces.iter().find(|(l, _, _)| *l == "full").unwrap().1;
+
+        let mut msg = forwarded_announce(0xaa);
+        msg.tx_type = TxMessageType::Broadcast(Some(full_addr));
+        h.mgr.send_flush(msg).await;
+
+        // Full (source) excluded by should_send.
+        // AP blocked by announce filter (AP blocks all announces).
+        // Boundary and Internal receive (no restriction on Full→* announces).
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl == "boundary" || *lbl == "internal";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_announce_from_boundary_blocked_on_internal_and_ap() {
+        let mut h = ModeTestHarness::new();
+        let boundary_addr = h.ifaces.iter().find(|(l, _, _)| *l == "boundary").unwrap().1;
+
+        let mut msg = forwarded_announce(0xbb);
+        msg.tx_type = TxMessageType::Broadcast(Some(boundary_addr));
+        h.mgr.send_flush(msg).await;
+
+        // Boundary (source) excluded by should_send.
+        // Internal blocked by announce filter: Internal blocks announces from Boundary.
+        // AP blocked by announce filter: AP blocks all announces.
+        // Full receives (no restriction).
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl == "full";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_announce_from_internal_blocked_on_ap() {
+        let mut h = ModeTestHarness::new();
+        let internal_addr = h.ifaces.iter().find(|(l, _, _)| *l == "internal").unwrap().1;
+
+        let mut msg = forwarded_announce(0xcc);
+        msg.tx_type = TxMessageType::Broadcast(Some(internal_addr));
+        h.mgr.send_flush(msg).await;
+
+        // Internal (source) excluded by should_send.
+        // AP blocked by announce filter (AP blocks all announces).
+        // Full and Boundary receive (no restriction on Internal→* announces).
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl == "full" || *lbl == "boundary";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_announce_from_roaming_blocked_on_boundary_and_ap() {
+        let mut h = ModeTestHarness::new();
+        let roaming_ch = h.mgr.new_channel_with_pacer(
+            4, None, false, None, None, Some(1_000_000.0),
+            InterfaceMode::Roaming, true, false,
+        );
+
+        let mut msg = forwarded_announce(0xee);
+        msg.tx_type = TxMessageType::Broadcast(Some(roaming_ch.address));
+        h.mgr.send_flush(msg).await;
+
+        // Roaming (source) excluded by should_send.
+        // Boundary blocked by announce filter: Boundary blocks announces from Roaming.
+        // AP blocked by announce filter: AP blocks all announces.
+        // Full receives (no restriction).
+        // Internal receives (no restriction: Internal only blocks from Boundary).
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl == "full" || *lbl == "internal";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
 }
