@@ -31,6 +31,7 @@ const SF_MAX: u8 = 12;
 const CR_MIN: u8 = 5;
 const CR_MAX: u8 = 8;
 const RSSI_OFFSET: i16 = 157;
+const CHANNEL_LOAD_QUERY_INTERVAL: Duration = Duration::from_secs(15);
 
 mod kiss {
     pub const FEND: u8 = 0xC0;
@@ -235,6 +236,7 @@ impl RNodeInterface {
             return;
         }
 
+        let channel_load = context.channel.channel_load.clone();
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
@@ -261,6 +263,9 @@ impl RNodeInterface {
             let cancel = context.cancel.clone();
             let stop = CancellationToken::new();
             let state = Arc::new(tokio::sync::Mutex::new(RNodeState::new()));
+            if let Some(ref load) = channel_load {
+                state.lock().await.channel_load = Some(load.clone());
+            }
             let ready = Arc::new(Notify::new());
             let (read_stream, write_stream) = tokio::io::split(stream);
             let write_stream = Arc::new(tokio::sync::Mutex::new(write_stream));
@@ -413,6 +418,7 @@ struct RNodeState {
     r_random: Option<u8>,
     hw_errors: Vec<RNodeHardwareError>,
     interface_ready: bool,
+    channel_load: Option<Arc<std::sync::Mutex<f64>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,6 +471,7 @@ impl RNodeState {
             r_random: None,
             hw_errors: Vec::new(),
             interface_ready: false,
+            channel_load: None,
         }
     }
 
@@ -965,6 +972,9 @@ async fn update_command_state(
             } else {
                 Some(frame.payload[10] as i16 - RSSI_OFFSET)
             };
+            if let Some(ref load) = state.channel_load {
+                *load.lock().unwrap() = state.r_channel_load_long as f64;
+            }
             true
         }
         kiss::CMD_STAT_PHYPRM if frame.payload.len() >= 12 => {
@@ -1081,6 +1091,8 @@ async fn tx_loop<W>(
     W: AsyncWrite + Unpin,
 {
     let mut packet_queue = VecDeque::new();
+    let mut channel_load_timer = tokio::time::interval(CHANNEL_LOAD_QUERY_INTERVAL);
+    channel_load_timer.tick().await;
 
     loop {
         if stop.is_cancelled() {
@@ -1117,6 +1129,10 @@ async fn tx_loop<W>(
                     stop.cancel();
                     break;
                 }
+            }
+            _ = channel_load_timer.tick() => {
+                drop(tx_channel);
+                let _ = write_command(&writer, kiss::CMD_STAT_CHTM, &[]).await;
             }
         };
     }
