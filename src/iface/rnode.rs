@@ -9,7 +9,7 @@ use tokio_serial::{DataBits, SerialPortBuilderExt, SerialStream, StopBits};
 use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
-use crate::iface::{Interface, InterfaceContext, InterfaceMode, RxMessage};
+use crate::iface::{DEFAULT_ANNOUNCE_CAP, Interface, InterfaceContext, InterfaceMode, RxMessage};
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -93,6 +93,7 @@ pub struct RNodeConfig {
     pub flow_control: bool,
     pub airtime_limit_short: Option<f32>,
     pub airtime_limit_long: Option<f32>,
+    pub announce_cap: Option<f64>,
 }
 
 impl RNodeConfig {
@@ -114,6 +115,7 @@ impl RNodeConfig {
             flow_control: false,
             airtime_limit_short: None,
             airtime_limit_long: None,
+            announce_cap: None,
         }
     }
 
@@ -125,6 +127,11 @@ impl RNodeConfig {
     pub fn with_airtime_limits(mut self, short: Option<f32>, long: Option<f32>) -> Self {
         self.airtime_limit_short = short;
         self.airtime_limit_long = long;
+        self
+    }
+
+    pub fn with_announce_cap(mut self, announce_cap: f64) -> Self {
+        self.announce_cap = Some(announce_cap);
         self
     }
 
@@ -150,6 +157,11 @@ impl RNodeConfig {
         if let Some(limit) = self.airtime_limit_long {
             validate_airtime_limit(limit, "long-term")?;
         }
+        if let Some(cap) = self.announce_cap {
+            if !(0.0..=1.0).contains(&cap) {
+                return Err(RNodeConfigError::AnnounceCap(cap));
+            }
+        }
 
         Ok(())
     }
@@ -163,6 +175,7 @@ pub enum RNodeConfigError {
     SpreadingFactor(u8),
     CodingRate(u8),
     AirtimeLimit { name: &'static str, value: f32 },
+    AnnounceCap(f64),
 }
 
 impl fmt::Display for RNodeConfigError {
@@ -175,6 +188,9 @@ impl fmt::Display for RNodeConfigError {
             Self::CodingRate(value) => write!(f, "invalid coding rate {value}"),
             Self::AirtimeLimit { name, value } => {
                 write!(f, "invalid {name} airtime limit {value}")
+            }
+            Self::AnnounceCap(value) => {
+                write!(f, "invalid announce cap {value}, must be between 0.0 and 1.0")
             }
         }
     }
@@ -347,6 +363,10 @@ impl Interface for RNodeInterface {
 
     fn interface_mode(&self) -> InterfaceMode {
         self.mode
+    }
+
+    fn announce_cap(&self) -> f64 {
+        self.config.announce_cap.unwrap_or(DEFAULT_ANNOUNCE_CAP)
     }
 }
 
