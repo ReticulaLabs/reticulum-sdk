@@ -450,4 +450,48 @@ mod tests {
             "response must be sent after grace expiry",
         );
     }
+
+    /// A PathResponse received from a remote peer and added via `add()`
+    /// retains its `PathResponse` context through `to_retransmit()` so
+    /// that outbound mode-based filtering in `send_flush` recognises it.
+    #[tokio::test(start_paused = true)]
+    async fn remote_path_response_retains_context_through_retransmit() {
+        let mut table = AnnounceTable::new();
+        let transport_id = AddressHash::new([0x01; 16]);
+        let dest = AddressHash::new([0xcc; 16]);
+        let iface = AddressHash::new([0xdd; 16]);
+
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type2,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Transport,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 1,
+            },
+            ifac: None,
+            destination: dest,
+            transport: Some(transport_id.clone()),
+            // Simulate a PathResponse received from a remote peer
+            context: PacketContext::PathResponse,
+            data: PacketDataBuffer::new_from_slice(&[7, 8, 9]),
+        };
+
+        table.add(&packet, dest, iface);
+
+        // Advance past the initial jitter (0..500ms) so the entry
+        // is eligible for retransmission.
+        time::advance(Duration::from_secs(1)).await;
+
+        let msgs = table.to_retransmit(&transport_id);
+
+        assert_eq!(msgs.len(), 1, "one announce should be retransmitted");
+        assert_eq!(
+            msgs[0].packet.context,
+            PacketContext::PathResponse,
+            "PathResponse context must be preserved through to_retransmit()",
+        );
+    }
 }
