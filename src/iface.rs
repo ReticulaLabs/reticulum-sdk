@@ -11,7 +11,7 @@ pub mod udp;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
@@ -364,7 +364,7 @@ fn ingress_threshold(created_at: Instant, new_threshold: f64, mature_threshold: 
 #[allow(clippy::too_many_arguments)]
 fn ingress_record_impl(
     freq_deque: &std::sync::Mutex<VecDeque<Instant>>,
-    burst_active: &std::sync::Mutex<bool>,
+    burst_active: &AtomicBool,
     burst_activated: &std::sync::Mutex<Instant>,
     created_at: Instant,
     new_threshold: f64,
@@ -380,22 +380,23 @@ fn ingress_record_impl(
 
     let freq = ingress_freq(&deque, now);
     let threshold = ingress_threshold(created_at, new_threshold, mature_threshold);
+    let deque_len = deque.len();
+    drop(deque);
 
-    let mut burst_active = burst_active.lock().unwrap();
     let mut burst_activated = burst_activated.lock().unwrap();
 
-    if *burst_active {
+    if burst_active.load(Ordering::Relaxed) {
         if freq < threshold
             && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
-            && deque.len() >= INGRESS_BURST_MIN_SAMPLES
+            && deque_len >= INGRESS_BURST_MIN_SAMPLES
         {
-            *burst_active = false;
+            burst_active.store(false, Ordering::Relaxed);
             return false;
         }
         true
     } else {
         if freq > threshold {
-            *burst_active = true;
+            burst_active.store(true, Ordering::Relaxed);
             *burst_activated = now;
             return true;
         }
@@ -406,7 +407,7 @@ fn ingress_record_impl(
 /// Shared ingress burst evaluation for periodic cleanup.
 fn ingress_evaluate_impl(
     freq_deque: &std::sync::Mutex<VecDeque<Instant>>,
-    burst_active: &std::sync::Mutex<bool>,
+    burst_active: &AtomicBool,
     burst_activated: &std::sync::Mutex<Instant>,
     created_at: Instant,
     new_threshold: f64,
@@ -416,23 +417,21 @@ fn ingress_evaluate_impl(
     let deque = freq_deque.lock().unwrap();
     let freq = ingress_freq(&deque, now);
     let threshold = ingress_threshold(created_at, new_threshold, mature_threshold);
+    let deque_len = deque.len();
     drop(deque);
 
-    let mut burst_active = burst_active.lock().unwrap();
     let mut burst_activated = burst_activated.lock().unwrap();
 
-    if *burst_active {
+    if burst_active.load(Ordering::Relaxed) {
         if freq < threshold
             && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
+            && deque_len >= INGRESS_BURST_MIN_SAMPLES
         {
-            let deque = freq_deque.lock().unwrap();
-            if deque.len() >= INGRESS_BURST_MIN_SAMPLES {
-                *burst_active = false;
-            }
+            burst_active.store(false, Ordering::Relaxed);
         }
     } else {
         if freq > threshold {
-            *burst_active = true;
+            burst_active.store(true, Ordering::Relaxed);
             *burst_activated = now;
         }
     }
@@ -488,11 +487,11 @@ struct LocalInterface {
     /// Timestamps of recently received path requests for frequency tracking.
     ip_freq_deque: std::sync::Mutex<VecDeque<Instant>>,
     /// Whether announce burst limiting is currently active.
-    ingress_burst_active: std::sync::Mutex<bool>,
+    ingress_burst_active: AtomicBool,
     /// When the current announce burst was activated.
     ingress_burst_activated: std::sync::Mutex<Instant>,
     /// Whether path-request burst limiting is currently active.
-    ingress_pr_burst_active: std::sync::Mutex<bool>,
+    ingress_pr_burst_active: AtomicBool,
     /// When the current PR burst was activated.
     ingress_pr_burst_activated: std::sync::Mutex<Instant>,
 
@@ -927,9 +926,9 @@ impl InterfaceManager {
             last_pacing_interval_us: AtomicU64::new(0),
             ia_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
             ip_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
-            ingress_burst_active: std::sync::Mutex::new(false),
+            ingress_burst_active: AtomicBool::new(false),
             ingress_burst_activated: std::sync::Mutex::new(Instant::now()),
-            ingress_pr_burst_active: std::sync::Mutex::new(false),
+            ingress_pr_burst_active: AtomicBool::new(false),
             ingress_pr_burst_activated: std::sync::Mutex::new(Instant::now()),
             op_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
         });
@@ -1115,12 +1114,13 @@ impl InterfaceManager {
 
         // Aggregated ingress burst control: if any sibling (same parent)
         // is in burst state, treat this interface as burst-active too.
+        // Uses AtomicBool::load to avoid per-sibling lock acquisitions.
         if !dropped {
             if let Some(parent) = iface.parent_interface {
                 for sibling in &self.ifaces {
                     if sibling.address != *address
                         && sibling.parent_interface == Some(parent)
-                        && *sibling.ingress_burst_active.lock().unwrap()
+                        && sibling.ingress_burst_active.load(Ordering::Relaxed)
                     {
                         return true;
                     }
@@ -1157,7 +1157,7 @@ impl InterfaceManager {
                 for sibling in &self.ifaces {
                     if sibling.address != *address
                         && sibling.parent_interface == Some(parent)
-                        && *sibling.ingress_pr_burst_active.lock().unwrap()
+                        && sibling.ingress_pr_burst_active.load(Ordering::Relaxed)
                     {
                         return true;
                     }
