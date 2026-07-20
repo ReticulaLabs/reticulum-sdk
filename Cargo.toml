@@ -1,6 +1,6 @@
 [package]
 name = "reticulum-sdk"
-version = "2.1.20"
+version = "2.1.21"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
