@@ -452,6 +452,8 @@ struct LocalInterface {
     last_data_send: std::sync::Mutex<Instant>,
     /// Cumulative number of data packets sent through this interface.
     packets_tx: AtomicU64,
+    /// Cumulative number of data bytes sent through this interface.
+    bytes_tx: Arc<AtomicU64>,
     /// Cumulative microseconds spent in pacing waits for this interface.
     pacing_wait_us: AtomicU64,
     /// Last computed pacing interval in microseconds.
@@ -772,6 +774,49 @@ async fn send_or_drop(
     }
 }
 
+/// Background task that periodically computes a theoretical channel load
+/// for interfaces with a known bitrate but no hardware channel-load
+/// measurement.  The load is derived from recent TX activity:
+///
+///   airtime = (bytes_sent * 8) / bitrate
+///   load_pct = airtime / sample_interval * 100
+///
+/// The result is written to the shared `channel_load` mutex so that both
+/// the announce pacer and metrics collection see a non-zero value.
+async fn theoretical_channel_load_task(
+    channel_load: Arc<Mutex<f64>>,
+    bytes_tx: Arc<AtomicU64>,
+    bitrate: f64,
+    stop: CancellationToken,
+) {
+    const SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+    let mut last_bytes = bytes_tx.load(Ordering::Relaxed);
+    let mut timer = time::interval(SAMPLE_INTERVAL);
+
+    // Skip the immediate first tick so we have a real delta.
+    timer.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            _ = timer.tick() => {},
+        }
+
+        let current_bytes = bytes_tx.load(Ordering::Relaxed);
+        let delta_bytes = current_bytes - last_bytes;
+        last_bytes = current_bytes;
+
+        if delta_bytes == 0 {
+            *channel_load.lock().unwrap() = 0.0;
+        } else {
+            let airtime_s = (delta_bytes as f64 * 8.0) / bitrate;
+            let load_pct = (airtime_s / SAMPLE_INTERVAL.as_secs_f64()) * 100.0;
+            *channel_load.lock().unwrap() = load_pct.clamp(0.0, 100.0);
+        }
+    }
+}
+
 pub struct InterfaceContext<T: Interface> {
     pub inner: Arc<Mutex<T>>,
     pub channel: InterfaceChannel,
@@ -805,7 +850,7 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)))
+        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)))
     }
 
     fn new_channel_with_pacer(
@@ -820,6 +865,7 @@ impl InterfaceManager {
         announces_from_internal: bool,
         recursive_prs: bool,
         channel_load: Arc<Mutex<f64>>,
+        bytes_tx: Arc<AtomicU64>,
     ) -> InterfaceChannel {
         self.counter += 1;
 
@@ -855,6 +901,7 @@ impl InterfaceManager {
             ingress_created_at: Instant::now(),
             last_data_send: std::sync::Mutex::new(Instant::now()),
             packets_tx: AtomicU64::new(0),
+            bytes_tx,
             pacing_wait_us: AtomicU64::new(0),
             last_pacing_interval_us: AtomicU64::new(0),
             ia_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
@@ -903,6 +950,7 @@ impl InterfaceManager {
         let mode = inner.interface_mode();
         let announces_from_internal = inner.announces_from_internal();
         let recursive_prs = inner.recursive_prs();
+        let bytes_tx = Arc::new(AtomicU64::new(0));
         let channel = self.new_channel_with_pacer(
             DEFAULT_INTERFACE_TX_QUEUE_CAP,
             announce_pacer,
@@ -913,8 +961,23 @@ impl InterfaceManager {
             mode,
             announces_from_internal,
             recursive_prs,
-            channel_load,
+            channel_load.clone(),
+            bytes_tx.clone(),
         );
+
+        // Spawn a background task that periodically calculates theoretical
+        // channel load from recent TX activity for interfaces with a known
+        // bitrate.  The result is written to the shared channel_load mutex
+        // so that both the announce pacer and metrics collection see it.
+        if let Some(bitrate) = bitrate.filter(|b| *b > 0.0) {
+            let stop = channel.stop.clone();
+            task::spawn(theoretical_channel_load_task(
+                channel_load,
+                bytes_tx,
+                bitrate,
+                stop,
+            ));
+        }
 
         let inner = Arc::new(Mutex::new(inner));
 
@@ -1489,6 +1552,14 @@ impl InterfaceManager {
                 }
             }
 
+            let transport_size = if message.packet.header.header_type == HeaderType::Type2 {
+                ADDRESS_HASH_SIZE
+            } else {
+                0
+            };
+            let packet_len = (2 + transport_size + ADDRESS_HASH_SIZE + 1
+                + message.packet.data.len()) as u64;
+
             if let Some(pacer) = iface
                 .announce_pacer
                 .as_ref()
@@ -1508,6 +1579,8 @@ impl InterfaceManager {
 
                 iface.packets_tx.fetch_add(1, Ordering::Relaxed);
             }
+
+            iface.bytes_tx.fetch_add(packet_len, Ordering::Relaxed);
         }
     }
 
@@ -1631,7 +1704,7 @@ mod tests {
         // 1 kbps link – realistic for LoRa at SF11/BW250
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)),
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1678,7 +1751,7 @@ mod tests {
         // 10 Mbps – typical fast link, no meaningful pacing needed.
         let bitrate = 10_000_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)),
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1705,7 +1778,7 @@ mod tests {
         let mut manager = InterfaceManager::new(4);
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)),
+            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
         );
         let iface = channel.address;
 
@@ -1765,7 +1838,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)));
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)));
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -1877,7 +1950,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)));
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)));
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -1902,7 +1975,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)));
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)));
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;
@@ -1995,7 +2068,7 @@ mod tests {
             ] {
                 let ch = mgr.new_channel_with_pacer(
                     4, None, false, None, None, Some(1_000_000.0),
-                    *mode, true, false, Arc::new(Mutex::new(0.0)),
+                    *mode, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
                 );
                 ifaces.push((*label, ch.address, ch.tx_channel));
             }
@@ -2202,7 +2275,7 @@ mod tests {
         let mut h = ModeTestHarness::new();
         let roaming_ch = h.mgr.new_channel_with_pacer(
             4, None, false, None, None, Some(1_000_000.0),
-            InterfaceMode::Roaming, true, false, Arc::new(Mutex::new(0.0)),
+            InterfaceMode::Roaming, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
         );
 
         let mut msg = forwarded_announce(0xee);
