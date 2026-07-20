@@ -849,6 +849,9 @@ pub struct InterfaceManager {
     rx_send: InterfaceRxSender,
     cancel: CancellationToken,
     ifaces: Vec<LocalInterface>,
+    /// Maps interface address → index into `ifaces` for O(1) lookups.
+    /// Rebuilt after any removal that shifts indices.
+    iface_index: HashMap<AddressHash, usize>,
     /// Set of destination hashes that are registered locally on this node.
     /// Used to exempt local destinations from interface-mode filtering.
     local_destinations: HashSet<AddressHash>,
@@ -865,6 +868,7 @@ impl InterfaceManager {
             rx_send,
             cancel: CancellationToken::new(),
             ifaces: Vec::new(),
+            iface_index: HashMap::new(),
             local_destinations: HashSet::new(),
         }
     }
@@ -932,6 +936,8 @@ impl InterfaceManager {
             ingress_pr_burst_activated: std::sync::Mutex::new(Instant::now()),
             op_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
         });
+
+        self.iface_index.insert(address, self.ifaces.len() - 1);
 
         InterfaceChannel {
             rx_channel: self.rx_send.clone(),
@@ -1087,6 +1093,10 @@ impl InterfaceManager {
 
     pub fn cleanup(&mut self) {
         self.ifaces.retain(|iface| !iface.stop.is_cancelled());
+        self.iface_index.clear();
+        for (idx, iface) in self.ifaces.iter().enumerate() {
+            self.iface_index.insert(iface.address, idx);
+        }
     }
 
     /// Record an incoming announce on an interface and return `true` if the
@@ -1096,10 +1106,10 @@ impl InterfaceManager {
     /// parent, and any sibling (same parent) is in burst state, the burst
     /// is considered active across the group (BackboneInterface.py:165).
     pub fn ingress_record_announce(&self, address: &AddressHash) -> bool {
-        let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) else {
+        let Some(iface) = self.iface_by_address(address) else {
             return false;
         };
-        if iface.stop.is_cancelled() || iface.bitrate.is_none() {
+        if iface.bitrate.is_none() {
             return false;
         }
 
@@ -1136,10 +1146,10 @@ impl InterfaceManager {
     /// Only applied to interfaces with a known bitrate (slow links).
     /// Uses the same sibling-aggregation pattern as `ingress_record_announce`.
     pub fn ingress_record_pr(&self, address: &AddressHash) -> bool {
-        let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) else {
+        let Some(iface) = self.iface_by_address(address) else {
             return false;
         };
-        if iface.stop.is_cancelled() || iface.bitrate.is_none() {
+        if iface.bitrate.is_none() {
             return false;
         }
 
@@ -1200,12 +1210,9 @@ impl InterfaceManager {
     /// `true` if the egress PR frequency exceeds `EGRESS_PR_FREQ` (5
     /// Hz), indicating excessive outgoing PR activity.
     pub fn egress_record_pr(&self, address: &AddressHash) -> bool {
-        let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) else {
+        let Some(iface) = self.iface_by_address(address) else {
             return false;
         };
-        if iface.stop.is_cancelled() {
-            return false;
-        }
 
         let now = Instant::now();
 
@@ -1263,13 +1270,33 @@ impl InterfaceManager {
         self.local_destinations.contains(hash)
     }
 
+    /// Look up an interface by address without scanning the entire Vec.
+    /// Returns `None` if the address is not found or the interface was
+    /// cancelled (but not yet removed by `cleanup`).
+    fn iface_by_address(&self, address: &AddressHash) -> Option<&LocalInterface> {
+        let idx = *self.iface_index.get(address)?;
+        let iface = &self.ifaces[idx];
+        if iface.stop.is_cancelled() {
+            return None;
+        }
+        Some(iface)
+    }
+
+    /// Mutable variant of `iface_by_address`.
+    fn iface_by_address_mut(&mut self, address: &AddressHash) -> Option<&mut LocalInterface> {
+        let idx = *self.iface_index.get(address)?;
+        let iface = &mut self.ifaces[idx];
+        if iface.stop.is_cancelled() {
+            return None;
+        }
+        Some(iface)
+    }
+
     /// Return whether the interface at `address` has recursive path
     /// requests enabled.  Returns `false` if the interface is not found
     /// or cancelled.  Matches Python's `Interface.recursive_prs`.
     pub fn recursive_prs_for_iface(&self, address: &AddressHash) -> bool {
-        self.ifaces
-            .iter()
-            .find(|i| i.address == *address && !i.stop.is_cancelled())
+        self.iface_by_address(address)
             .map(|i| i.recursive_prs)
             .unwrap_or(false)
     }
@@ -1277,9 +1304,7 @@ impl InterfaceManager {
     /// Return the interface mode for the given interface address, or
     /// `InterfaceMode::Full` if the interface is not found or cancelled.
     pub fn interface_mode(&self, address: &AddressHash) -> InterfaceMode {
-        self.ifaces
-            .iter()
-            .find(|i| i.address == *address && !i.stop.is_cancelled())
+        self.iface_by_address(address)
             .map(|i| i.mode)
             .unwrap_or(InterfaceMode::Full)
     }
@@ -1323,9 +1348,7 @@ impl InterfaceManager {
     /// or `None` if the interface does not participate in MTU upgrades or
     /// is no longer active.
     pub fn hw_mtu(&self, address: &AddressHash) -> Option<usize> {
-        self.ifaces
-            .iter()
-            .find(|iface| iface.address == *address && !iface.stop.is_cancelled())
+        self.iface_by_address(address)
             .and_then(|iface| iface.hw_mtu.as_ref().map(|mtu| mtu.load(Ordering::Relaxed)))
     }
 
@@ -1601,37 +1624,30 @@ impl InterfaceManager {
     /// When set, outbound packets sent through this interface will have an
     /// Ed25519 signature attached as an Interface Access Code.
     pub fn set_ifac_config(&mut self, address: &AddressHash, config: Option<IfacConfig>) {
-        for iface in &mut self.ifaces {
-            if iface.address == *address {
-                iface.ifac_config = config;
-                return;
-            }
+        if let Some(idx) = self.iface_index.get(address).copied() {
+            self.ifaces[idx].ifac_config = config;
         }
     }
 
     /// Return the IFAC configuration for a specific interface, if set.
     pub fn get_ifac_config(&self, address: &AddressHash) -> Option<&IfacConfig> {
-        self.ifaces
-            .iter()
-            .find(|iface| iface.address == *address)
-            .and_then(|iface| iface.ifac_config.as_ref())
+        let idx = *self.iface_index.get(address)?;
+        self.ifaces[idx].ifac_config.as_ref()
     }
 
     /// Set the parent interface for an interface.
     /// Matches Python's `Interface.parent_interface` used by
     /// `BackboneInterface` and `I2PInterface` for their spawned children.
     pub fn set_parent_interface(&mut self, address: &AddressHash, parent: &AddressHash) {
-        if let Some(iface) = self.ifaces.iter_mut().find(|iface| iface.address == *address) {
-            iface.parent_interface = Some(*parent);
+        if let Some(idx) = self.iface_index.get(address).copied() {
+            self.ifaces[idx].parent_interface = Some(*parent);
         }
     }
 
     /// Return the parent_interface for a given interface, if any.
     pub fn parent_interface_of(&self, address: &AddressHash) -> Option<AddressHash> {
-        self.ifaces
-            .iter()
-            .find(|iface| iface.address == *address)
-            .and_then(|iface| iface.parent_interface)
+        let idx = *self.iface_index.get(address)?;
+        self.ifaces[idx].parent_interface
     }
 }
 
