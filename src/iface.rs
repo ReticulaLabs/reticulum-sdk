@@ -127,7 +127,7 @@ pub struct InterfaceQueueLength {
     pub tx: usize,
     /// Number of forwarded announces waiting in the interface announce pacer.
     pub announce: usize,
-    /// Cumulative number of data packets sent through this interface.
+    /// Cumulative number of packets sent through this interface.
     pub packets_tx: u64,
     /// Cumulative microseconds spent in pacing waits for this interface.
     pub pacing_wait_us: u64,
@@ -470,7 +470,7 @@ struct LocalInterface {
     recursive_prs: bool,
     /// Timestamp of the last data packet send, used for inter-packet pacing.
     last_data_send: std::sync::Mutex<Instant>,
-    /// Cumulative number of data packets sent through this interface.
+    /// Cumulative number of packets sent through this interface.
     packets_tx: AtomicU64,
     /// Cumulative number of data bytes sent through this interface.
     bytes_tx: Arc<AtomicU64>,
@@ -1589,10 +1589,9 @@ impl InterfaceManager {
             } else {
                 send_or_drop(&iface.tx_send, message, Some(&iface.saturated_queue_logger))
                     .await;
-
-                iface.packets_tx.fetch_add(1, Ordering::Relaxed);
             }
 
+            iface.packets_tx.fetch_add(1, Ordering::Relaxed);
             iface.bytes_tx.fetch_add(packet_len, Ordering::Relaxed);
         }
     }
