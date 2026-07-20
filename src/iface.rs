@@ -54,6 +54,9 @@ const INTERFACE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) const CHANNEL_LOAD_LOW_THRESHOLD: f64 = 30.0;
 pub(crate) const CHANNEL_LOAD_HIGH_THRESHOLD: f64 = 50.0;
 
+const QUEUE_WARN_THRESHOLD: usize = 1000;
+const QUEUE_WARN_INTERVAL: Duration = Duration::from_secs(300);
+
 // --- Ingress burst limiting (ported from Python Reticulum) ---
 /// How many timestamps to keep for frequency calculation.
 const INGRESS_FREQ_SAMPLES: usize = 48;
@@ -533,6 +536,7 @@ struct AnnouncePacer {
     bitrate: f64,
     announce_cap: f64,
     channel_load: Option<Arc<Mutex<f64>>>,
+    iface: Option<AddressHash>,
     state: Arc<tokio::sync::Mutex<AnnouncePacerState>>,
 }
 
@@ -541,6 +545,8 @@ struct AnnouncePacerState {
     announce_queue: VecDeque<AddressHash>,
     announce_data: HashMap<AddressHash, TxMessage>,
     timer_active: bool,
+    next_queue_warn_at: Instant,
+    last_queue_warn_len: usize,
 }
 
 impl AnnouncePacer {
@@ -549,13 +555,20 @@ impl AnnouncePacer {
             bitrate,
             announce_cap,
             channel_load: None,
+            iface: None,
             state: Arc::new(tokio::sync::Mutex::new(AnnouncePacerState {
                 announce_allowed_at: Instant::now(),
                 announce_queue: VecDeque::new(),
                 announce_data: HashMap::new(),
                 timer_active: false,
+                next_queue_warn_at: Instant::now(),
+                last_queue_warn_len: 0,
             })),
         }
+    }
+
+    fn set_iface(&mut self, addr: AddressHash) {
+        self.iface = Some(addr);
     }
 
     fn with_channel_load(mut self, load: Arc<Mutex<f64>>) -> Self {
@@ -636,6 +649,25 @@ impl AnnouncePacer {
         } else if state.announce_queue.len() < MAX_QUEUED_ANNOUNCES {
             state.announce_queue.push_back(dest);
             state.announce_data.insert(dest, message);
+        }
+
+        let qlen = state.announce_queue.len();
+        if qlen >= QUEUE_WARN_THRESHOLD
+            && qlen > state.last_queue_warn_len
+            && now >= state.next_queue_warn_at
+        {
+            state.next_queue_warn_at = now + QUEUE_WARN_INTERVAL;
+            state.last_queue_warn_len = qlen;
+            let iface = self.iface.map(|a| a.to_string()).unwrap_or_default();
+            let pkt_time = (44.0_f64 * 8.0) / self.bitrate;
+            let drain = self.effective_announce_cap() / pkt_time;
+            log::warn!(
+                "iface {}: announce backlog {} entries, cap={:.0}% ({:.0}% effective), drain={:.1}/s",
+                iface, qlen,
+                self.announce_cap * 100.0,
+                self.effective_announce_cap() * 100.0,
+                drain,
+            );
         }
 
         if !state.timer_active {
@@ -801,6 +833,8 @@ impl InterfaceManager {
             address,
             hw_mtu.as_ref().map(|m| m.load(Ordering::Relaxed))
         );
+
+        let announce_pacer = announce_pacer.map(|mut p| { p.set_iface(address); p });
 
         let stop = CancellationToken::new();
 
