@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, interval};
 use tokio_util::sync::CancellationToken;
 
 use crate::destination::link::{Link, LinkEvent, LinkEventData, LinkId, LinkStatus};
@@ -146,7 +146,7 @@ struct SentMessage {
     packet_hash: Hash,
     delivered_tx: broadcast::Sender<bool>,
     tries: u16,
-    timeout_cancel: CancellationToken,
+    deadline: Instant,
 }
 
 // ─── Inbound message reassembly ─────────────────────────────────────────────
@@ -229,14 +229,14 @@ struct Outbound {
     next_sequence: u16,
     params: ChannelParams,
     cancel: CancellationToken,
-    timeout_tx: mpsc::Sender<Hash>,
+    recalc_tx: mpsc::UnboundedSender<()>,
 }
 
 impl Outbound {
     async fn new(
         link: Arc<Mutex<Link>>,
         transport: crate::transport::Transport,
-        timeout_tx: mpsc::Sender<Hash>,
+        recalc_tx: mpsc::UnboundedSender<()>,
     ) -> Self {
         let rtt = *link.lock().await.rtt();
         let slow = rtt.as_secs_f32() > RTT_SLOW;
@@ -250,7 +250,7 @@ impl Outbound {
             next_sequence: 0,
             params: ChannelParams::new(slow),
             cancel: CancellationToken::new(),
-            timeout_tx,
+            recalc_tx,
         }
     }
 
@@ -272,47 +272,14 @@ impl Outbound {
         self.sent_messages.len() < self.params.window as usize
     }
 
-    /// Cancel the timeout task for a specific message hash.
-    fn cancel_timeout(&mut self, packet_hash: &Hash) {
-        if let Some(entry) = self.sent_messages.get(packet_hash) {
-            entry.timeout_cancel.cancel();
-        }
-    }
-
-    /// Cancel timeout for all pending messages and reschedule with the
-    /// current ring length.  Matches Python's `_update_packet_timeouts()`.
-    fn reschedule_all_timeouts(&mut self) {
-        let hashes: Vec<Hash> = self.sent_messages.keys().copied().collect();
-        for h in &hashes {
-            if let Some(entry) = self.sent_messages.get(h) {
-                entry.timeout_cancel.cancel();
-            }
-        }
-        for h in &hashes {
-            if let Some(entry) = self.sent_messages.get(h) {
-                let rtt = *self.link.blocking_lock().rtt();
-                let ring_len = self.sent_messages.len();
-                let timeout = timeout_duration(rtt, ring_len, entry.tries);
-                let mut delivered_rx = entry.delivered_tx.subscribe();
-                let cancel = self.cancel.clone();
-                let timeouts_tx = self.timeout_tx.clone();
-                let hash = *h;
-                let token = CancellationToken::new();
-                let watch_token = token.clone();
-                if let Some(entry) = self.sent_messages.get_mut(h) {
-                    entry.timeout_cancel = token;
-                }
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = sleep(timeout) => {
-                            let _ = timeouts_tx.send(hash).await;
-                        }
-                        _ = delivered_rx.recv() => {}
-                        _ = cancel.cancelled() => {}
-                        _ = watch_token.cancelled() => {}
-                    }
-                });
-            }
+    /// Recompute deadlines for all pending messages based on current RTT,
+    /// in-flight count, and per-message retry count.
+    fn recalculate_all_deadlines(&mut self) {
+        let rtt = *self.link.blocking_lock().rtt();
+        let ring_len = self.sent_messages.len();
+        let now = Instant::now();
+        for entry in self.sent_messages.values_mut() {
+            entry.deadline = now + timeout_duration(rtt, ring_len, entry.tries);
         }
     }
 
@@ -340,17 +307,14 @@ impl Outbound {
         };
         let packet_hash = packet.hash();
 
-        let (delivered_tx, mut delivered_rx) = broadcast::channel(1);
-
-        let timeout_cancel = CancellationToken::new();
-        let watch_timeout_cancel = timeout_cancel.clone();
+        let (delivered_tx, _) = broadcast::channel(1);
 
         let sent = SentMessage {
             raw_envelope: raw_envelope.clone(),
             packet_hash,
             delivered_tx,
             tries: 0,
-            timeout_cancel,
+            deadline: Instant::now(),
         };
         self.sent_messages.insert(packet_hash, sent);
 
@@ -360,41 +324,20 @@ impl Outbound {
 
         // Mark as sent (tries = 1, matching Python where tries is incremented
         // in send before the timeout is set)
-        let tries: u16 = 1;
         if let Some(entry) = self.sent_messages.get_mut(&packet_hash) {
-            entry.tries = tries;
+            entry.tries = 1;
         }
 
-        let rtt = *self.link.lock().await.rtt();
-        let ring_len = self.sent_messages.len();
-        let timeout = timeout_duration(rtt, ring_len, tries);
-
-        let hash_for_timeout = packet_hash;
-        let timeouts_tx = self.timeout_tx.clone();
-        let cancel = self.cancel.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = sleep(timeout) => {
-                    let _ = timeouts_tx.send(hash_for_timeout).await;
-                }
-                _ = delivered_rx.recv() => {}
-                _ = cancel.cancelled() => {}
-                _ = watch_timeout_cancel.cancelled() => {}
-            }
-        });
-
-        // Extend timeouts for all pending messages (Python _update_packet_timeouts)
-        self.reschedule_all_timeouts();
+        // Recompute deadlines for all in-flight messages using the updated ring_len
+        self.recalculate_all_deadlines();
+        let _ = self.recalc_tx.send(());
 
         Ok(packet_hash)
     }
 
     fn handle_proof(&mut self, packet_hash: Hash) {
         let sent_message = match self.sent_messages.remove(&packet_hash) {
-            Some(m) => {
-                m.timeout_cancel.cancel();
-                m
-            }
+            Some(m) => m,
             None => {
                 log::trace!(
                     "channel({}): ignoring delivery proof for unknown message {}",
@@ -410,6 +353,10 @@ impl Outbound {
 
         self.delivered.insert(packet_hash);
         let _ = sent_message.delivered_tx.send(true);
+
+        // Remaining in-flight messages now have a smaller ring_len; update deadlines
+        self.recalculate_all_deadlines();
+        let _ = self.recalc_tx.send(());
     }
 
     async fn handle_timeout(&mut self, packet_hash: Hash) {
@@ -440,9 +387,6 @@ impl Outbound {
 
         let new_tries = tries + 1;
 
-        // Cancel old timeout
-        self.cancel_timeout(&packet_hash);
-
         let raw_envelope = match self.sent_messages.get(&packet_hash) {
             Some(e) => e.raw_envelope.clone(),
             None => return,
@@ -458,40 +402,16 @@ impl Outbound {
         packet.context = PacketContext::Channel;
         self.transport.send_packet(packet).await;
 
-        // Transfer tracking to new hash and schedule timeout
+        // Transfer tracking to new hash
         if let Some(mut entry) = self.sent_messages.remove(&packet_hash) {
             entry.tries = new_tries;
             entry.packet_hash = new_hash;
-            let timeout_cancel = CancellationToken::new();
-            let watch_cancel = timeout_cancel.clone();
-            entry.timeout_cancel = timeout_cancel;
             self.sent_messages.insert(new_hash, entry);
-
-            // Schedule new timeout
-            if let Some(entry) = self.sent_messages.get(&new_hash) {
-                let mut delivered_rx = entry.delivered_tx.subscribe();
-                let rtt = *self.link.lock().await.rtt();
-                let ring_len = self.sent_messages.len();
-                let timeout = timeout_duration(rtt, ring_len, new_tries);
-
-                let timeouts_tx = self.timeout_tx.clone();
-                let hash = new_hash;
-                let cancel = self.cancel.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = sleep(timeout) => {
-                            let _ = timeouts_tx.send(hash).await;
-                        }
-                        _ = delivered_rx.recv() => {}
-                        _ = cancel.cancelled() => {}
-                        _ = watch_cancel.cancelled() => {}
-                    }
-                });
-            }
         }
 
-        // Extend timeouts for all pending messages (Python _update_packet_timeouts)
-        self.reschedule_all_timeouts();
+        // Recompute deadlines (ring_len unchanged, but this entry's tries changed)
+        self.recalculate_all_deadlines();
+        let _ = self.recalc_tx.send(());
     }
 }
 
@@ -534,6 +454,41 @@ async fn outbound_event_loop(
     }
 }
 
+/// Background task that periodically checks for expired message timeouts.
+///
+/// Replaces the O(n) per-message `tokio::spawn` tasks with a single polling
+/// loop, eliminating O(n²) spawn/cancel overhead on every send or retransmission.
+async fn timeout_monitor(
+    outbound: Arc<Mutex<Outbound>>,
+    timeouts_tx: mpsc::Sender<Hash>,
+    mut recalc_rx: mpsc::UnboundedReceiver<()>,
+    cancel: CancellationToken,
+) {
+    let mut ticker = interval(Duration::from_millis(100));
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = recalc_rx.recv() => continue,
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                let expired: Vec<Hash> = {
+                    let outbound = outbound.lock().await;
+                    outbound.sent_messages.iter()
+                        .filter(|(_, m)| m.deadline <= now)
+                        .map(|(h, _)| *h)
+                        .collect()
+                };
+                for h in expired {
+                    let _ = timeouts_tx.send(h).await;
+                }
+            }
+        }
+    }
+}
+
 // ─── Public Channel API ──────────────────────────────────────────────────────
 
 /// A reliable, ordered channel over a Reticulum [`Link`].
@@ -570,14 +525,24 @@ impl<M: Message> Channel<M> {
         let incoming_rx = inbound.subscribe();
 
         let (event_timeout_tx, event_timeout_rx) = mpsc::channel(256);
+        let (recalc_tx, recalc_rx) = mpsc::unbounded_channel();
+        let monitor_timeout_tx = event_timeout_tx.clone();
         let outbound = Outbound::new(
             link.clone(),
             transport.clone(),
-            event_timeout_tx,
+            recalc_tx,
         ).await;
         let cancel = outbound.cancel_token();
         let outbound_link_id = outbound.link_id();
         let outbound = Arc::new(Mutex::new(outbound));
+
+        // Spawn timeout monitor (single task replacing per-message spawned timeouts)
+        tokio::spawn(timeout_monitor(
+            outbound.clone(),
+            monitor_timeout_tx,
+            recalc_rx,
+            cancel.clone(),
+        ));
 
         // Spawn inbound receiver
         let inbound_cancel = cancel.clone();
