@@ -373,6 +373,10 @@ impl Interface for RNodeInterface {
     fn announce_cap(&self) -> f64 {
         self.config.announce_cap.unwrap_or(DEFAULT_ANNOUNCE_CAP)
     }
+
+    fn has_hardware_channel_load(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]

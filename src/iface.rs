@@ -283,6 +283,15 @@ pub trait Interface {
         false
     }
 
+    /// Whether this interface provides its own channel-load measurement
+    /// from hardware (e.g. RNode's CCA / CMD_STAT_CHTM).  When `true`,
+    /// the interface manager will skip spawning the theoretical channel
+    /// load background task that would otherwise overwrite the hardware
+    /// measurement.
+    fn has_hardware_channel_load(&self) -> bool {
+        false
+    }
+
     /// Whether this interface should auto-size its HW_MTU from the bitrate
     /// and participate in link MTU discovery / upgrades.
     fn autoconfigure_mtu(&self) -> bool {
@@ -967,16 +976,20 @@ impl InterfaceManager {
 
         // Spawn a background task that periodically calculates theoretical
         // channel load from recent TX activity for interfaces with a known
-        // bitrate.  The result is written to the shared channel_load mutex
-        // so that both the announce pacer and metrics collection see it.
+        // bitrate but no hardware channel-load measurement (e.g. RNode's
+        // CCA provides its own).  The result is written to the shared
+        // channel_load mutex so that both the announce pacer and metrics
+        // collection see a non-zero value.
         if let Some(bitrate) = bitrate.filter(|b| *b > 0.0) {
-            let stop = channel.stop.clone();
-            task::spawn(theoretical_channel_load_task(
-                channel_load,
-                bytes_tx,
-                bitrate,
-                stop,
-            ));
+            if !inner.has_hardware_channel_load() {
+                let stop = channel.stop.clone();
+                task::spawn(theoretical_channel_load_task(
+                    channel_load,
+                    bytes_tx,
+                    bitrate,
+                    stop,
+                ));
+            }
         }
 
         let inner = Arc::new(Mutex::new(inner));
@@ -1385,6 +1398,16 @@ impl InterfaceManager {
     /// returned duration so that the `InterfaceManager` lock is not held
     /// during the sleep.  Pacing delay computation is NOT repeated here.
     pub async fn send_flush(&self, message: TxMessage) {
+        // Hoist invariant values out of the per-interface loop.
+        // source_mode and is_local depend only on the message, not on the
+        // destination interface, so computing them once avoids O(n²) behaviour
+        // from the linear scan inside self.interface_mode().
+        let source_mode = match &message.tx_type {
+            TxMessageType::Broadcast(Some(addr)) => Some(self.interface_mode(addr)),
+            _ => None,
+        };
+        let is_local = self.is_local_destination(&message.packet.destination);
+
         for iface in &self.ifaces {
             let should_send = match message.tx_type {
                 TxMessageType::Broadcast(address) => {
@@ -1412,11 +1435,6 @@ impl InterfaceManager {
                 if message.packet.context == PacketContext::PathResponse {
                     // fall through — no mode restrictions
                 } else {
-                    let is_local = self.is_local_destination(&message.packet.destination);
-                    let source_mode = match &message.tx_type {
-                        TxMessageType::Broadcast(Some(addr)) => Some(self.interface_mode(addr)),
-                        _ => None,
-                    };
 
                     // Python: "elif not local_destination and interface.announces_from_internal == False
                     //          and from_interface.mode == MODE_INTERNAL: block"
@@ -1523,13 +1541,7 @@ impl InterfaceManager {
                 // flooded by traffic from the boundary (typically high-speed)
                 // side, matching the intent described in the Reticulum docs.
                 if iface.mode == InterfaceMode::Internal {
-                    let from_boundary = match &message.tx_type {
-                        TxMessageType::Broadcast(Some(addr)) => {
-                            self.interface_mode(addr) == InterfaceMode::Boundary
-                        }
-                        _ => false,
-                    };
-                    if from_boundary {
+                    if source_mode == Some(InterfaceMode::Boundary) {
                         log::trace!(
                             "iface: blocking non-announce broadcast on internal iface {} from boundary",
                             iface.address,
