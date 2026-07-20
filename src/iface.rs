@@ -107,6 +107,17 @@ pub struct RxMessage {
     pub packet: Packet,       // Received packet
 }
 
+/// Compute the on-wire size of a packet, matching the formula used by
+/// both the data pacer and the announce pacer.
+fn packet_wire_len(packet: &Packet) -> usize {
+    let transport_size = if packet.header.header_type == HeaderType::Type2 {
+        ADDRESS_HASH_SIZE
+    } else {
+        0
+    };
+    2 + transport_size + ADDRESS_HASH_SIZE + 1 + packet.data.len()
+}
+
 /// Queue length snapshot for a single interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceQueueLength {
@@ -554,7 +565,10 @@ struct AnnouncePacer {
 struct AnnouncePacerState {
     announce_allowed_at: Instant,
     announce_queue: VecDeque<AddressHash>,
-    announce_data: HashMap<AddressHash, TxMessage>,
+    /// Queued announce messages alongside the pacing interval computed
+    /// at enqueue time, so the dequeue path can read it without re-
+    /// acquiring the channel_load mutex inside wait_time().
+    announce_data: HashMap<AddressHash, (TxMessage, Duration)>,
     timer_active: bool,
     next_queue_warn_at: Instant,
     last_queue_warn_len: usize,
@@ -656,10 +670,10 @@ impl AnnouncePacer {
 
         let dest = message.packet.destination;
         if state.announce_data.contains_key(&dest) {
-            state.announce_data.insert(dest, message);
+            state.announce_data.insert(dest, (message, wait_time));
         } else if state.announce_queue.len() < MAX_QUEUED_ANNOUNCES {
             state.announce_queue.push_back(dest);
-            state.announce_data.insert(dest, message);
+            state.announce_data.insert(dest, (message, wait_time));
         }
 
         let qlen = state.announce_queue.len();
@@ -719,16 +733,14 @@ async fn process_announce_queue(
             // Pop the queued announce with the lowest hop count,
             // matching Python's hop-prioritized announce queue.
             let min_idx = state.announce_queue.iter().enumerate().filter_map(|(i, dest)| {
-                state.announce_data.get(dest).map(|msg| (i, msg.packet.header.hops))
+                state.announce_data.get(dest).map(|(msg, _)| (i, msg.packet.header.hops))
             }).min_by_key(|&(_, hops)| hops);
 
             match min_idx {
                 Some((idx, _)) => {
                     if let Some(dest) = state.announce_queue.remove(idx) {
-                        if let Some(message) = state.announce_data.remove(&dest) {
-                            if let Some(wait_time) = pacer.wait_time(&message.packet) {
-                                state.announce_allowed_at = now + wait_time;
-                            }
+                        if let Some((message, wait_time)) = state.announce_data.remove(&dest) {
+                            state.announce_allowed_at = now + wait_time;
                             Some(message)
                         } else {
                             state.timer_active = false;
@@ -1359,13 +1371,7 @@ impl InterfaceManager {
             let Some(bitrate) = iface.bitrate else { continue };
             if bitrate <= 0.0 { continue; }
 
-            let transport_size = if message.packet.header.header_type == HeaderType::Type2 {
-                ADDRESS_HASH_SIZE
-            } else {
-                0
-            };
-            let packet_len = 2 + transport_size + ADDRESS_HASH_SIZE + 1
-                + message.packet.data.len();
+            let packet_len = packet_wire_len(&message.packet);
             let tx_time = (packet_len as f64 * 8.0) / bitrate;
             let min_interval = Duration::from_secs_f64(tx_time * 2.0);
 
@@ -1426,7 +1432,8 @@ impl InterfaceManager {
 
             // Interface mode-based announce propagation filtering.
             // Matches Python RNS/Transport.py outbound() lines 1207-1264.
-            if AnnouncePacer::should_pace(&message) {
+            let is_paced_announce = AnnouncePacer::should_pace(&message);
+            if is_paced_announce {
                 // Path responses are solicited replies to client path
                 // requests.  They must cross all interface mode boundaries
                 // regardless of normal announce propagation rules,
@@ -1564,18 +1571,12 @@ impl InterfaceManager {
                 }
             }
 
-            let transport_size = if message.packet.header.header_type == HeaderType::Type2 {
-                ADDRESS_HASH_SIZE
-            } else {
-                0
-            };
-            let packet_len = (2 + transport_size + ADDRESS_HASH_SIZE + 1
-                + message.packet.data.len()) as u64;
+            let packet_len = packet_wire_len(&message.packet) as u64;
 
             if let Some(pacer) = iface
                 .announce_pacer
                 .as_ref()
-                .filter(|_| AnnouncePacer::should_pace(&message))
+                .filter(|_| is_paced_announce)
             {
                 pacer
                     .send(
