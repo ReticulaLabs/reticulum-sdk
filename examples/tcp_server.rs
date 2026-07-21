@@ -1,4 +1,5 @@
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use reticulum_sdk::identity::PrivateIdentity;
 use reticulum_sdk::iface::tcp_server::TcpServer;
 use reticulum_sdk::transport::{Transport, TransportConfig};
@@ -9,9 +10,10 @@ async fn main() {
 
     log::info!(">>> TCP SERVER APP <<<");
 
+    let mut rng = UnwrapErr(SysRng);
     let transport = Transport::new(TransportConfig::new(
         "server",
-        &PrivateIdentity::new_from_rand(OsRng),
+        &PrivateIdentity::new_from_rand(&mut rng),
         true,
     ));
 

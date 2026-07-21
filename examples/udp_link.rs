@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use reticulum_sdk::destination::link::{Link, LinkEvent, LinkStatus};
 use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
 use reticulum_sdk::hash::AddressHash;
@@ -28,7 +29,8 @@ async fn main() {
 
     log::info!(">>> UDP LINK APP <<<");
 
-    let id = PrivateIdentity::new_from_rand(OsRng);
+    let mut rng = UnwrapErr(SysRng);
+    let id = PrivateIdentity::new_from_rand(&mut rng);
     let destination =
         SingleInputDestination::new(id.clone(), DestinationName::new("example", "app"));
     let transport = Transport::new(TransportConfig::new("server", &id, true));

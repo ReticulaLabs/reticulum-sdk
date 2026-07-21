@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
 use reticulum_sdk::identity::PrivateIdentity;
 use reticulum_sdk::iface::tcp_client::TcpClient;
@@ -20,14 +21,15 @@ async fn main() {
         .await
         .spawn(TcpClient::new("127.0.0.1:4242"), TcpClient::spawn);
 
-    let id = PrivateIdentity::new_from_rand(OsRng);
+    let mut rng = UnwrapErr(SysRng);
+    let id = PrivateIdentity::new_from_rand(&mut rng);
 
     let destination = SingleInputDestination::new(id, DestinationName::new("example", "app"));
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     transport
-        .send_direct(client_addr, destination.announce(OsRng, None).unwrap())
+        .send_direct(client_addr, destination.announce(&mut rng, None).unwrap())
         .await;
 
     let _ = tokio::signal::ctrl_c().await;

@@ -3,7 +3,8 @@ use std::str::from_utf8;
 
 use tokio::io::AsyncBufReadExt;
 
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 
 use reticulum_sdk::destination::link::{LinkEvent, LinkStatus};
 use reticulum_sdk::destination::{DestinationName, SingleInputDestination};
@@ -42,7 +43,8 @@ async fn main() {
         last_hop
     );
 
-    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let mut rng = UnwrapErr(SysRng);
+    let identity = PrivateIdentity::new_from_rand(&mut rng);
     let transport_id = identity.address_hash().clone();
 
     let last_hop_id = PrivateIdentity::new_from_name("last_hop");
@@ -79,14 +81,14 @@ async fn main() {
         if our_hop == last_hop {
             destination = transport.add_destination(last_hop_id, last_hop_name).await;
         } else {
-            let id = PrivateIdentity::new_from_rand(OsRng);
+            let id = PrivateIdentity::new_from_rand(&mut rng);
             let name = DestinationName::new(&format!("hop-{}", our_hop), "app");
             destination = transport.add_destination(id, name).await;
         }
 
         log::info!("Created destination {}", destination.lock().await.desc);
 
-        let mut announce = destination.lock().await.announce(OsRng, None).unwrap();
+        let mut announce = destination.lock().await.announce(&mut rng, None).unwrap();
 
         announce.transport = Some(transport_id);
         announce.header.header_type = HeaderType::Type2;

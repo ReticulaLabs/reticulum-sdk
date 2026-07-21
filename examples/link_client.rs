@@ -1,4 +1,5 @@
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 
 use reticulum_sdk::destination::link::LinkEvent;
 use reticulum_sdk::destination::{DestinationAnnounce, DestinationName};
@@ -31,8 +32,9 @@ async fn main() {
         )
         .await;
 
+    let mut rng = UnwrapErr(SysRng);
     transport
-        .send_packet(in_destination.lock().await.announce(OsRng, None).unwrap())
+        .send_packet(in_destination.lock().await.announce(&mut rng, None).unwrap())
         .await;
 
     tokio::spawn(async move {
