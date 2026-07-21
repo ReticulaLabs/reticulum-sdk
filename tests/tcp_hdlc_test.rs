@@ -2,7 +2,8 @@ use std::net::TcpListener;
 use std::sync::Once;
 use std::time::Duration;
 
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use reticulum_sdk::{
     identity::PrivateIdentity,
     iface::{tcp_client::TcpClient, tcp_server::TcpServer},
@@ -30,10 +31,11 @@ async fn build_transport(
     server_listener: TcpListener,
     client_addr: &[&str],
 ) -> Transport {
+    let mut rng = UnwrapErr(SysRng);
     let server_addr = server_listener.local_addr().unwrap().to_string();
     let transport = Transport::new(TransportConfig::new(
         name,
-        &PrivateIdentity::new_from_rand(OsRng),
+        &PrivateIdentity::new_from_rand(&mut rng),
         true,
     ));
 

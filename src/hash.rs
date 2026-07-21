@@ -4,7 +4,7 @@ use core::fmt;
 
 use crypto_common::OutputSizeUser;
 use crypto_common::typenum::Unsigned;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 use sha2::{Digest, Sha256};
 
 use crate::error::RnsError;
@@ -45,7 +45,7 @@ impl Hash {
         Self { 0: hash }
     }
 
-    pub fn new_from_rand<R: CryptoRngCore>(mut rng: R) -> Self {
+    pub fn new_from_rand<R: CryptoRng + ?Sized>(rng: &mut R) -> Self {
         let mut hash = [0u8; HASH_SIZE];
         let mut data = [0u8; HASH_SIZE];
 
@@ -89,7 +89,7 @@ impl AddressHash {
         Self { 0: address_hash }
     }
 
-    pub fn new_from_rand<R: CryptoRngCore>(rng: R) -> Self {
+    pub fn new_from_rand<R: CryptoRng + ?Sized>(rng: &mut R) -> Self {
         Self::new_from_hash(&Hash::new_from_rand(rng))
     }
 
@@ -167,13 +167,15 @@ impl fmt::Display for Hash {
 #[cfg(test)]
 mod tests {
 
-    use rand_core::OsRng;
+    use rand_core::UnwrapErr;
+    use getrandom::SysRng;
 
     use crate::hash::AddressHash;
 
     #[test]
     fn address_hex_string() {
-        let original_address_hash = AddressHash::new_from_rand(OsRng);
+        let mut rng = UnwrapErr(SysRng);
+        let original_address_hash = AddressHash::new_from_rand(&mut rng);
 
         let address_hash_hex = original_address_hash.to_hex_string();
 

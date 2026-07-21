@@ -3,7 +3,8 @@ use std::sync::Once;
 use std::time::Duration;
 
 use ed25519_dalek::{SIGNATURE_LENGTH, Signature};
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use reticulum_sdk::{
     destination::link::LinkEvent,
     destination::{DestinationDesc, DestinationName, SingleOutputDestination},
@@ -38,7 +39,8 @@ async fn build_transport_full(
     retransmit: bool,
 ) -> Transport {
     let server_addr = server_listener.local_addr().unwrap().to_string();
-    let mut config = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), true);
+    let mut rng = UnwrapErr(SysRng);
+    let mut config = TransportConfig::new(name, &PrivateIdentity::new_from_rand(&mut rng), true);
 
     if retransmit {
         config.set_retransmit(true);
@@ -73,7 +75,8 @@ async fn build_transport_probe(
     respond_to_probes: bool,
 ) -> Transport {
     let server_addr = server_listener.local_addr().unwrap().to_string();
-    let mut config = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), broadcast);
+    let mut rng = UnwrapErr(SysRng);
+    let mut config = TransportConfig::new(name, &PrivateIdentity::new_from_rand(&mut rng), broadcast);
 
     if retransmit {
         config.set_retransmit(true);

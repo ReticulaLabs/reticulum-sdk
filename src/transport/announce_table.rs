@@ -1,7 +1,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use rand_core::OsRng;
-use rand_core::RngCore;
+use getrandom::SysRng;
+use rand_core::{Rng, UnwrapErr};
 use tokio::time::{Duration, Instant};
 
 use crate::hash::AddressHash;
@@ -20,7 +20,8 @@ const PATHFINDER_RW_MILLIS: u64 = 500;
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
 
 fn random_rw_jitter() -> Duration {
-    Duration::from_millis(OsRng.next_u64() % (PATHFINDER_RW_MILLIS + 1))
+    let mut rng = UnwrapErr(SysRng);
+    Duration::from_millis(rng.next_u64() % (PATHFINDER_RW_MILLIS + 1))
 }
 
 #[derive(Clone)]

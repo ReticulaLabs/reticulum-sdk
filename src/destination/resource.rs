@@ -1,7 +1,8 @@
 use core::time::Duration;
 use std::collections::VecDeque;
 
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use rand_core::{Rng, UnwrapErr};
 use sha2::{Digest, Sha256};
 
 use rmpv::{Value, decode::read_value, encode::write_value};
@@ -384,7 +385,8 @@ impl Resource {
         // Generate random hash (used for map hash computation, matching Python)
         let random_hash: [u8; RANDOM_HASH_SIZE] = {
             let mut buf = [0u8; RANDOM_HASH_SIZE];
-            OsRng.fill_bytes(&mut buf);
+            let mut rng = UnwrapErr(SysRng);
+            rng.fill_bytes(&mut buf);
             buf
         };
 
@@ -392,7 +394,8 @@ impl Resource {
         // (the inline random hash is separate from self.random_hash)
         let mut plaintext_blob = Vec::with_capacity(RANDOM_HASH_SIZE + data.len());
         let mut inline_random = [0u8; RANDOM_HASH_SIZE];
-        OsRng.fill_bytes(&mut inline_random);
+        let mut rng = UnwrapErr(SysRng);
+        rng.fill_bytes(&mut inline_random);
         plaintext_blob.extend_from_slice(&inline_random);
         plaintext_blob.extend_from_slice(data);
 
@@ -451,7 +454,8 @@ impl Resource {
 
                 if collision_guard.contains(&map_hash) {
                     // Collision - regenerate random hash and retry
-                    OsRng.fill_bytes(&mut random_hash_value);
+                    let mut rng = UnwrapErr(SysRng);
+                    rng.fill_bytes(&mut random_hash_value);
                     hashmap_ok = false;
                     break;
                 }

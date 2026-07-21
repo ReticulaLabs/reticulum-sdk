@@ -134,7 +134,8 @@ impl Packet {
 
 #[cfg(test)]
 mod tests {
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     use crate::{
         buffer::{InputBuffer, OutputBuffer},
@@ -280,8 +281,8 @@ mod tests {
                 hops: 0,
             },
             ifac: None,
-            destination: AddressHash::new_from_rand(OsRng),
-            transport: Some(AddressHash::new_from_rand(OsRng)),
+            destination: AddressHash::new_from_rand(&mut UnwrapErr(SysRng)),
+            transport: Some(AddressHash::new_from_rand(&mut UnwrapErr(SysRng))),
             context: PacketContext::None,
             data: PacketDataBuffer::new(),
         };
@@ -310,7 +311,7 @@ mod tests {
                 hops: 0,
             },
             ifac: None,
-            destination: AddressHash::new_from_rand(OsRng),
+            destination: AddressHash::new_from_rand(&mut UnwrapErr(SysRng)),
             transport: None,
             context: PacketContext::None,
             data: PacketDataBuffer::new(),
@@ -359,7 +360,7 @@ mod tests {
                 ..Default::default()
             },
             ifac: Some(ifac),
-            destination: AddressHash::new_from_rand(OsRng),
+            destination: AddressHash::new_from_rand(&mut UnwrapErr(SysRng)),
             transport: None,
             context: PacketContext::None,
             data: PacketDataBuffer::new_from_slice(b"hello"),
@@ -401,8 +402,8 @@ mod tests {
                 ..Default::default()
             },
             ifac: Some(ifac),
-            destination: AddressHash::new_from_rand(OsRng),
-            transport: Some(AddressHash::new_from_rand(OsRng)),
+            destination: AddressHash::new_from_rand(&mut UnwrapErr(SysRng)),
+            transport: Some(AddressHash::new_from_rand(&mut UnwrapErr(SysRng))),
             context: PacketContext::None,
             data: PacketDataBuffer::new_from_slice(b"world"),
         };
@@ -435,7 +436,7 @@ mod tests {
                 ..Default::default()
             },
             ifac: None,
-            destination: AddressHash::new_from_rand(OsRng),
+            destination: AddressHash::new_from_rand(&mut UnwrapErr(SysRng)),
             transport: None,
             context: PacketContext::None,
             data: PacketDataBuffer::new_from_slice(b"data"),

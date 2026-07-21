@@ -2,7 +2,8 @@ use std::net::TcpListener;
 use std::sync::Once;
 use std::time::Duration;
 
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use reticulum_sdk::{
     destination::DestinationName,
     identity::PrivateIdentity,
@@ -33,7 +34,7 @@ async fn build_transport(
     let server_addr = server_listener.local_addr().unwrap().to_string();
     let transport = Transport::new(TransportConfig::new(
         name,
-        &PrivateIdentity::new_from_rand(OsRng),
+        &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     ));
 
@@ -156,7 +157,7 @@ async fn shared_instance_client_receives_network_discovery_announces() {
 
     let mut server_config = TransportConfig::new(
         "shared-server",
-        &PrivateIdentity::new_from_rand(OsRng),
+        &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     );
     server_config.set_share_instance(true);
@@ -170,7 +171,7 @@ async fn shared_instance_client_receives_network_discovery_announces() {
 
     let mut client_config = TransportConfig::new(
         "shared-client",
-        &PrivateIdentity::new_from_rand(OsRng),
+        &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     );
     client_config.set_share_instance(true);
@@ -219,7 +220,7 @@ async fn shared_instance_client_receives_passive_destination_announces() {
 
     let mut server_config = TransportConfig::new(
         "shared-server-passive",
-        &PrivateIdentity::new_from_rand(OsRng),
+        &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     );
     server_config.set_share_instance(true);
@@ -233,7 +234,7 @@ async fn shared_instance_client_receives_passive_destination_announces() {
 
     let mut client_config = TransportConfig::new(
         "shared-client-passive",
-        &PrivateIdentity::new_from_rand(OsRng),
+        &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     );
     client_config.set_share_instance(true);
@@ -245,7 +246,7 @@ async fn shared_instance_client_receives_passive_destination_announces() {
         build_transport("remote-passive", remote_listener, &[server_addr.as_str()]).await;
     let destination = remote
         .add_destination(
-            PrivateIdentity::new_from_rand(OsRng),
+            PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
             DestinationName::new("test", "passive_announce"),
         )
         .await;

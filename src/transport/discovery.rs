@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use ed25519_dalek::Signature;
+use getrandom::SysRng;
 use hkdf::Hkdf;
-use rand_core::{OsRng, RngCore};
+use rand_core::{Rng, UnwrapErr};
 use rmpv::{Value, decode::read_value, encode::write_value};
 use sha2::{Digest, Sha256};
 use tokio::time;
@@ -526,10 +527,11 @@ fn generate_stamp(
     expand_rounds: usize,
 ) -> Result<[u8; HASH_SIZE], RnsError> {
     let workblock = stamp_workblock(material, expand_rounds)?;
+    let mut rng = UnwrapErr(SysRng);
 
     loop {
         let mut stamp = [0u8; HASH_SIZE];
-        OsRng.fill_bytes(&mut stamp);
+        rng.fill_bytes(&mut stamp);
 
         if stamp_valid(&stamp, stamp_cost, &workblock) {
             return Ok(stamp);

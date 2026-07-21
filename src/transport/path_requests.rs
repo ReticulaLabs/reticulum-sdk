@@ -1,6 +1,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 
 use tokio::time::{Duration, Instant};
 
@@ -34,7 +35,8 @@ const PATH_REQUEST_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DISCOVERY_PATH_REQUEST_TAGS: usize = 32_000;
 
 pub fn create_random_tag() -> TagBytes {
-    AddressHash::new_from_rand(OsRng).as_slice().into()
+    let mut rng = UnwrapErr(SysRng);
+    AddressHash::new_from_rand(&mut rng).as_slice().into()
 }
 
 pub struct PathRequest {

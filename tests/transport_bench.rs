@@ -1,7 +1,8 @@
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use reticulum_sdk::{
     destination::{DestinationName, SingleInputDestination, SingleOutputDestination},
     hash::AddressHash,
@@ -42,14 +43,15 @@ async fn setup_transport() -> (Transport, reticulum_sdk::iface::InterfaceChannel
 async fn bench_send_packet_routed() {
     setup();
 
+    let mut rng = UnwrapErr(SysRng);
     let (transport, channel) = setup_transport().await;
     let iface_addr = *channel.address();
 
     let remote = SingleInputDestination::new(
-        PrivateIdentity::new_from_rand(OsRng),
+        PrivateIdentity::new_from_rand(&mut rng),
         DestinationName::new("bench", "routed"),
     );
-    let mut announce = remote.announce(OsRng, None).unwrap();
+    let mut announce = remote.announce(&mut rng, None).unwrap();
     announce.header.header_type = HeaderType::Type2;
     announce.header.propagation_type = PropagationType::Transport;
     announce.header.hops = 1;
@@ -153,12 +155,13 @@ async fn bench_send_packet_broadcast() {
 async fn bench_inbound_data_decryption() {
     setup();
 
+    let mut rng = UnwrapErr(SysRng);
     let mut transport = Transport::new(TransportConfig::default());
     let im = transport.iface_manager();
     let channel = im.lock().await.new_channel(TX_CHANNEL_CAP);
     let iface_addr = *channel.address();
 
-    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let identity = PrivateIdentity::new_from_rand(&mut rng);
     let dest = transport
         .add_destination(identity, DestinationName::new("bench", "inbound"))
         .await;

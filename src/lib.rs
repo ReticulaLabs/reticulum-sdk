@@ -68,7 +68,8 @@
 //! Destinations need to be announced to the network.
 //!
 //! ```
-//! # use rand_core::OsRng;
+//! # use getrandom::SysRng;
+//! # use rand_core::UnwrapErr;
 //! # use reticulum_sdk::transport::{Transport, TransportConfig};
 //! # use reticulum_sdk::identity::PrivateIdentity;
 //! # use reticulum_sdk::destination::{SingleInputDestination, DestinationName};
@@ -76,7 +77,8 @@
 //! # #[tokio::main]
 //! # async fn main() {
 //!     # let mut transport = Transport::new(TransportConfig::default());
-//!     let id = PrivateIdentity::new_from_rand(OsRng);
+//!     # let mut rng = UnwrapErr(SysRng);
+//!     let id = PrivateIdentity::new_from_rand(&mut rng);
 //!     let destination = transport
 //!         .add_destination(id, DestinationName::new("example", "app"))
 //!         .await;
@@ -93,7 +95,8 @@
 //!
 //! ```no_run
 // Don't run because it will run forever because it will never receive announces
-//! # use rand_core::OsRng;
+//! # use getrandom::SysRng;
+//! # use rand_core::UnwrapErr;
 //! # use tokio::sync::Mutex;
 //! # use std::sync::Arc;
 //! # use reticulum_sdk::transport::{Transport, TransportConfig};
@@ -102,7 +105,8 @@
 //! # #[tokio::main]
 //! # async fn main() {
 //!     # let transport = Transport::new(TransportConfig::default());
-//!     # let target_destination = AddressHash::new_from_rand(OsRng);
+//!     # let mut rng = UnwrapErr(SysRng);
+//!     # let target_destination = AddressHash::new_from_rand(&mut rng);
 //!     let mut link: Option<Arc<Mutex<Link>>> = None;
 //!     let mut announce_receiver = transport.recv_announces().await;
 //!     while let Ok(announce) = announce_receiver.recv().await {

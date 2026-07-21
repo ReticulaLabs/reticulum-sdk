@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, Signature, SigningKey};
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use rmpv::{Value, decode::read_value, encode::write_value};
 use sha2::Digest;
 use x25519_dalek::StaticSecret;
@@ -249,10 +250,11 @@ impl Link {
         destination: DestinationDesc,
         event_tx: tokio::sync::broadcast::Sender<LinkEventData>,
     ) -> Self {
+        let mut rng = UnwrapErr(SysRng);
         Self {
             id: AddressHash::new_empty(),
             destination,
-            priv_identity: PrivateIdentity::new_from_rand(OsRng),
+            priv_identity: PrivateIdentity::new_from_rand(&mut rng),
             peer_identity: Identity::default(),
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
@@ -304,10 +306,11 @@ impl Link {
             RETICULUM_MTU
         };
 
+        let mut rng = UnwrapErr(SysRng);
         let mut link = Self {
             id: link_id,
             destination,
-            priv_identity: PrivateIdentity::new(StaticSecret::random_from_rng(OsRng), signing_key),
+            priv_identity: PrivateIdentity::new(StaticSecret::random_from_rng(&mut rng), signing_key),
             peer_identity,
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
@@ -848,13 +851,15 @@ impl Link {
     }
 
     pub fn encrypt<'a>(&self, text: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+        let mut rng = UnwrapErr(SysRng);
         self.priv_identity
-            .encrypt(OsRng, text, &self.derived_key, out_buf)
+            .encrypt(&mut rng, text, &self.derived_key, out_buf)
     }
 
     pub fn decrypt<'a>(&self, text: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+        let mut rng = UnwrapErr(SysRng);
         self.priv_identity
-            .decrypt(OsRng, text, &self.derived_key, out_buf)
+            .decrypt(&mut rng, text, &self.derived_key, out_buf)
     }
 
     pub fn destination(&self) -> &DestinationDesc {

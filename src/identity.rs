@@ -1,8 +1,8 @@
 use alloc::fmt::Write;
 use hkdf::Hkdf;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey, ed25519::signature::Signer};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret, StaticSecret};
 
@@ -21,9 +21,9 @@ pub const DERIVED_KEY_LENGTH: usize = 256 / 8;
 pub const DERIVED_KEY_LENGTH: usize = 512 / 8;
 
 pub trait EncryptIdentity {
-    fn encrypt<'a, R: CryptoRngCore + Copy>(
+    fn encrypt<'a, R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         text: &[u8],
         derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
@@ -31,9 +31,9 @@ pub trait EncryptIdentity {
 }
 
 pub trait DecryptIdentity {
-    fn decrypt<'a, R: CryptoRngCore + Copy>(
+    fn decrypt<'a, R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         data: &[u8],
         derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
@@ -134,13 +134,13 @@ impl Identity {
             .map_err(|_| RnsError::IncorrectSignature)
     }
 
-    pub fn derive_key<R: CryptoRngCore + Copy>(&self, rng: R, salt: Option<&[u8]>) -> DerivedKey {
+    pub fn derive_key<R: CryptoRng + ?Sized>(&self, rng: &mut R, salt: Option<&[u8]>) -> DerivedKey {
         DerivedKey::new_from_ephemeral_key(rng, &self.public_key, salt)
     }
 
-    pub fn encrypt_packet<'a, R: CryptoRngCore + Copy>(
+    pub fn encrypt_packet<'a, R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         text: &[u8],
         salt: Option<&[u8]>,
         out_buf: &'a mut [u8],
@@ -148,9 +148,9 @@ impl Identity {
         self.encrypt_packet_to_public_key(rng, &self.public_key, text, salt, out_buf)
     }
 
-    pub fn encrypt_packet_to_public_key<'a, R: CryptoRngCore + Copy>(
+    pub fn encrypt_packet_to_public_key<'a, R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         public_key: &PublicKey,
         text: &[u8],
         salt: Option<&[u8]>,
@@ -167,12 +167,12 @@ impl Identity {
         out_buf[..ephemeral_public_bytes.len()].copy_from_slice(ephemeral_public_bytes);
 
         let derived_key = DerivedKey::new(&ephemeral_key.diffie_hellman(public_key), salt);
-        let token = Fernet::new_from_slices(
+        let mut fernet = Fernet::new_from_slices(
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
-        )
-        .encrypt(
+        );
+        let token = fernet.encrypt(
             PlainText::from(text),
             &mut out_buf[ephemeral_public_bytes.len()..],
         )?;
@@ -186,7 +186,8 @@ impl Identity {
 impl Default for Identity {
     fn default() -> Self {
         let empty_key = [0u8; PUBLIC_KEY_LENGTH];
-        Self::new(PublicKey::from(empty_key), VerifyingKey::default())
+        let sign_key = SigningKey::from_bytes(&empty_key);
+        Self::new(PublicKey::from(empty_key), sign_key.verifying_key())
     }
 }
 
@@ -197,9 +198,9 @@ impl HashIdentity for Identity {
 }
 
 impl EncryptIdentity for Identity {
-    fn encrypt<'a, R: CryptoRngCore + Copy>(
+    fn encrypt<'a, R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         text: &[u8],
         derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
@@ -218,12 +219,12 @@ impl EncryptIdentity for Identity {
             }
         }
 
-        let token = Fernet::new_from_slices(
+        let mut fernet = Fernet::new_from_slices(
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
-        )
-        .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
+        );
+        let token = fernet.encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
 
         out_offset += token.as_bytes().len();
 
@@ -240,9 +241,9 @@ impl HashIdentity for EmptyIdentity {
 }
 
 impl EncryptIdentity for EmptyIdentity {
-    fn encrypt<'a, R: CryptoRngCore + Copy>(
+    fn encrypt<'a, R: CryptoRng + ?Sized>(
         &self,
-        _rng: R,
+        _rng: &mut R,
         text: &[u8],
         _derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
@@ -258,9 +259,9 @@ impl EncryptIdentity for EmptyIdentity {
 }
 
 impl DecryptIdentity for EmptyIdentity {
-    fn decrypt<'a, R: CryptoRngCore + Copy>(
+    fn decrypt<'a, R: CryptoRng + ?Sized>(
         &self,
-        _rng: R,
+        _rng: &mut R,
         data: &[u8],
         _derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
@@ -291,8 +292,8 @@ impl PrivateIdentity {
         }
     }
 
-    pub fn new_from_rand<R: CryptoRngCore>(mut rng: R) -> Self {
-        let sign_key = SigningKey::generate(&mut rng);
+    pub fn new_from_rand<R: CryptoRng + ?Sized>(rng: &mut R) -> Self {
+        let sign_key = SigningKey::generate(rng);
         let private_key = StaticSecret::random_from_rng(rng);
 
         Self::new(private_key, sign_key)
@@ -385,9 +386,9 @@ impl PrivateIdentity {
         DerivedKey::new_from_private_key(&self.private_key, public_key, salt)
     }
 
-    pub fn decrypt_packet<'a, R: CryptoRngCore + Copy>(
+    pub fn decrypt_packet<'a, R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         data: &[u8],
         salt: Option<&[u8]>,
         out_buf: &'a mut [u8],
@@ -422,21 +423,21 @@ impl HashIdentity for PrivateIdentity {
 }
 
 impl EncryptIdentity for PrivateIdentity {
-    fn encrypt<'a, R: CryptoRngCore + Copy>(
+    fn encrypt<'a, R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         text: &[u8],
         derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], RnsError> {
         let mut out_offset = 0;
 
-        let token = Fernet::new_from_slices(
+        let mut fernet = Fernet::new_from_slices(
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
-        )
-        .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
+        );
+        let token = fernet.encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
 
         out_offset += token.len();
 
@@ -445,9 +446,9 @@ impl EncryptIdentity for PrivateIdentity {
 }
 
 impl DecryptIdentity for PrivateIdentity {
-    fn decrypt<'a, R: CryptoRngCore + Copy>(
+    fn decrypt<'a, R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         data: &[u8],
         derived_key: &DerivedKey,
         out_buf: &'a mut [u8],
@@ -501,8 +502,8 @@ impl DerivedKey {
         Self::new(&priv_key.diffie_hellman(pub_key), salt)
     }
 
-    pub fn new_from_ephemeral_key<R: CryptoRngCore + Copy>(
-        rng: R,
+    pub fn new_from_ephemeral_key<R: CryptoRng + ?Sized>(
+        rng: &mut R,
         pub_key: &PublicKey,
         salt: Option<&[u8]>,
     ) -> Self {
@@ -522,13 +523,15 @@ impl DerivedKey {
 
 #[cfg(test)]
 mod tests {
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     use super::PrivateIdentity;
 
     #[test]
     fn private_identity_hex_string() {
-        let original_id = PrivateIdentity::new_from_rand(OsRng);
+        let mut rng = UnwrapErr(SysRng);
+        let original_id = PrivateIdentity::new_from_rand(&mut rng);
         let original_hex = original_id.to_hex_string();
 
         let actual_id =

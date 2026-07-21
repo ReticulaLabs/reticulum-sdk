@@ -2,7 +2,7 @@
 // Do not edit by hand; regenerate from exported JSON instead.
 
 use ed25519_dalek::SigningKey;
-use rand_core::{CryptoRng, Error, RngCore};
+use rand_core::{Infallible, TryCryptoRng, TryRng};
 use x25519_dalek::StaticSecret;
 
 use crate::identity::PrivateIdentity;
@@ -70,33 +70,31 @@ impl FixedRng {
     }
 }
 
-impl RngCore for FixedRng {
-    fn next_u32(&mut self) -> u32 {
-        let mut buf = [0u8; 4];
-        self.fill_bytes(&mut buf);
-        u32::from_le_bytes(buf)
-    }
+impl TryRng for FixedRng {
+    type Error = Infallible;
 
-    fn next_u64(&mut self) -> u64 {
-        let mut buf = [0u8; 8];
-        self.fill_bytes(&mut buf);
-        u64::from_le_bytes(buf)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        for byte in dest {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        for byte in dest.iter_mut() {
             *byte = self.bytes[self.offset % self.bytes.len()];
             self.offset += 1;
         }
+        Ok(())
     }
 
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
-        self.fill_bytes(dest);
-        Ok(())
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut buf = [0u8; 4];
+        self.try_fill_bytes(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut buf = [0u8; 8];
+        self.try_fill_bytes(&mut buf)?;
+        Ok(u64::from_le_bytes(buf))
     }
 }
 
-impl CryptoRng for FixedRng {}
+impl TryCryptoRng for FixedRng {}
 
 pub fn decode_hex(hex: &str) -> Vec<u8> {
     assert_eq!(hex.len() % 2, 0, "hex string must be even-length");

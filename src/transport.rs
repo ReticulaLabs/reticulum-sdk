@@ -12,8 +12,9 @@ use path_requests::PathRequests;
 use path_requests::TagBytes;
 use path_requests::create_path_request_destination;
 use path_table::PathTable;
-use rand_core::OsRng;
-use rand_core::RngCore;
+use getrandom::SysRng;
+use rand_core::Rng;
+use rand_core::UnwrapErr;
 use reverse_table::ReverseTable;
 use rmpv::{Value, decode::read_value, encode::write_value};
 use sha2::Sha256;
@@ -679,9 +680,10 @@ impl TransportConfig {
 
 impl Default for TransportConfig {
     fn default() -> Self {
+        let mut rng = UnwrapErr(SysRng);
         Self {
-            name: "tp".into(),
-            identity: PrivateIdentity::new_from_rand(OsRng),
+            name: "reticulum".into(),
+            identity: PrivateIdentity::new_from_rand(&mut rng),
             broadcast: false,
             retransmit: false,
             reroute_eager: false,
@@ -1038,13 +1040,14 @@ impl Transport {
         destination: &Arc<Mutex<SingleInputDestination>>,
         app_data: Option<&[u8]>,
     ) {
+        let mut rng = UnwrapErr(SysRng);
         self.send_ctx
             .send_packet(
                 &self.name,
                 destination
                     .lock()
                     .await
-                    .announce(OsRng, app_data)
+                    .announce(&mut rng, app_data)
                     .expect("valid announce packet"),
             )
             .await;
@@ -1778,8 +1781,9 @@ async fn shared_rpc_authenticate(
 }
 
 fn shared_rpc_challenge() -> Vec<u8> {
+    let mut rng = UnwrapErr(SysRng);
     let mut random = [0u8; 40];
-    OsRng.fill_bytes(&mut random);
+    rng.fill_bytes(&mut random);
 
     let mut challenge = Vec::with_capacity(PY_CONN_CHALLENGE.len() + 8 + random.len());
     challenge.extend_from_slice(PY_CONN_CHALLENGE);
@@ -2720,10 +2724,11 @@ impl TransportHandler {
             .config
             .build_app_data(self.config.retransmit, self.config.identity.address_hash())?;
 
+        let mut rng = UnwrapErr(SysRng);
         self.discovery_destination
             .lock()
             .await
-            .announce(OsRng, Some(app_data.as_slice()))
+            .announce(&mut rng, Some(app_data.as_slice()))
     }
 }
 
@@ -3302,10 +3307,11 @@ async fn handle_path_request(
 
     if let Some(request) = handler.path_requests.decode(packet.data.as_slice()) {
         if let Some(dest) = handler.single_in_destinations.get(&request.destination) {
+            let mut rng = UnwrapErr(SysRng);
             let response = dest
                 .lock()
                 .await
-                .path_response(OsRng, None)
+                .path_response(&mut rng, None)
                 .expect("valid path response");
 
             pending.push(TxMessage {
@@ -5156,12 +5162,13 @@ mod tests {
             *iface_manager.new_channel(4).address()
         };
 
+        let mut rng = UnwrapErr(SysRng);
         let remote_destination = SingleInputDestination::new(
-            PrivateIdentity::new_from_rand(OsRng),
+            PrivateIdentity::new_from_rand(&mut rng),
             DestinationName::new("example_utilities", "shared.rpc.path"),
         );
         let mut announce = remote_destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid announce");
         let destination = announce.destination;
         let next_hop = AddressHash::new_from_slice(b"next-hop-transport");
@@ -5354,9 +5361,10 @@ mod tests {
     #[tokio::test]
     async fn decrypts_single_destination_packets_before_emitting() {
         let mut transport = Transport::new(Default::default());
+        let mut rng = UnwrapErr(SysRng);
         let destination = transport
             .add_destination(
-                PrivateIdentity::new_from_rand(OsRng),
+                PrivateIdentity::new_from_rand(&mut rng),
                 DestinationName::new("example_utilities", "single.decrypt"),
             )
             .await;
@@ -5367,7 +5375,7 @@ mod tests {
             .data_packet(b"plaintext payload")
             .expect("encrypted packet");
 
-        let iface = AddressHash::new_from_rand(OsRng);
+        let iface = AddressHash::new_from_rand(&mut rng);
         let handler = transport.get_handler();
         let mut events = transport.received_data_events();
 
@@ -5385,9 +5393,10 @@ mod tests {
     #[tokio::test]
     async fn invalid_single_destination_ciphertext_is_not_proved() {
         let mut transport = Transport::new(Default::default());
+        let mut rng = UnwrapErr(SysRng);
         let destination = transport
             .add_destination(
-                PrivateIdentity::new_from_rand(OsRng),
+                PrivateIdentity::new_from_rand(&mut rng),
                 DestinationName::new("example_utilities", "single.proof"),
             )
             .await;
@@ -5434,12 +5443,13 @@ mod tests {
             (*channel.address(), channel.tx_channel)
         };
 
+        let mut rng = UnwrapErr(SysRng);
         let remote_destination = SingleInputDestination::new(
-            PrivateIdentity::new_from_rand(OsRng),
+            PrivateIdentity::new_from_rand(&mut rng),
             DestinationName::new("example_utilities", "known.path"),
         );
         let mut announce = remote_destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid announce");
         let destination = announce.destination;
         let next_hop = AddressHash::new_from_slice(b"next-hop-transport");
@@ -5482,14 +5492,15 @@ mod tests {
     async fn path_response_bypasses_announce_rate_limits() {
         let transport = Transport::new(Default::default());
         let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
         let remote_destination = SingleInputDestination::new(
-            PrivateIdentity::new_from_rand(OsRng),
+            PrivateIdentity::new_from_rand(&mut rng),
             DestinationName::new("example_utilities", "path.response"),
         );
         let path_response = remote_destination
-            .path_response(OsRng, None)
+            .path_response(&mut rng, None)
             .expect("valid path response");
-        let iface = AddressHash::new_from_rand(OsRng);
+        let iface = AddressHash::new_from_rand(&mut rng);
 
         {
             let mut guard = handler.lock().await;
@@ -5522,14 +5533,15 @@ mod tests {
     async fn metrics_snapshot_reflects_transport_state() {
         let transport = Transport::new(Default::default());
         let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
         let remote_destination = SingleInputDestination::new(
-            PrivateIdentity::new_from_rand(OsRng),
+            PrivateIdentity::new_from_rand(&mut rng),
             DestinationName::new("example_utilities", "metrics.path"),
         );
         let announce = remote_destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid announce");
-        let iface = AddressHash::new_from_rand(OsRng);
+        let iface = AddressHash::new_from_rand(&mut rng);
 
         // Before any traffic
         let m = transport.metrics().await;
@@ -5566,14 +5578,15 @@ mod tests {
     async fn metrics_track_rate_limited_announces() {
         let transport = Transport::new(Default::default());
         let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
         let remote_destination = SingleInputDestination::new(
-            PrivateIdentity::new_from_rand(OsRng),
+            PrivateIdentity::new_from_rand(&mut rng),
             DestinationName::new("example_utilities", "metrics.limit"),
         );
         let announce = remote_destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid announce");
-        let iface = AddressHash::new_from_rand(OsRng);
+        let iface = AddressHash::new_from_rand(&mut rng);
 
         // Force-block the destination so the next announce is rate-limited
         {
@@ -5604,11 +5617,12 @@ mod tests {
         );
         let second_destination =
             SingleInputDestination::new(identity, DestinationName::new("lxst", "messaging"));
+        let mut rng = UnwrapErr(SysRng);
         let first_announce = first_destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid first announce");
         let second_announce = second_destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid second announce");
 
         let mut config = TransportConfig::default();
@@ -5616,7 +5630,7 @@ mod tests {
         let transport_id = config.identity.address_hash().clone();
         let transport = Transport::new(config);
         let handler = transport.get_handler();
-        let iface = AddressHash::new_from_rand(OsRng);
+        let iface = AddressHash::new_from_rand(&mut rng);
 
         let mut pending = PendingSends::new();
         {
@@ -5650,12 +5664,13 @@ mod tests {
         );
         let second_destination =
             SingleInputDestination::new(identity, DestinationName::new("lxst", "messaging"));
+        let mut rng = UnwrapErr(SysRng);
         let first_announce = first_destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid first announce");
         let large_agent_data = [0x42u8; PACKET_MDU + 1];
         let second_announce = second_destination
-            .announce(OsRng, Some(&large_agent_data))
+            .announce(&mut rng, Some(&large_agent_data))
             .expect("valid second announce");
 
         let mut config = TransportConfig::default();

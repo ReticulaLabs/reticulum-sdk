@@ -9,7 +9,7 @@ use cbc::cipher::BlockEncryptMut;
 use cbc::cipher::KeyIvInit;
 use crypto_common::{IvSizeUser, KeySizeUser, OutputSizeUser};
 use hmac::{Hmac, Mac};
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -35,15 +35,8 @@ pub struct PlainText<'a>(&'a [u8]);
 pub struct VerifiedToken<'a>(&'a [u8]);
 pub struct Token<'a>(&'a [u8]);
 
-// This class provides a slightly modified implementation of the Fernet spec
-// found at: https://github.com/fernet/spec/blob/master/Spec.md
-//
-// According to the spec, a Fernet token includes a one byte VERSION and
-// eight byte TIMESTAMP field at the start of each token. These fields are
-// not relevant to Reticulum. They are therefore stripped from this
-// implementation, since they incur overhead and leak initiator metadata.
-pub struct Fernet<R: CryptoRngCore> {
-    rng: R,
+pub struct Fernet<'r, R: CryptoRng + ?Sized> {
+    rng: &'r mut R,
     sign_key: [u8; AES_KEY_SIZE],
     enc_key: AesKey,
 }
@@ -81,16 +74,12 @@ impl<'a> From<&'a [u8]> for Token<'a> {
     }
 }
 
-impl<R: CryptoRngCore + Copy> Fernet<R> {
-    pub fn new(sign_key: [u8; AES_KEY_SIZE], enc_key: AesKey, rng: R) -> Self {
-        Self {
-            rng,
-            sign_key,
-            enc_key,
-        }
+impl<'r, R: CryptoRng + ?Sized> Fernet<'r, R> {
+    pub fn new(sign_key: [u8; AES_KEY_SIZE], enc_key: AesKey, rng: &'r mut R) -> Self {
+        Self { rng, sign_key, enc_key }
     }
 
-    pub fn new_from_slices(sign_key: &[u8], enc_key: &[u8], rng: R) -> Self {
+    pub fn new_from_slices(sign_key: &[u8], enc_key: &[u8], rng: &'r mut R) -> Self {
         let mut sign_key_bytes = [0u8; AES_KEY_SIZE];
         sign_key_bytes[..cmp::min(AES_KEY_SIZE, sign_key.len())].copy_from_slice(sign_key);
 
@@ -104,20 +93,21 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
         }
     }
 
-    pub fn new_rand(mut rng: R) -> Self {
+    pub fn new_rand(rng: &'r mut R) -> Self {
         let mut sign_key = [0u8; AES_KEY_SIZE];
         rng.fill_bytes(&mut sign_key);
-        let enc_key = AesCbcEnc::generate_key(&mut rng);
+        let mut enc_key_bytes = [0u8; AES_KEY_SIZE];
+        rng.fill_bytes(&mut enc_key_bytes);
 
         Self {
             rng,
             sign_key,
-            enc_key,
+            enc_key: enc_key_bytes.into(),
         }
     }
 
     pub fn encrypt<'a>(
-        &self,
+        &mut self,
         text: PlainText,
         out_buf: &'a mut [u8],
     ) -> Result<Token<'a>, RnsError> {
@@ -127,13 +117,13 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let mut out_len = 0;
 
-        // Generate random IV
-        let iv = AesCbcEnc::generate_iv(self.rng);
-        out_buf[..iv.len()].copy_from_slice(iv.as_slice());
+        let mut iv = [0u8; IV_KEY_SIZE];
+        self.rng.fill_bytes(&mut iv);
+        out_buf[..iv.len()].copy_from_slice(&iv);
 
         out_len += iv.len();
 
-        let chiper_len = AesCbcEnc::new(&self.enc_key, &iv)
+        let chiper_len = AesCbcEnc::new(&self.enc_key, &iv.into())
             .encrypt_padded_b2b_mut::<Pkcs7>(text.0, &mut out_buf[out_len..])
             .unwrap()
             .len();
@@ -191,15 +181,15 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let tag_start_index = token_data.len() - HMAC_OUT_SIZE;
 
-        let iv: [u8; IV_KEY_SIZE] = token_data[..IV_KEY_SIZE].try_into().unwrap();
+        let iv_bytes: [u8; IV_KEY_SIZE] = token_data[..IV_KEY_SIZE].try_into().unwrap();
 
         let ciphertext = &token_data[IV_KEY_SIZE..tag_start_index];
 
-        let msg = AesCbcDec::new(&self.enc_key, &iv.into())
+        let msg = AesCbcDec::new(&self.enc_key, &iv_bytes.into())
             .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, out_buf)
             .map_err(|_| RnsError::CryptoError)?;
 
-        return Ok(PlainText { 0: msg });
+        Ok(PlainText { 0: msg })
     }
 }
 
@@ -207,13 +197,15 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 mod tests {
     use crate::crypt::fernet::Fernet;
     use core::str;
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     #[test]
     fn encrypt_then_decrypt() {
         const BUF_SIZE: usize = 4096;
 
-        let fernet = Fernet::new_rand(OsRng);
+        let mut rng = UnwrapErr(SysRng);
+        let mut fernet = Fernet::new_rand(&mut rng);
 
         let out_msg: &str = "#FERNET_TEST_MESSAGE#";
 
@@ -234,7 +226,8 @@ mod tests {
 
     #[test]
     fn small_buffer() {
-        let fernet = Fernet::new_rand(OsRng);
+        let mut rng = UnwrapErr(SysRng);
+        let mut fernet = Fernet::new_rand(&mut rng);
 
         let test_msg: &str = "#FERNET_TEST_MESSAGE#";
 

@@ -133,8 +133,6 @@ impl IfacConfig {
 
 #[cfg(test)]
 mod tests {
-    use rand_core::OsRng;
-
     use super::*;
     use crate::hash::AddressHash;
     use crate::packet::{

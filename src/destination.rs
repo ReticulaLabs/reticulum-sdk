@@ -3,7 +3,8 @@ pub mod link_map;
 pub mod resource;
 
 use ed25519_dalek::{SIGNATURE_LENGTH, Signature, SigningKey, VerifyingKey};
-use rand_core::{CryptoRngCore, OsRng};
+use getrandom::SysRng;
+use rand_core::{CryptoRng, UnwrapErr};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use core::{fmt, marker::PhantomData};
@@ -306,9 +307,9 @@ impl Destination<PrivateIdentity, Input, Single> {
         Ok(packet_data)
     }
 
-    fn build_announce_rand_hash<R: CryptoRngCore + Copy>(
+    fn build_announce_rand_hash<R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         timestamp_secs: u64,
     ) -> [u8; RAND_HASH_LENGTH] {
         let rand_hash = Hash::new_from_rand(rng);
@@ -342,16 +343,16 @@ impl Destination<PrivateIdentity, Input, Single> {
         }
     }
 
-    pub fn enable_ratchet<R: CryptoRngCore>(&mut self, rng: &mut R) {
+    pub fn enable_ratchet<R: CryptoRng + ?Sized>(&mut self, rng: &mut R) {
         let secret = StaticSecret::random_from_rng(rng);
         let public = PublicKey::from(&secret);
         self.desc.ratchet_public_key = Some(public.to_bytes());
         self.ratchet_secret = Some(secret);
     }
 
-    pub fn announce<R: CryptoRngCore + Copy>(
+    pub fn announce<R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         app_data: Option<&[u8]>,
     ) -> Result<Packet, RnsError> {
         let timestamp_secs = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() as u64;
@@ -380,9 +381,9 @@ impl Destination<PrivateIdentity, Input, Single> {
         })
     }
 
-    pub fn path_response<R: CryptoRngCore + Copy>(
+    pub fn path_response<R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         app_data: Option<&[u8]>,
     ) -> Result<Packet, RnsError> {
         let mut announce = self.announce(rng, app_data)?;
@@ -422,9 +423,9 @@ impl Destination<PrivateIdentity, Input, Single> {
     }
 
     #[cfg(test)]
-    fn announce_with_timestamp<R: CryptoRngCore + Copy>(
+    fn announce_with_timestamp<R: CryptoRng + ?Sized>(
         &self,
-        rng: R,
+        rng: &mut R,
         timestamp_secs: u64,
         app_data: Option<&[u8]>,
     ) -> Result<Packet, RnsError> {
@@ -508,8 +509,9 @@ impl Destination<PrivateIdentity, Input, Single> {
     }
 
     pub fn decrypt<'a>(&self, data: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+        let mut rng = UnwrapErr(SysRng);
         self.identity.decrypt_packet(
-            OsRng,
+            &mut rng,
             data,
             Some(self.identity.as_address_hash_slice()),
             out_buf,
@@ -556,9 +558,10 @@ impl Destination<Identity, Output, Single> {
         let mut packet_data = PacketDataBuffer::new();
 
         let cipher_text_len = {
+            let mut rng = UnwrapErr(SysRng);
             let cipher_text = if let Some(ratchet_public_key) = self.desc.ratchet_public_key {
                 self.identity.encrypt_packet_to_public_key(
-                    OsRng,
+                    &mut rng,
                     &PublicKey::from(ratchet_public_key),
                     data,
                     Some(self.identity.as_address_hash_slice()),
@@ -571,7 +574,7 @@ impl Destination<Identity, Output, Single> {
                 )?
             } else {
                 self.identity.encrypt_packet(
-                    OsRng,
+                    &mut rng,
                     data,
                     Some(self.identity.as_address_hash_slice()),
                     packet_data.accuire_buf(
@@ -640,7 +643,8 @@ pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::{SIGNATURE_LENGTH, Signature};
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
     use sha2::Digest;
     use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -667,13 +671,14 @@ mod tests {
 
     #[test]
     fn create_announce() {
-        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut rng = UnwrapErr(SysRng);
+        let identity = PrivateIdentity::new_from_rand(&mut rng);
 
         let single_in_destination =
             SingleInputDestination::new(identity, DestinationName::new("test", "in"));
 
         let announce_packet = single_in_destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid announce packet");
 
         assert_eq!(
@@ -924,9 +929,10 @@ mod tests {
 
         let ratchet_identity = PrivateIdentity::new(ratchet_secret, destination.sign_key().clone());
         let mut plain_text = [0u8; crate::packet::PACKET_MDU];
+        let mut rng = UnwrapErr(SysRng);
         let decrypted = ratchet_identity
             .decrypt_packet(
-                OsRng,
+                &mut rng,
                 packet.data.as_slice(),
                 Some(destination.identity.as_identity().address_hash.as_slice()),
                 &mut plain_text,
@@ -938,7 +944,8 @@ mod tests {
 
     #[test]
     fn check_announce() {
-        let priv_identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut rng = UnwrapErr(SysRng);
+        let priv_identity = PrivateIdentity::new_from_rand(&mut rng);
 
         let destination = SingleInputDestination::new(
             priv_identity,
@@ -946,7 +953,7 @@ mod tests {
         );
 
         let announce = destination
-            .announce(OsRng, None)
+            .announce(&mut rng, None)
             .expect("valid announce packet");
 
         DestinationAnnounce::validate(&announce).expect("valid announce");
@@ -990,7 +997,8 @@ mod tests {
 
     #[test]
     fn single_packet_roundtrip() {
-        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut rng = UnwrapErr(SysRng);
+        let identity = PrivateIdentity::new_from_rand(&mut rng);
         let input_destination = SingleInputDestination::new(
             identity,
             DestinationName::new("example_utilities", "single.roundtrip"),
@@ -1015,7 +1023,8 @@ mod tests {
 
     #[test]
     fn single_packet_rejects_payload_over_encrypted_mdu() {
-        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut rng = UnwrapErr(SysRng);
+        let identity = PrivateIdentity::new_from_rand(&mut rng);
         let input_destination = SingleInputDestination::new(
             identity,
             DestinationName::new("example_utilities", "single.mdu"),
