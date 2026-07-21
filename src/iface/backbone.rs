@@ -540,7 +540,7 @@ impl BackboneClient {
                                         }
                                     }
                                     Err(e) => {
-                                        log::warn!("backbone_client: connection error {}", e);
+                                        log::debug!("backbone_client: connection error {}", e);
                                         stop.cancel();
                                         break;
                                     }
@@ -583,8 +583,14 @@ impl BackboneClient {
                                 if let Ok(_) = packet.serialize(&mut output) {
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
                                     if let Ok(_) = Hdlc::encode(output.as_slice(), &mut hdlc_output) {
-                                        let _ = stream.write_all(hdlc_output.as_slice()).await;
-                                        let _ = stream.flush().await;
+                                        if let Err(_) = stream.write_all(hdlc_output.as_slice()).await {
+                                            stop.cancel();
+                                            break;
+                                        }
+                                        if let Err(_) = stream.flush().await {
+                                            stop.cancel();
+                                            break;
+                                        }
                                     }
                                 }
                             }
