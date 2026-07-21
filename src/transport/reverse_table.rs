@@ -3,7 +3,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::{
     hash::AddressHash,
-    packet::{Header, Packet},
+    packet::{Header, IfacFlag, Packet},
 };
 
 pub struct ReverseEntry {
@@ -14,6 +14,7 @@ pub struct ReverseEntry {
 fn send_backwards(packet: &Packet, entry: &ReverseEntry) -> (Packet, AddressHash) {
     let propagated = Packet {
         header: Header {
+            ifac_flag: IfacFlag::Open,
             hops: packet.header.hops,
             ..packet.header
         },
@@ -66,7 +67,7 @@ mod tests {
     use super::ReverseTable;
     use crate::{
         hash::AddressHash,
-        packet::{DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType},
+        packet::{DestinationType, Header, IfacFlag, Packet, PacketContext, PacketDataBuffer, PacketType},
     };
 
     #[test]
@@ -116,5 +117,55 @@ mod tests {
         assert_eq!(propagated.destination, proof.destination);
         assert_eq!(propagated.transport, None);
         assert_eq!(propagated.header.hops, proof.header.hops);
+    }
+
+    #[test]
+    fn send_backwards_resets_ifac_flag_to_open() {
+        let original_destination = AddressHash::new_from_slice(b"probe-destination");
+        let previous_hop_iface = AddressHash::new_from_slice(b"previous-hop-iface");
+
+        let mut original_data = PacketDataBuffer::new();
+        original_data.safe_write(b"payload");
+
+        let original = Packet {
+            header: Header {
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: original_destination,
+            transport: None,
+            context: PacketContext::None,
+            data: original_data,
+        };
+
+        let mut reverse_table = ReverseTable::new();
+        reverse_table.add(&original, previous_hop_iface);
+
+        // Proof with ifac_flag=Authenticated but no ifac data.
+        // send_backwards() must reset the flag to Open.
+        let mut proof_data = PacketDataBuffer::new();
+        proof_data.safe_write(b"proof");
+        let proof = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Authenticated,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Proof,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: AddressHash::new_from_hash(&original.hash()),
+            transport: None,
+            context: PacketContext::None,
+            data: proof_data,
+        };
+
+        let (propagated, _iface) = reverse_table
+            .handle_proof(&proof)
+            .expect("reverse entry exists");
+
+        assert_eq!(propagated.header.ifac_flag, IfacFlag::Open);
+        assert!(propagated.ifac.is_none());
     }
 }

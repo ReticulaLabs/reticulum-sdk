@@ -719,8 +719,8 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
     ) -> bool {
         let mut tx_buffer = [0u8; LORA_HW_MTU];
         let mut output = OutputBuffer::new(&mut tx_buffer);
-        if packet.serialize(&mut output).is_err() {
-            log::warn!("lora_interface: couldn't serialize outbound packet");
+        if let Err(error) = packet.serialize(&mut output) {
+            log::warn!("lora_interface: couldn't serialize outbound packet: {error}");
             return true;
         }
 

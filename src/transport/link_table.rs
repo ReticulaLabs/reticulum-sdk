@@ -3,7 +3,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::destination::link::LinkId;
 use crate::hash::AddressHash;
-use crate::packet::{Header, Packet};
+use crate::packet::{Header, IfacFlag, Packet};
 
 pub struct LinkEntry {
     pub timestamp: Instant,
@@ -21,6 +21,7 @@ pub struct LinkEntry {
 fn propagate(packet: &Packet, iface: AddressHash) -> (Packet, AddressHash) {
     let propagated = Packet {
         header: Header {
+            ifac_flag: IfacFlag::Open,
             hops: packet.header.hops,
             ..packet.header
         },
@@ -270,7 +271,7 @@ mod tests {
     use crate::{
         destination::link::LinkId,
         hash::AddressHash,
-        packet::{DestinationType, Header, Packet, PacketContext, PacketType},
+        packet::{DestinationType, Header, IfacFlag, Packet, PacketContext, PacketType},
     };
 
     fn link_request(destination: AddressHash) -> Packet {
@@ -334,5 +335,79 @@ mod tests {
         assert_eq!(iface, request_iface);
         assert_eq!(forwarded.header.hops, 0);
         assert_eq!(forwarded.transport, None);
+    }
+
+    #[test]
+    fn propagate_forwards_link_data_with_ifac_flag_reset_to_open() {
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let request_iface = AddressHash::new_from_slice(b"request-iface");
+        let destination_iface = AddressHash::new_from_slice(b"destination-iface");
+        let request = link_request(destination);
+        let link_id = LinkId::from(&request);
+        let mut table = LinkTable::new();
+
+        table.add(&request, destination, request_iface, destination_iface, 0);
+
+        let proof = link_data(link_id, 0);
+        table.handle_proof(&proof).expect("link proof forwards");
+
+        // Forward a packet that has ifac_flag=Authenticated but no ifac data.
+        // propagate() must reset the flag to Open to keep serialization consistent.
+        let forward = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Authenticated,
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                hops: 0,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::None,
+            data: Default::default(),
+        };
+
+        let (forwarded, _iface) = table
+            .handle_packet(&forward, request_iface)
+            .expect("packet should be forwarded");
+
+        assert_eq!(forwarded.header.ifac_flag, IfacFlag::Open);
+        assert!(forwarded.ifac.is_none());
+    }
+
+    #[test]
+    fn propagate_forwards_link_proof_with_ifac_flag_reset_to_open() {
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let request_iface = AddressHash::new_from_slice(b"request-iface");
+        let destination_iface = AddressHash::new_from_slice(b"destination-iface");
+        let request = link_request(destination);
+        let link_id = LinkId::from(&request);
+        let mut table = LinkTable::new();
+
+        table.add(&request, destination, request_iface, destination_iface, 0);
+
+        // Proof with ifac_flag=Authenticated but no ifac data.
+        let proof = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Authenticated,
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+                hops: 0,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::None,
+            data: Default::default(),
+        };
+
+        let (propagated, _iface) = table
+            .handle_proof(&proof)
+            .expect("proof should be forwarded");
+
+        assert_eq!(propagated.header.ifac_flag, IfacFlag::Open);
+        assert!(propagated.ifac.is_none());
     }
 }

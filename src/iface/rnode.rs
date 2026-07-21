@@ -1156,10 +1156,10 @@ async fn send_packet<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut tx_buffer = [0u8; core::mem::size_of::<Packet>() * 2];
+    let mut tx_buffer = [0u8; RNODE_HW_MTU];
     let mut output = OutputBuffer::new(&mut tx_buffer);
-    if packet.serialize(&mut output).is_err() {
-        log::warn!("rnode_interface: couldn't serialize outbound packet");
+    if let Err(error) = packet.serialize(&mut output) {
+        log::warn!("rnode_interface: couldn't serialize outbound packet: {error}");
         return Ok(());
     }
 
