@@ -43,7 +43,7 @@ pub type InterfaceRxReceiver = mpsc::Receiver<RxMessage>;
 // implementation isn't great from a security standpoint.
 pub const DEFAULT_HW_MTU: usize = 2048;
 pub const MAX_AUTOCONFIGURED_HW_MTU: usize = 524_288;
-pub(crate) const DEFAULT_ANNOUNCE_CAP: f64 = 0.20;
+pub(crate) const DEFAULT_ANNOUNCE_CAP: f64 = 0.06;
 const DEFAULT_INTERFACE_TX_QUEUE_CAP: usize = 16_384;
 const MAX_QUEUED_ANNOUNCES: usize = 16_384;
 const INTERFACE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
