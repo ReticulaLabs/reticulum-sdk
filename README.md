@@ -67,6 +67,15 @@ Cargo.toml
 [dependencies]
 reticulum-sdk = "2.1"
 ```
+## Python Protocol Deviations
+
+* The 2% announcement cap implemented in the official Python implementation can quickly begin
+  to backlog and drop announcements from being sent over low-bitrate networks such as LoRA.
+  (~27 announces per minute max on a reasonable 250kHz/SF8 encoding)
+  * This implementation of Reticulum improves this design choice by allowing 6% of the interface
+    to be used for announcements, and scaling down the announcement cap when interface load
+    increases. (~81/min when quiet, ~27/min when channel under load)
+  * The probability of infinite growth of announcement backlogs is reduced.
 
 ## Implementations
 
