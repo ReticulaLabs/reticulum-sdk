@@ -7,6 +7,7 @@ pub mod modem73;
 pub mod rnode;
 pub mod tcp_client;
 pub mod tcp_server;
+pub mod serial;
 pub mod udp;
 
 use std::sync::Arc;

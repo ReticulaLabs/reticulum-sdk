@@ -24,6 +24,7 @@
 //! * [`iface::tcp_client::TcpClient`]
 //! * [`iface::tcp_server::TcpServer`]
 //! * [`iface::udp::UdpInterface`]
+//! * [`iface::serial::SerialInterface`]
 //! * [`iface::modem73::Modem73Interface`]
 //! * [`iface::lora::LoRaInterface`] with [`iface::lora::sx1262::SX1262`] or
 //!   [`iface::lora::lr1121::LR1121`]

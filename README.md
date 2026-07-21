@@ -44,7 +44,7 @@ Reticulum operates independently of traditional IP, and can function effectively
 
 * ❌ BluetoothInterface
 * ❌ PipeInterface
-* ❌ SerialInterface
+* ✅ SerialInterface
 
 ## Usage
 
