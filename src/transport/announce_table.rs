@@ -259,11 +259,31 @@ impl AnnounceTable {
     /// local_rebroadcasts counter and remove the entry if the maximum
     /// has been reached. Returns `true` if the entry was removed
     /// (announce propagation complete).
+    ///
+    /// Two echo patterns are detected:
+    ///
+    /// 1. **Direct echo** (`hops - 1 == entry.hops`): a peer retransmitted
+    ///    our announce at the same hop count.  Counts toward the
+    ///    `local_rebroadcasts` limit.
+    ///
+    /// 2. **Pass-on** (`hops - 1 == entry.hops + 1`): another node has
+    ///    already forwarded our announce before our next scheduled
+    ///    retransmission.  The entry is removed immediately (matching
+    ///    the Python optimisation at Transport.py:1789-1794).
     pub fn echo_received(&mut self, destination: &AddressHash, hops: u8) -> bool {
         if let Some(entry) = self.map.get_mut(destination) {
-            if entry.retries > 0 && hops > 0 && hops - 1 == entry.hops {
-                entry.local_rebroadcasts += 1;
-                if entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
+            if entry.retries > 0 && hops > 0 {
+                if hops - 1 == entry.hops {
+                    entry.local_rebroadcasts += 1;
+                    if entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
+                        self.map.remove(destination);
+                        return true;
+                    }
+                } else if hops - 1 == entry.hops + 1 && Instant::now() < entry.timeout {
+                    log::trace!(
+                        "announce_table: {} passed on by another node before our retransmit, completing",
+                        destination,
+                    );
                     self.map.remove(destination);
                     return true;
                 }

@@ -3388,17 +3388,6 @@ is_path_response={}",
             );
         }
 
-        // Only trigger a new retransmit for the first announce, not echoes
-        if !is_echo && handler.config.retransmit {
-            let transport_id = handler.config.identity.address_hash().clone();
-            if let Some(message) = handler
-                .announce_table
-                .new_packet(&packet.destination, &transport_id)
-            {
-                pending.push(message);
-            }
-        }
-
         warn_if_event_channel_full(&handler.announce_tx, handler.config.event_channel_capacity, "announce", &handler.config.name);
         let _ = handler.announce_tx.send(AnnounceEvent {
             destination,
