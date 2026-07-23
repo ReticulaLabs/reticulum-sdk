@@ -1885,6 +1885,7 @@ fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut Transport
             "link_count" => Value::from(0),
             "blackholed_identities" => shared_rpc_blackholed_identities(handler.as_deref_mut()),
             "is_blackholed" => shared_rpc_is_blackholed(map, handler.as_deref_mut()),
+            "interfaces" => shared_rpc_interfaces(handler.as_deref_mut()),
             _ => {
                 log::warn!(
                     "share_instance: unsupported RPC get operation <{}>",
@@ -2173,6 +2174,32 @@ fn shared_rpc_destination_hash(map: &[(Value, Value)]) -> Option<AddressHash> {
     let mut hash = [0u8; crate::hash::ADDRESS_HASH_SIZE];
     hash.copy_from_slice(bytes);
     Some(AddressHash::new(hash))
+}
+
+fn shared_rpc_interfaces(handler: Option<&mut TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::Array(vec![]);
+    };
+    let iface_manager = match handler.send_ctx.iface_manager.try_lock() {
+        Ok(mgr) => mgr,
+        Err(_) => return Value::Array(vec![]),
+    };
+    let entries: Vec<Value> = iface_manager
+        .interface_info_list()
+        .into_iter()
+        .map(|info| {
+            Value::Map(vec![
+                (Value::from("type"), Value::from(info.interface_type)),
+                (Value::from("name"), Value::from(info.name)),
+                (
+                    Value::from("identity"),
+                    Value::Binary(info.address.as_slice().to_vec()),
+                ),
+                (Value::from("error_count"), Value::from(info.error_count)),
+            ])
+        })
+        .collect();
+    Value::Array(entries)
 }
 
 fn shared_rpc_interface_stats() -> Value {
