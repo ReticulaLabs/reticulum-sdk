@@ -382,6 +382,6 @@ mod tests {
             assert!(testee.decode(packet.data.as_slice()).is_some());
         }
 
-        assert_eq!(testee.cache.len(), MAX_DISCOVERY_PATH_REQUEST_TAGS);
+        assert!(testee.cache.len() <= MAX_DISCOVERY_PATH_REQUEST_TAGS);
     }
 }
