@@ -833,7 +833,14 @@ impl Transport {
         };
 
         if start_shared_rpc {
-            start_tcp_shared_rpc(rpc_name, rpc_port, rpc_key, handler.clone(), cancel.clone());
+            start_tcp_shared_rpc(
+                rpc_name,
+                rpc_port,
+                rpc_key,
+                handler.clone(),
+                iface_messages_tx.clone(),
+                cancel.clone(),
+            );
         }
 
         if has_blackhole_sources {
@@ -1605,6 +1612,7 @@ fn start_tcp_shared_rpc(
     port: u16,
     auth_key: Option<Vec<u8>>,
     handler: Arc<Mutex<TransportHandler>>,
+    iface_messages: broadcast::Sender<RxMessage>,
     cancel: CancellationToken,
 ) {
     let addr = format!("127.0.0.1:{}", port);
@@ -1643,9 +1651,10 @@ fn start_tcp_shared_rpc(
                             );
                             let auth_key = auth_key.clone();
                             let handler = handler.clone();
+                            let iface_messages = iface_messages.clone();
                             tokio::spawn(async move {
                                 if let Err(error) =
-                                    handle_shared_rpc_client(stream, auth_key.as_deref(), handler)
+                                    handle_shared_rpc_client(stream, auth_key.as_deref(), handler, iface_messages)
                                         .await
                                 {
                                     log::warn!(
@@ -1674,11 +1683,31 @@ async fn handle_shared_rpc_client(
     mut stream: TcpStream,
     auth_key: Option<&[u8]>,
     handler: Arc<Mutex<TransportHandler>>,
+    iface_messages: broadcast::Sender<RxMessage>,
 ) -> Result<(), String> {
     shared_rpc_authenticate(&mut stream, auth_key).await?;
 
     let request = read_py_connection_frame(&mut stream, 64 * 1024).await?;
     let request = read_shared_rpc_value(&request)?;
+
+    if let Some(map) = request.as_map() {
+        if let Some(listen_config) = shared_rpc_map_value(map, "listen") {
+            let destination_filter = listen_config
+                .as_map()
+                .and_then(|m| shared_rpc_map_value(m, "destination"))
+                .and_then(|v| v.as_slice())
+                .and_then(|slice| {
+                    if slice.len() == crate::hash::ADDRESS_HASH_SIZE {
+                        let mut bytes = [0u8; crate::hash::ADDRESS_HASH_SIZE];
+                        bytes.copy_from_slice(slice);
+                        Some(AddressHash::new(bytes))
+                    } else {
+                        None
+                    }
+                });
+            return handle_shared_rpc_listen(stream, iface_messages, destination_filter).await;
+        }
+    }
 
     let response = if let Some(map) = request.as_map() {
         if shared_rpc_map_str(map, "get") == Some("request_path") {
@@ -1858,6 +1887,88 @@ fn shared_rpc_hmac_response(auth_key: &[u8], message: &[u8]) -> Result<Vec<u8>, 
     response.extend_from_slice(b"{sha256}");
     response.extend_from_slice(&digest);
     Ok(response)
+}
+
+async fn handle_shared_rpc_listen(
+    mut stream: TcpStream,
+    iface_messages: broadcast::Sender<RxMessage>,
+    destination_filter: Option<AddressHash>,
+) -> Result<(), String> {
+    let mut rx = iface_messages.subscribe();
+
+    let init = write_shared_rpc_value(&Value::Map(vec![(
+        Value::from("status"),
+        Value::from("listening"),
+    )]))?;
+    write_py_connection_frame(&mut stream, &init).await?;
+
+    loop {
+        match rx.recv().await {
+            Ok(msg) => {
+                if let Some(ref filter) = destination_filter {
+                    if msg.packet.destination != *filter {
+                        continue;
+                    }
+                }
+
+                let packet_info = Value::Map(vec![
+                    (
+                        Value::from("destination"),
+                        Value::Binary(msg.packet.destination.as_slice().to_vec()),
+                    ),
+                    (
+                        Value::from("hops"),
+                        Value::from(msg.packet.header.hops as u64),
+                    ),
+                    (
+                        Value::from("header_type"),
+                        Value::from(msg.packet.header.header_type as u8 as u64),
+                    ),
+                    (
+                        Value::from("packet_type"),
+                        Value::from(msg.packet.header.packet_type as u8 as u64),
+                    ),
+                    (
+                        Value::from("context"),
+                        Value::from(msg.packet.context as u8 as u64),
+                    ),
+                    (
+                        Value::from("payload_len"),
+                        Value::from(msg.packet.data.len() as u64),
+                    ),
+                    (
+                        Value::from("iface"),
+                        Value::Binary(msg.address.as_slice().to_vec()),
+                    ),
+                    (
+                        Value::from("snr"),
+                        msg.snr.map(Value::from).unwrap_or(Value::Nil),
+                    ),
+                    (
+                        Value::from("rssi"),
+                        msg.rssi
+                            .map(|v| Value::from(v as i64))
+                            .unwrap_or(Value::Nil),
+                    ),
+                ]);
+
+                let encoded = write_shared_rpc_value(&packet_info)?;
+                write_py_connection_frame(&mut stream, &encoded).await?;
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                let lag = Value::Map(vec![(
+                    Value::from("lagged"),
+                    Value::from(n as u64),
+                )]);
+                let encoded = write_shared_rpc_value(&lag)?;
+                write_py_connection_frame(&mut stream, &encoded).await?;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut TransportHandler>) -> Value {
