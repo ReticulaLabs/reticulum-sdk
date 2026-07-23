@@ -27,6 +27,7 @@ fn random_rw_jitter() -> Duration {
 #[derive(Clone)]
 pub struct AnnounceEntry {
     pub packet: Packet,
+    #[allow(dead_code)]
     pub timestamp: Instant,
     pub timeout: Instant,
     pub received_from: AddressHash,
@@ -234,10 +235,12 @@ impl AnnounceTable {
         self.map.contains_key(destination)
     }
 
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, destination: &AddressHash) -> Option<&mut AnnounceEntry> {
         self.map.get_mut(destination)
     }
 
+    #[allow(dead_code)]
     pub fn remove(&mut self, destination: &AddressHash) {
         self.map.remove(destination);
     }

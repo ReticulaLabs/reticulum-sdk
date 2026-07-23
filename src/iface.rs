@@ -61,8 +61,6 @@ const QUEUE_WARN_INTERVAL: Duration = Duration::from_secs(300);
 // --- Ingress burst limiting (ported from Python Reticulum) ---
 /// How many timestamps to keep for frequency calculation.
 const INGRESS_FREQ_SAMPLES: usize = 48;
-/// Minimum frequency floor for rate decay (Hz).
-const INGRESS_MIN_FREQ_HZ: f64 = 0.1;
 /// Announce burst threshold for interfaces < 2 hours old (Hz).
 const INGRESS_BURST_FREQ_NEW: f64 = 3.0;
 /// Announce burst threshold for established interfaces (Hz).
@@ -73,14 +71,10 @@ const INGRESS_PR_BURST_FREQ_NEW: f64 = 3.0;
 const INGRESS_PR_BURST_FREQ: f64 = 8.0;
 /// How long burst mode remains active after rate drops below threshold (s).
 const INGRESS_BURST_HOLD_S: u64 = 15;
-/// Penalty time before held announces can be released (s).
-const INGRESS_BURST_PENALTY_S: u64 = 15;
 /// Min samples before frequency can be computed.
 const INGRESS_DEQUE_MIN_SAMPLE: usize = 2;
 /// Min samples before burst can be deactivated.
 const INGRESS_BURST_MIN_SAMPLES: usize = 6;
-/// Maximum held announces per interface.
-const INGRESS_MAX_HELD: usize = 256;
 /// Egress path-request frequency threshold (Hz). When an interface's
 /// outgoing PR rate exceeds this, a warning is logged.
 const EGRESS_PR_FREQ: f64 = 5.0;
@@ -1306,16 +1300,6 @@ impl InterfaceManager {
     fn iface_by_address(&self, address: &AddressHash) -> Option<&LocalInterface> {
         let idx = *self.iface_index.get(address)?;
         let iface = &self.ifaces[idx];
-        if iface.stop.is_cancelled() {
-            return None;
-        }
-        Some(iface)
-    }
-
-    /// Mutable variant of `iface_by_address`.
-    fn iface_by_address_mut(&mut self, address: &AddressHash) -> Option<&mut LocalInterface> {
-        let idx = *self.iface_index.get(address)?;
-        let iface = &mut self.ifaces[idx];
         if iface.stop.is_cancelled() {
             return None;
         }

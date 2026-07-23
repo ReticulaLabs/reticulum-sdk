@@ -110,11 +110,13 @@ impl BlackholeTable {
         self.entries.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Iterate over all (identity_hash, entry) pairs.
+    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = (&AddressHash, &BlackholeEntry)> {
         self.entries.iter()
     }
@@ -126,6 +128,7 @@ impl BlackholeTable {
 
     /// Return entries whose `source` matches the given identity hash
     /// (i.e. the entries that originated from a particular transport instance).
+    #[allow(dead_code)]
     pub fn local_entries(&self, source_hash: &AddressHash) -> HashMap<AddressHash, BlackholeEntry> {
         self.entries
             .iter()
@@ -155,6 +158,7 @@ impl BlackholeTable {
     /// Merge entries from a remote source. Any conflicting identity
     /// hashes that were originally blackholed by the *local* identity
     /// are preserved (not overwritten by the remote source).
+    #[allow(dead_code)]
     pub fn insert_remote(
         &mut self,
         _source: AddressHash,
@@ -199,6 +203,7 @@ impl BlackholeTable {
     }
 
     /// Reset the check timer (called after bulk-loading entries).
+    #[allow(dead_code)]
     pub fn reset_check_timer(&mut self) {
         self.last_check = Instant::now();
     }
@@ -223,6 +228,7 @@ impl BlackholeTable {
 
     /// Deserialize from an `rmpv::Value::Map` produced by the Python
     /// reference. Returns `None` if the value is not a map.
+    #[allow(dead_code)]
     pub fn from_msgpack(value: &Value, source: AddressHash) -> Option<Self> {
         let map = value.as_map()?;
         let mut entries = HashMap::new();

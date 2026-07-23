@@ -18,6 +18,7 @@ type RandomBlob = [u8; RAND_HASH_LENGTH];
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PathState {
     Unknown,
+    #[allow(dead_code)]
     Responsive,
     Unresponsive,
 }
@@ -27,6 +28,7 @@ pub struct PathEntry {
     pub received_from: AddressHash,
     pub hops: u8,
     pub iface: AddressHash,
+    #[allow(dead_code)]
     pub packet_hash: Hash,
     pub expires: Instant,
     path_expiry: Duration,
@@ -124,6 +126,7 @@ impl PathTable {
         }
     }
 
+    #[allow(dead_code)]
     pub fn mark_state_unknown(&mut self, destination: &AddressHash) {
         if let Some(entry) = self.map.get_mut(destination) {
             entry.state = PathState::Unknown;

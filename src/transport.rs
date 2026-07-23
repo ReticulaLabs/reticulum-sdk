@@ -1437,7 +1437,8 @@ impl Transport {
         self.handler.lock().await.knows_destination(address)
     }
 
-    pub fn get_handler(&self) -> Arc<Mutex<TransportHandler>> {
+    #[cfg(test)]
+    pub(crate) fn get_handler(&self) -> Arc<Mutex<TransportHandler>> {
         // direct access to handler for testing purposes
         self.handler.clone()
     }

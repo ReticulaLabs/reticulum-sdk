@@ -284,6 +284,7 @@ struct ResourcePart {
 // Resource
 // ============================================================================
 
+#[allow(dead_code)]
 pub struct Resource {
     // Identity
     hash: Hash,
