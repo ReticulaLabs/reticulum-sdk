@@ -4101,25 +4101,6 @@ async fn retransmit_announces(
     }
 }
 
-fn create_retransmit_packet(packet: &Packet) -> Packet {
-    Packet {
-        header: Header {
-            ifac_flag: packet.header.ifac_flag,
-            header_type: packet.header.header_type,
-            context_flag: packet.header.context_flag,
-            propagation_type: packet.header.propagation_type,
-            destination_type: packet.header.destination_type,
-            packet_type: packet.header.packet_type,
-            hops: packet.header.hops,
-        },
-        ifac: packet.ifac,
-        destination: packet.destination,
-        transport: packet.transport,
-        context: packet.context,
-        data: packet.data.clone(),
-    }
-}
-
 async fn manage_transport(
     handler: Arc<Mutex<TransportHandler>>,
     send_ctx: Arc<SendCtx>,
