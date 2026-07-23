@@ -30,6 +30,7 @@ pub struct PathEntry {
     pub iface: AddressHash,
     pub packet_hash: Hash,
     pub expires: Instant,
+    path_expiry: Duration,
     random_blobs: Vec<RandomBlob>,
     state: PathState,
 }
@@ -186,6 +187,7 @@ self_referential_transport={}",
             iface,
             packet_hash: announce.hash(),
             expires: Instant::now() + path_expiry,
+            path_expiry,
             random_blobs: self
                 .map
                 .get(&announce.destination)
@@ -262,7 +264,7 @@ self_referential_transport={}",
     pub fn refresh(&mut self, destination: &AddressHash) {
         if let Some(entry) = self.map.get_mut(destination) {
             entry.timestamp = Instant::now();
-            entry.expires = entry.timestamp + PATHFINDER_E;
+            entry.expires = entry.timestamp + entry.path_expiry;
         }
     }
 
