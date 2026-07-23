@@ -473,8 +473,6 @@ impl DecryptIdentity for PrivateIdentity {
     }
 }
 
-pub struct GroupIdentity {}
-
 pub struct DerivedKey {
     key: [u8; DERIVED_KEY_LENGTH],
 }

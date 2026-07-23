@@ -42,10 +42,6 @@ impl<const N: usize> StaticBuffer<N> {
         Ok(self)
     }
 
-    pub fn finalize(self) -> Self {
-        self
-    }
-
     pub fn safe_write(&mut self, data: &[u8]) -> usize {
         let data_size = data.len();
 

@@ -61,19 +61,6 @@ impl AnnounceEntry {
         RetransmitOutcome::Ready(self.always_retransmit(transport_id))
     }
 
-    /// Retransmit immediately, bypassing the timeout check.
-    /// Used by `new_packet` when a new announce arrives for an already-tracked destination.
-    pub fn retransmit_now(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
-        if self.retries >= LOCAL_REBROADCASTS_MAX || self.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
-            return None;
-        }
-
-        self.retries += 1;
-        self.timeout = Instant::now() + Duration::from_secs(PATHFINDER_G) + random_rw_jitter();
-
-        Some(self.always_retransmit(transport_id))
-    }
-
     pub fn always_retransmit(&self, transport_id: &AddressHash) -> TxMessage {
         let context = if self.response_to_iface.is_some() {
             PacketContext::PathResponse
@@ -290,16 +277,6 @@ impl AnnounceTable {
             }
         }
         false
-    }
-
-    pub fn new_packet(
-        &mut self,
-        dest_hash: &AddressHash,
-        transport_id: &AddressHash,
-    ) -> Option<TxMessage> {
-        self.map
-            .get_mut(dest_hash)
-            .map_or(None, |e| e.retransmit_now(transport_id))
     }
 
     pub fn to_retransmit(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {

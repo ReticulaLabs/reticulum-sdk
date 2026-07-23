@@ -160,5 +160,3 @@ pub mod serde;
 #[cfg(test)]
 pub(crate) mod test_vectors;
 pub mod transport;
-
-mod utils;

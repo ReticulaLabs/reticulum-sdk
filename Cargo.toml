@@ -19,10 +19,6 @@ constrained deployments with maximum performance and minimal dependencies.
 
 [dependencies]
 
-# Protobuf and gRPC
-tonic = "0.13.0"
-prost = "0.13.5"
-
 # Crypto
 crypto-common = { version = "0.1.6", features = ["rand_core"] }
 aes = "0.8.4"
@@ -43,7 +39,6 @@ rand_core = "0.10.0"
 
 # Async IO
 tokio = { version = "1.44.2", features = ["full"] }
-tokio-stream = "0.1.17"
 tokio-util = "0.7.15"
 tokio-serial = "5.4.5"
 libc = "0.2.172"
@@ -62,8 +57,7 @@ default = ["alloc"]
 alloc = []
 fernet-aes128 = []
 
-[build-dependencies]
-tonic-build = "0.13.0"
+
 
 [dev-dependencies]
 tokio = { version = "1.44.2", features = ["test-util"] }

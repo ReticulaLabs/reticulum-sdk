@@ -1,5 +1,4 @@
 pub mod link;
-pub mod link_map;
 pub mod resource;
 
 use ed25519_dalek::{SIGNATURE_LENGTH, Signature, SigningKey, VerifyingKey};
@@ -226,33 +225,6 @@ impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
         <T as Type>::destination_type()
     }
 }
-
-// impl<I: DecryptIdentity + HashIdentity, T: Type> Destination<I, Input, T> {
-//     pub fn decrypt<'b, R: CryptoRngCore + Copy>(
-//         &self,
-//         rng: R,
-//         data: &[u8],
-//         out_buf: &'b mut [u8],
-//     ) -> Result<&'b [u8], RnsError> {
-//         self.identity.decrypt(rng, data, out_buf)
-//     }
-// }
-
-// impl<I: EncryptIdentity + HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
-//     pub fn encrypt<'b, R: CryptoRngCore + Copy>(
-//         &self,
-//         rng: R,
-//         text: &[u8],
-//         out_buf: &'b mut [u8],
-//     ) -> Result<&'b [u8], RnsError> {
-//         // self.identity.encrypt(
-//         //     rng,
-//         //     text,
-//         //     Some(self.identity.as_address_hash_slice()),
-//         //     out_buf,
-//         // )
-//     }
-// }
 
 pub enum DestinationHandleStatus {
     None,
