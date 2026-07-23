@@ -10,7 +10,6 @@ use crate::{
     packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, PropagationType},
 };
 
-const PATHFINDER_E: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 const MAX_RANDOM_BLOBS: usize = 64;
 const ANNOUNCE_RANDOM_BLOB_OFFSET: usize = PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH;
 

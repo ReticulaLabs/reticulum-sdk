@@ -113,14 +113,6 @@ const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
 const PATH_REQUEST_GRACE: Duration = Duration::from_millis(400);
 const PATH_REQUEST_RG: Duration = Duration::from_millis(1500);
 
-// Interface mode path expiry times (matching Python Reticulum):
-// Full / Gateway / Boundary / Internal / PointToPoint → 1 week
-const PATH_EXPIRY_FULL: Duration = Duration::from_secs(60 * 60 * 24 * 7);
-// Access Point → 1 day
-const PATH_EXPIRY_AP: Duration = Duration::from_secs(60 * 60 * 24);
-// Roaming → 6 hours
-const PATH_EXPIRY_ROAMING: Duration = Duration::from_secs(60 * 60 * 6);
-
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 
@@ -2443,6 +2435,7 @@ fn read_python_pickle_value(data: &[u8]) -> Result<Value, String> {
     Err("pickle ended without STOP opcode".into())
 }
 
+#[cfg(test)]
 fn write_python_pickle_value(value: &Value) -> Result<Vec<u8>, String> {
     let mut encoded = vec![0x80, 0x05];
     write_python_pickle_payload(&mut encoded, value)?;
@@ -2450,6 +2443,7 @@ fn write_python_pickle_value(value: &Value) -> Result<Vec<u8>, String> {
     Ok(encoded)
 }
 
+#[cfg(test)]
 fn write_python_pickle_payload(encoded: &mut Vec<u8>, value: &Value) -> Result<(), String> {
     match value {
         Value::Nil => encoded.push(b'N'),
@@ -2782,6 +2776,56 @@ impl TransportHandler {
         is_new || allow_duplicate
     }
 
+    /// Forward `packet` to all non-hot (below egress PR threshold)
+    /// interfaces, excluding `on_iface`.  Returns `true` if at least
+    /// one interface accepted the packet.
+    async fn forward_via_non_hot_ifaces(
+        &self,
+        packet: &Packet,
+        pending: &mut PendingSends,
+        on_iface: Option<AddressHash>,
+        log_destination: &AddressHash,
+        log_label: &str,
+    ) -> bool {
+        let ifaces = {
+            let mgr = self.send_ctx.iface_manager.lock().await;
+            mgr.active_interface_addresses()
+        };
+
+        let mut sent_any = false;
+        for iface_addr in &ifaces {
+            if let Some(ref on) = on_iface {
+                if iface_addr == on {
+                    continue;
+                }
+            }
+
+            let is_hot = {
+                let mgr = self.send_ctx.iface_manager.lock().await;
+                mgr.egress_record_pr(iface_addr)
+            };
+
+            if is_hot {
+                log::trace!(
+                    "tp({}): egress PR limit hit on iface {}, dropping {} to {}",
+                    self.config.name,
+                    iface_addr,
+                    log_label,
+                    log_destination,
+                );
+                continue;
+            }
+
+            pending.push(TxMessage {
+                tx_type: TxMessageType::Direct(*iface_addr),
+                packet: packet.clone(),
+            });
+            sent_any = true;
+        }
+
+        sent_any
+    }
+
     async fn request_path(
         &mut self,
         address: &AddressHash,
@@ -2804,40 +2848,9 @@ impl TransportHandler {
         // Per-interface egress path-request limiting: only send to
         // interfaces whose outgoing PR rate is below the threshold
         // (EGRESS_PR_FREQ, default 5 Hz).
-        let ifaces = {
-            let mgr = self.send_ctx.iface_manager.lock().await;
-            mgr.active_interface_addresses()
-        };
-
-        let mut sent_any = false;
-        for iface_addr in &ifaces {
-            if let Some(ref on) = on_iface {
-                if iface_addr == on {
-                    continue;
-                }
-            }
-
-            let is_hot = {
-                let mgr = self.send_ctx.iface_manager.lock().await;
-                mgr.egress_record_pr(iface_addr)
-            };
-
-            if is_hot {
-                log::trace!(
-                    "tp({}): egress PR limit hit on iface {}, dropping path request to {}",
-                    self.config.name,
-                    iface_addr,
-                    address,
-                );
-                continue;
-            }
-
-            pending.push(TxMessage {
-                tx_type: TxMessageType::Direct(*iface_addr),
-                packet: packet.clone(),
-            });
-            sent_any = true;
-        }
+        let sent_any = self
+            .forward_via_non_hot_ifaces(&packet, pending, on_iface, address, "path request")
+            .await;
 
         // Fallback: if no interface accepted the PR (e.g. all were hot
         // or only the originating interface existed), send a normal
@@ -3520,36 +3533,16 @@ async fn handle_path_request(
                 iface,
                 Some(request.tag_bytes.clone()),
             ) {
-                // Apply egress PR limiting: only forward to non-hot
-                // interfaces, excluding the originating interface.
-                let ifaces = {
-                    let mgr = handler.send_ctx.iface_manager.lock().await;
-                    mgr.active_interface_addresses()
-                };
-                let mut sent_any = false;
-                for iface_addr in &ifaces {
-                    if *iface_addr == iface {
-                        continue;
-                    }
-                    let is_hot = {
-                        let mgr = handler.send_ctx.iface_manager.lock().await;
-                        mgr.egress_record_pr(iface_addr)
-                    };
-                    if is_hot {
-                        log::trace!(
-                            "tp({}): egress PR limit hit on iface {}, dropping recursive PR to {}",
-                            handler.config.name,
-                            iface_addr,
-                            request.destination,
-                        );
-                        continue;
-                    }
-                    pending.push(TxMessage {
-                        tx_type: TxMessageType::Direct(*iface_addr),
-                        packet: packet.clone(),
-                    });
-                    sent_any = true;
-                }
+                let sent_any = handler
+                    .forward_via_non_hot_ifaces(
+                        &packet,
+                        pending,
+                        Some(iface),
+                        &request.destination,
+                        "recursive PR",
+                    )
+                    .await;
+
                 if !sent_any {
                     pending.push(TxMessage {
                         tx_type: TxMessageType::Broadcast(Some(iface)),
