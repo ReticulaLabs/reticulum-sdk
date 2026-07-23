@@ -267,11 +267,6 @@ self_referential_transport={}",
     }
 
     pub fn handle_packet(&self, packet: Packet) -> (Packet, Option<AddressHash>) {
-        if packet.header.header_type == HeaderType::Type2 {
-            log::trace!("path_table: skip Type2 packet dst={}", packet.destination);
-            return (packet, None);
-        }
-
         if packet.header.packet_type == PacketType::Announce {
             return (packet, None);
         }
@@ -293,27 +288,34 @@ self_referential_transport={}",
             }
         };
 
-        let (header_type, propagation_type, transport) = if entry.hops > 1 {
-            log::trace!(
-                "path_table: route dst={} via next-hop={} iface={} ({} hops)",
-                packet.destination,
-                entry.received_from,
-                entry.iface,
-                entry.hops,
-            );
-            (
-                HeaderType::Type2,
-                PropagationType::Transport,
-                Some(entry.received_from),
-            )
-        } else {
-            log::trace!(
-                "path_table: direct dst={} on iface={} (1 hop)",
-                packet.destination,
-                entry.iface,
-            );
-            (HeaderType::Type1, PropagationType::Broadcast, None)
-        };
+        // If the packet is already Type2 (e.g. locally-queued announce
+        // retransmission or a forwarded Type2 packet) we still need to
+        // select the correct egress interface.  Preserve the existing
+        // routing metadata — only the iface lookup should change.
+        let (header_type, propagation_type, transport) =
+            if packet.header.header_type == HeaderType::Type2 {
+                (packet.header.header_type, packet.header.propagation_type, packet.transport)
+            } else if entry.hops > 1 {
+                log::trace!(
+                    "path_table: route dst={} via next-hop={} iface={} ({} hops)",
+                    packet.destination,
+                    entry.received_from,
+                    entry.iface,
+                    entry.hops,
+                );
+                (
+                    HeaderType::Type2,
+                    PropagationType::Transport,
+                    Some(entry.received_from),
+                )
+            } else {
+                log::trace!(
+                    "path_table: direct dst={} on iface={} (1 hop)",
+                    packet.destination,
+                    entry.iface,
+                );
+                (HeaderType::Type1, PropagationType::Broadcast, None)
+            };
 
         (
             Packet {
@@ -891,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_type2_packet_passthrough() {
+    fn outbound_type2_packet_unknown_destination_passthrough() {
         let destination = AddressHash::new_from_slice(b"outbound-type2-dst");
         let table = PathTable::new(false);
 
@@ -914,6 +916,55 @@ mod tests {
 
         assert_eq!(forwarded_iface, None);
         assert_eq!(forwarded.header.header_type, HeaderType::Type2);
+    }
+
+    #[test]
+    fn outbound_type2_packet_with_known_path_is_routed() {
+        let destination = AddressHash::new_from_slice(b"outbound-type2-routed");
+        let next_hop = AddressHash::new_from_slice(b"outbound-next-hop");
+        let iface = AddressHash::new_from_slice(b"outbound-iface");
+        let mut table = PathTable::new(false);
+
+        table.handle_announce(
+            &Packet {
+                header: Header {
+                    header_type: HeaderType::Type2,
+                    packet_type: PacketType::Announce,
+                    destination_type: DestinationType::Single,
+                    hops: 2,
+                    ..Default::default()
+                },
+                destination,
+                transport: Some(next_hop),
+                context: PacketContext::None,
+                ifac: None,
+                data: Default::default(),
+            },
+            Some(next_hop),
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+        );
+
+        let packet = Packet {
+            header: Header {
+                header_type: HeaderType::Type2,
+                packet_type: PacketType::Data,
+                destination_type: DestinationType::Single,
+                hops: 1,
+                ..Default::default()
+            },
+            destination,
+            transport: Some(next_hop),
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        let (forwarded, forwarded_iface) = table.handle_packet(packet);
+
+        assert_eq!(forwarded_iface, Some(iface));
+        assert_eq!(forwarded.header.header_type, HeaderType::Type2);
+        assert_eq!(forwarded.transport, Some(next_hop));
     }
 
     #[test]
