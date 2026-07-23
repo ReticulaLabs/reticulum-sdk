@@ -36,20 +36,29 @@ pub struct AnnounceEntry {
     pub response_to_iface: Option<AddressHash>,
 }
 
+pub enum RetransmitOutcome {
+    /// Retry limit reached; the entry should be moved to the archive cache.
+    Completed,
+    /// Timeout has not yet expired; keep the entry and try again next cycle.
+    Deferred,
+    /// The entry is ready to be sent now.
+    Ready(TxMessage),
+}
+
 impl AnnounceEntry {
-    pub fn retransmit(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
+    pub fn retransmit(&mut self, transport_id: &AddressHash) -> RetransmitOutcome {
         if self.retries >= LOCAL_REBROADCASTS_MAX || self.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX {
-            return None;
+            return RetransmitOutcome::Completed;
         }
 
         if Instant::now() < self.timeout {
-            return None;
+            return RetransmitOutcome::Deferred;
         }
 
         self.retries += 1;
         self.timeout = Instant::now() + Duration::from_secs(PATHFINDER_G) + random_rw_jitter();
 
-        Some(self.always_retransmit(transport_id))
+        RetransmitOutcome::Ready(self.always_retransmit(transport_id))
     }
 
     /// Retransmit immediately, bypassing the timeout check.
@@ -282,18 +291,19 @@ impl AnnounceTable {
                 continue;
             }
 
-            if let Some(message) = entry.retransmit(transport_id) {
-                messages.push(message);
-            } else {
-                completed.push(destination.clone());
+            match entry.retransmit(transport_id) {
+                RetransmitOutcome::Ready(msg) => messages.push(msg),
+                RetransmitOutcome::Completed => completed.push(destination.clone()),
+                RetransmitOutcome::Deferred => {}
             }
         }
 
         let n_announces = messages.len();
 
         for (_, ref mut entry) in &mut self.responses {
-            if let Some(message) = entry.retransmit(transport_id) {
-                messages.push(message);
+            match entry.retransmit(transport_id) {
+                RetransmitOutcome::Ready(msg) => messages.push(msg),
+                RetransmitOutcome::Completed | RetransmitOutcome::Deferred => {}
             }
         }
 
