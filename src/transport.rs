@@ -439,6 +439,7 @@ struct TransportHandler {
     announce_limits: AnnounceLimits,
 
     out_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
+    out_links_by_link_id: HashMap<AddressHash, Arc<Mutex<Link>>>,
     in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
 
     path_requests: PathRequests,
@@ -793,6 +794,7 @@ impl Transport {
             discoverable_ifaces: HashMap::new(),
             announce_limits: AnnounceLimits::new(),
             out_links: HashMap::new(),
+            out_links_by_link_id: HashMap::new(),
             in_links: HashMap::new(),
             path_requests,
             last_path_requests: HashMap::new(),
@@ -1161,18 +1163,7 @@ impl Transport {
     }
 
     pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
-        let links = {
-            let handler = self.handler.lock().await;
-            handler.out_links.values().cloned().collect::<Vec<_>>()
-        };
-
-        for link in links {
-            if *link.lock().await.id() == *link_id {
-                return Some(link);
-            }
-        }
-
-        None
+        self.handler.lock().await.out_links_by_link_id.get(link_id).cloned()
     }
 
     pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
@@ -1228,15 +1219,14 @@ impl Transport {
             path_mtu
         );
 
+        let link_id = *link.id();
         let link = Arc::new(Mutex::new(link));
 
         self.send_packet(packet).await;
 
-        self.handler
-            .lock()
-            .await
-            .out_links
-            .insert(destination.address_hash, link.clone());
+        let mut handler = self.handler.lock().await;
+        handler.out_links.insert(destination.address_hash, link.clone());
+        handler.out_links_by_link_id.insert(link_id, link.clone());
 
         link
     }
@@ -2897,8 +2887,8 @@ async fn handle_proof(
         packet.destination
     );
 
-    for link in handler.out_links.values() {
-        let mut link = link.lock().await;
+    if let Some(out_link) = handler.out_links_by_link_id.get(&packet.destination).cloned() {
+        let mut link = out_link.lock().await;
         match link.handle_packet(packet, true) {
             LinkHandleResult::Activated => {
                 log::debug!(
@@ -3074,8 +3064,8 @@ async fn handle_data(
             }
         }
 
-        for link in handler.out_links.values() {
-            let mut link = link.lock().await;
+        if let Some(out_link) = handler.out_links_by_link_id.get(&packet.destination).cloned() {
+            let mut link = out_link.lock().await;
             let result = link.handle_packet(packet, true);
             if matches!(result, LinkHandleResult::KeepAlive) {
                 log::trace!(
@@ -3789,6 +3779,7 @@ async fn handle_check_links(
     pending: &mut PendingSends,
 ) {
     let mut links_to_remove: Vec<AddressHash> = Vec::new();
+    let mut out_link_ids_to_remove: Vec<AddressHash> = Vec::new();
 
     // Clean up input links
     for link_entry in &handler.in_links {
@@ -3881,6 +3872,7 @@ async fn handle_check_links(
                             pending.push(handler.send_ctx.prepare_send_packet(packet));
                         }
                         links_to_remove.push(*link_entry.0);
+                        out_link_ids_to_remove.push(*link.id());
                     }
                 }
             }
@@ -3952,6 +3944,7 @@ async fn handle_check_links(
             LinkStatus::Closed => {
                 link.close();
                 links_to_remove.push(*link_entry.0);
+                out_link_ids_to_remove.push(*link.id());
             }
             _ => {}
         }
@@ -3959,6 +3952,9 @@ async fn handle_check_links(
 
     for addr in &links_to_remove {
         handler.out_links.remove(&addr);
+    }
+    for link_id in &out_link_ids_to_remove {
+        handler.out_links_by_link_id.remove(&link_id);
     }
 
     for (dest, blocked_if) in &rediscover_destinations {
@@ -4729,11 +4725,11 @@ async fn update_blackhole_from_source(
     };
 
     let link_arc = Arc::new(Mutex::new(link));
-    handler
-        .lock()
-        .await
-        .out_links
-        .insert(dest_hash, link_arc.clone());
+    {
+        let mut h = handler.lock().await;
+        h.out_links.insert(dest_hash, link_arc.clone());
+        h.out_links_by_link_id.insert(link_id, link_arc.clone());
+    }
 
     log::trace!(
         "tp({name}): waiting for blackhole link {link_id} to activate (timeout {:.0}s)",
@@ -4877,7 +4873,11 @@ async fn update_blackhole_from_source(
     };
 
     log::trace!("tp({name}): tearing down blackhole link {link_id} to {dest_hash}",);
-    handler.lock().await.out_links.remove(&dest_hash);
+    {
+        let mut h = handler.lock().await;
+        h.out_links.remove(&dest_hash);
+        h.out_links_by_link_id.remove(&link_id);
+    }
 
     log::trace!("tp({name}): blackhole fetch from {source_hash} complete, {inserted} new entries",);
 
