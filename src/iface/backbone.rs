@@ -1,7 +1,7 @@
 use std::cmp;
 use std::fmt::Write as _;
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -14,7 +14,7 @@ use crate::iface::{
     Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, RxMessage,
     configured_bitrate,
 };
-use crate::iface::reconnect_pacer::ReconnectPacer;
+use crate::iface::reconnect_pacer::{ReconnectPacer, ReconnectPacerMetrics};
 use crate::packet::{
     Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
 };
@@ -98,6 +98,7 @@ pub struct BackboneServer {
     ifac_netname: Option<String>,
     ifac_netkey: Option<String>,
     mode: InterfaceMode,
+    reconnect_pacer: Arc<Mutex<ReconnectPacer>>,
 }
 
 impl BackboneServer {
@@ -114,6 +115,11 @@ impl BackboneServer {
             ifac_netname: None,
             ifac_netkey: None,
             mode: InterfaceMode::Full,
+            reconnect_pacer: Arc::new(Mutex::new(ReconnectPacer::new(
+                INITIAL_RECONNECT_BACKOFF,
+                MAX_RECONNECT_BACKOFF,
+                Duration::from_secs(60),
+            ))),
         }
     }
 
@@ -131,6 +137,11 @@ impl BackboneServer {
             ifac_netname: None,
             ifac_netkey: None,
             mode: InterfaceMode::Full,
+            reconnect_pacer: Arc::new(Mutex::new(ReconnectPacer::new(
+                INITIAL_RECONNECT_BACKOFF,
+                MAX_RECONNECT_BACKOFF,
+                Duration::from_secs(60),
+            ))),
         }
     }
 
@@ -155,6 +166,16 @@ impl BackboneServer {
         self
     }
 
+    /// Returns a snapshot of current reconnect-pacer metrics.
+    ///
+    /// The reconnect pacer tracks per-source-IP reconnection frequency
+    /// and applies exponential backoff to prevent rapid reconnect storms.
+    /// This method allows external monitoring tools to observe how many
+    /// client IPs are currently being rate-limited.
+    pub fn reconnect_pacer_metrics(&self) -> ReconnectPacerMetrics {
+        self.reconnect_pacer.lock().unwrap().metrics()
+    }
+
     pub async fn spawn(context: InterfaceContext<Self>) {
         let addr = { context.inner.lock().unwrap().addr.clone() };
 
@@ -164,17 +185,11 @@ impl BackboneServer {
         let hw_mtu = { context.inner.lock().unwrap().hw_mtu };
         let ifac_netname = { context.inner.lock().unwrap().ifac_netname.clone() };
         let ifac_netkey = { context.inner.lock().unwrap().ifac_netkey.clone() };
+        let reconnect_pacer = { context.inner.lock().unwrap().reconnect_pacer.clone() };
 
         let server_address = context.channel.address;
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
-
-        // Per-source-IP reconnect backoff to prevent rapid reconnect storms.
-        let mut reconnect_pacer = ReconnectPacer::new(
-            INITIAL_RECONNECT_BACKOFF,
-            MAX_RECONNECT_BACKOFF,
-            Duration::from_secs(60),
-        );
 
         loop {
             if context.cancel.is_cancelled() {
@@ -244,14 +259,17 @@ impl BackboneServer {
 
                             // Per-IP backoff: reject rapid reconnects from
                             // the same source address before spawning a handler.
-                            if !reconnect_pacer.is_allowed(peer_ip) {
-                                log::debug!(
-                                    "backbone_server: rejecting reconnect from <{}> (backoff active)",
-                                    client.1,
-                                );
-                                continue;
+                            {
+                                let mut pacer = reconnect_pacer.lock().unwrap();
+                                if !pacer.is_allowed(peer_ip) {
+                                    log::debug!(
+                                        "backbone_server: rejecting reconnect from <{}> (backoff active)",
+                                        client.1,
+                                    );
+                                    continue;
+                                }
+                                pacer.record(peer_ip);
                             }
-                            reconnect_pacer.record(peer_ip);
 
                             log::info!(
                                 "backbone_server: new client <{}> connected to <{}>",

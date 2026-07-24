@@ -23,6 +23,20 @@ struct ReconnectEntry {
     backoff: Duration,
 }
 
+/// Snapshot of the reconnect pacer state for external metrics collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconnectPacerMetrics {
+    /// Number of source IPs currently within their backoff window
+    /// (i.e. would be rejected if they tried to reconnect right now).
+    pub entries_in_backoff: usize,
+    /// Total number of source IPs currently tracked by the pacer.
+    pub total_tracked_ips: usize,
+    /// Configured initial backoff duration.
+    pub initial_backoff_ms: u64,
+    /// Configured maximum backoff duration.
+    pub max_backoff_ms: u64,
+}
+
 impl ReconnectPacer {
     pub(crate) fn new(
         initial_backoff: Duration,
@@ -41,9 +55,7 @@ impl ReconnectPacer {
     /// Returns `true` if the given IP is currently allowed to reconnect.
     /// Call this *after* accepting the TCP connection but *before* spawning
     /// the client handler.
-    pub(crate) fn is_allowed(&mut self, ip: IpAddr) -> bool {
-        self.maybe_cleanup();
-
+    pub(crate) fn is_allowed(&self, ip: IpAddr) -> bool {
         match self.entries.get(&ip) {
             Some(entry) => {
                 let now = Instant::now();
@@ -57,6 +69,8 @@ impl ReconnectPacer {
     /// per-IP backoff window so subsequent rapid reconnects are rejected.
     /// Should be called only when `is_allowed()` returned `true`.
     pub(crate) fn record(&mut self, ip: IpAddr) {
+        self.maybe_cleanup();
+
         let now = Instant::now();
 
         let is_first = !self.entries.contains_key(&ip);
@@ -74,6 +88,22 @@ impl ReconnectPacer {
             }
         }
         entry.last_connect = now;
+    }
+
+    /// Take a metrics snapshot without mutating internal state.
+    pub(crate) fn metrics(&self) -> ReconnectPacerMetrics {
+        let now = Instant::now();
+        let entries_in_backoff = self
+            .entries
+            .values()
+            .filter(|e| now - e.last_connect < e.backoff)
+            .count();
+        ReconnectPacerMetrics {
+            entries_in_backoff,
+            total_tracked_ips: self.entries.len(),
+            initial_backoff_ms: self.initial_backoff.as_millis() as u64,
+            max_backoff_ms: self.max_backoff.as_millis() as u64,
+        }
     }
 
     fn maybe_cleanup(&mut self) {
