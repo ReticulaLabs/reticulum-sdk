@@ -14,6 +14,7 @@ use crate::iface::{
     Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, RxMessage,
     configured_bitrate,
 };
+use crate::iface::reconnect_pacer::ReconnectPacer;
 use crate::packet::{
     Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
 };
@@ -168,6 +169,13 @@ impl BackboneServer {
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
+        // Per-source-IP reconnect backoff to prevent rapid reconnect storms.
+        let mut reconnect_pacer = ReconnectPacer::new(
+            INITIAL_RECONNECT_BACKOFF,
+            MAX_RECONNECT_BACKOFF,
+            Duration::from_secs(60),
+        );
+
         loop {
             if context.cancel.is_cancelled() {
                 break;
@@ -232,6 +240,19 @@ impl BackboneServer {
                     }
                     client = listener.accept() => {
                         if let Ok(client) = client {
+                            let peer_ip = client.1.ip();
+
+                            // Per-IP backoff: reject rapid reconnects from
+                            // the same source address before spawning a handler.
+                            if !reconnect_pacer.is_allowed(peer_ip) {
+                                log::debug!(
+                                    "backbone_server: rejecting reconnect from <{}> (backoff active)",
+                                    client.1,
+                                );
+                                continue;
+                            }
+                            reconnect_pacer.record(peer_ip);
+
                             log::info!(
                                 "backbone_server: new client <{}> connected to <{}>",
                                 client.1,

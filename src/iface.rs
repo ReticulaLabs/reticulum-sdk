@@ -4,6 +4,7 @@ pub mod ifac;
 pub mod kiss;
 pub mod lora;
 pub mod modem73;
+pub mod reconnect_pacer;
 pub mod rnode;
 pub mod tcp_client;
 pub mod tcp_server;
