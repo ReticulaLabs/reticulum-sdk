@@ -362,7 +362,7 @@ impl PrivateIdentity {
         hex_string
     }
 
-    pub fn shared_instance_rpc_key(&self) -> Vec<u8> {
+    pub fn rpc_key(&self) -> Vec<u8> {
         Hash::generator()
             .chain_update(self.private_key.as_bytes())
             .chain_update(self.sign_key.as_bytes())

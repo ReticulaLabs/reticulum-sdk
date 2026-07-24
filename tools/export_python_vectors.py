@@ -131,9 +131,9 @@ def offline_transport_state(RNS):
         return None
 
     if not had_owner:
-        RNS.Transport.owner = SimpleNamespace(is_connected_to_shared_instance=False)
+        RNS.Transport.owner = SimpleNamespace(rpc_connected=False)
     elif original_owner is None:
-        RNS.Transport.owner = SimpleNamespace(is_connected_to_shared_instance=False)
+        RNS.Transport.owner = SimpleNamespace(rpc_connected=False)
 
     RNS.Transport.register_destination = register_destination_stub
     try:

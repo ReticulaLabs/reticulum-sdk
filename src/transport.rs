@@ -130,8 +130,9 @@ const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 /// serial) can use a smaller one (e.g., 512–1024).
 pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 16384;
 const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
-pub const DEFAULT_SHARED_INSTANCE_PORT: u16 = 37428;
-pub const DEFAULT_INSTANCE_CONTROL_PORT: u16 = 37429;
+pub const DEFAULT_RPC_DATA_PORT: u16 = 37428;
+pub const DEFAULT_RPC_CONTROL_PORT: u16 = 37429;
+pub const DEFAULT_RPC_BIND_HOST: &str = "127.0.0.1";
 pub const DEFAULT_INSTANCE_NAME: &str = "default";
 const DEFAULT_PER_HOP_TIMEOUT_SECS: u64 = 6;
 const PY_CONN_CHALLENGE: &[u8] = b"#CHALLENGE#";
@@ -213,18 +214,19 @@ pub struct TransportConfig {
     /// it to save memory.
     event_channel_capacity: usize,
 
-    /// Python-compatible shared instance mode. When enabled, this transport
-    /// tries to become the local shared instance and falls back to connecting
+    /// Python-compatible rpc instance mode. When enabled, this transport
+    /// tries to become the local rpc instance and falls back to connecting
     /// to an existing one.
-    share_instance: bool,
-    require_shared_instance: bool,
-    shared_instance_type: SharedInstanceType,
-    shared_instance_port: u16,
-    instance_control_port: u16,
+    rpc_instance: bool,
+    require_rpc_instance: bool,
+    rpc_instance_type: RpcInstanceType,
+    rpc_data_port: u16,
+    rpc_control_port: u16,
+    rpc_bind_host: String,
     instance_name: String,
     rpc_key: Option<Vec<u8>>,
-    is_shared_instance: bool,
-    is_connected_to_shared_instance: bool,
+    rpc_enabled: bool,
+    rpc_connected: bool,
     is_standalone_instance: bool,
 }
 
@@ -258,7 +260,7 @@ struct PendingProof {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SharedInstanceType {
+pub enum RpcInstanceType {
     Tcp,
     Unix,
 }
@@ -465,7 +467,7 @@ struct TransportHandler {
     decryption_failures: u64,
 
     /// Last received packet SNR/RSSI, updated per-packet from any interface.
-    /// Used by the shared-instance RPC to expose radio metrics to peers.
+    /// Used by the rpc RPC to expose radio metrics to peers.
     last_snr: Option<f32>,
     last_rssi: Option<i16>,
 
@@ -504,15 +506,16 @@ impl TransportConfig {
             blackhole_sources: vec![],
             blackhole_update_interval: Duration::from_secs(60 * 60),
             link_mtu_discovery: true,
-            share_instance: false,
-            require_shared_instance: false,
-            shared_instance_type: SharedInstanceType::Tcp,
-            shared_instance_port: DEFAULT_SHARED_INSTANCE_PORT,
-            instance_control_port: DEFAULT_INSTANCE_CONTROL_PORT,
+            rpc_instance: false,
+            require_rpc_instance: false,
+            rpc_instance_type: RpcInstanceType::Tcp,
+            rpc_data_port: DEFAULT_RPC_DATA_PORT,
+            rpc_control_port: DEFAULT_RPC_CONTROL_PORT,
+            rpc_bind_host: DEFAULT_RPC_BIND_HOST.into(),
             instance_name: DEFAULT_INSTANCE_NAME.into(),
             rpc_key: None,
-            is_shared_instance: false,
-            is_connected_to_shared_instance: false,
+            rpc_enabled: false,
+            rpc_connected: false,
             is_standalone_instance: true,
             event_channel_capacity: EVENT_CHANNEL_CAPACITY,
         }
@@ -581,44 +584,52 @@ impl TransportConfig {
         self.event_channel_capacity = capacity;
     }
 
-    pub fn set_share_instance(&mut self, share_instance: bool) {
-        self.share_instance = share_instance;
+    pub fn set_rpc_instance(&mut self, rpc_instance: bool) {
+        self.rpc_instance = rpc_instance;
     }
 
-    pub fn share_instance(&self) -> bool {
-        self.share_instance
+    pub fn rpc_instance(&self) -> bool {
+        self.rpc_instance
     }
 
-    pub fn set_require_shared_instance(&mut self, require_shared_instance: bool) {
-        self.require_shared_instance = require_shared_instance;
+    pub fn set_require_rpc_instance(&mut self, require_rpc_instance: bool) {
+        self.require_rpc_instance = require_rpc_instance;
     }
 
-    pub fn require_shared_instance(&self) -> bool {
-        self.require_shared_instance
+    pub fn require_rpc_instance(&self) -> bool {
+        self.require_rpc_instance
     }
 
-    pub fn set_shared_instance_type(&mut self, shared_instance_type: SharedInstanceType) {
-        self.shared_instance_type = shared_instance_type;
+    pub fn set_rpc_instance_type(&mut self, rpc_instance_type: RpcInstanceType) {
+        self.rpc_instance_type = rpc_instance_type;
     }
 
-    pub fn shared_instance_type(&self) -> SharedInstanceType {
-        self.shared_instance_type
+    pub fn rpc_instance_type(&self) -> RpcInstanceType {
+        self.rpc_instance_type
     }
 
-    pub fn set_shared_instance_port(&mut self, port: u16) {
-        self.shared_instance_port = port;
+    pub fn set_rpc_data_port(&mut self, port: u16) {
+        self.rpc_data_port = port;
     }
 
-    pub fn shared_instance_port(&self) -> u16 {
-        self.shared_instance_port
+    pub fn rpc_data_port(&self) -> u16 {
+        self.rpc_data_port
     }
 
-    pub fn set_instance_control_port(&mut self, port: u16) {
-        self.instance_control_port = port;
+    pub fn set_rpc_control_port(&mut self, port: u16) {
+        self.rpc_control_port = port;
     }
 
-    pub fn instance_control_port(&self) -> u16 {
-        self.instance_control_port
+    pub fn rpc_control_port(&self) -> u16 {
+        self.rpc_control_port
+    }
+
+    pub fn set_rpc_bind_host<T: Into<String>>(&mut self, host: T) {
+        self.rpc_bind_host = host.into();
+    }
+
+    pub fn rpc_bind_host(&self) -> &str {
+        &self.rpc_bind_host
     }
 
     pub fn set_instance_name<T: Into<String>>(&mut self, name: T) {
@@ -687,15 +698,16 @@ impl Default for TransportConfig {
             blackhole_sources: vec![],
             blackhole_update_interval: Duration::from_secs(60 * 60),
             link_mtu_discovery: true,
-            share_instance: false,
-            require_shared_instance: false,
-            shared_instance_type: SharedInstanceType::Tcp,
-            shared_instance_port: DEFAULT_SHARED_INSTANCE_PORT,
-            instance_control_port: DEFAULT_INSTANCE_CONTROL_PORT,
+            rpc_instance: false,
+            require_rpc_instance: false,
+            rpc_instance_type: RpcInstanceType::Tcp,
+            rpc_data_port: DEFAULT_RPC_DATA_PORT,
+            rpc_control_port: DEFAULT_RPC_CONTROL_PORT,
+            rpc_bind_host: DEFAULT_RPC_BIND_HOST.into(),
             instance_name: DEFAULT_INSTANCE_NAME.into(),
             rpc_key: None,
-            is_shared_instance: false,
-            is_connected_to_shared_instance: false,
+            rpc_enabled: false,
+            rpc_connected: false,
             is_standalone_instance: true,
             event_channel_capacity: EVENT_CHANNEL_CAPACITY,
         }
@@ -719,12 +731,13 @@ impl Transport {
 
         let iface_manager = Arc::new(Mutex::new(iface_manager));
         let cancel = CancellationToken::new();
-        start_shared_instance(&mut config, iface_manager.clone(), cancel.clone());
+        start_rpc_instance(&mut config, iface_manager.clone(), cancel.clone());
 
-        let start_shared_rpc = config.is_shared_instance
-            && matches!(config.shared_instance_type, SharedInstanceType::Tcp);
+        let start_rpc = config.rpc_enabled
+            && matches!(config.rpc_instance_type, RpcInstanceType::Tcp);
         let rpc_name = config.name.clone();
-        let rpc_port = config.instance_control_port;
+        let rpc_port = config.rpc_control_port;
+        let rpc_bind_host = config.rpc_bind_host.clone();
         let rpc_key = config.rpc_key.clone();
 
         let transport_id = if config.retransmit {
@@ -826,10 +839,11 @@ impl Transport {
             ))
         };
 
-        if start_shared_rpc {
-            start_tcp_shared_rpc(
+        if start_rpc {
+            start_tcp_rpc(
                 rpc_name,
                 rpc_port,
+                rpc_bind_host,
                 rpc_key,
                 handler.clone(),
                 iface_messages_tx.clone(),
@@ -1365,16 +1379,16 @@ impl Transport {
         self.handler.lock().await.probe_destination.clone()
     }
 
-    pub async fn is_shared_instance(&self) -> bool {
-        self.handler.lock().await.config.is_shared_instance
+    pub async fn rpc_enabled(&self) -> bool {
+        self.handler.lock().await.config.rpc_enabled
     }
 
-    pub async fn is_connected_to_shared_instance(&self) -> bool {
+    pub async fn rpc_connected(&self) -> bool {
         self.handler
             .lock()
             .await
             .config
-            .is_connected_to_shared_instance
+            .rpc_connected
     }
 
     pub async fn is_standalone_instance(&self) -> bool {
@@ -1434,29 +1448,29 @@ impl Transport {
     }
 }
 
-fn start_shared_instance(
+fn start_rpc_instance(
     config: &mut TransportConfig,
     iface_manager: Arc<Mutex<InterfaceManager>>,
     cancel: CancellationToken,
 ) {
-    config.is_shared_instance = false;
-    config.is_connected_to_shared_instance = false;
+    config.rpc_enabled = false;
+    config.rpc_connected = false;
     config.is_standalone_instance = false;
 
-    if !config.share_instance {
+    if !config.rpc_instance {
         config.is_standalone_instance = true;
         return;
     }
 
     if config.rpc_key.is_none() {
-        config.rpc_key = Some(config.identity.shared_instance_rpc_key());
+        config.rpc_key = Some(config.identity.rpc_key());
     }
 
-    match config.shared_instance_type {
-        SharedInstanceType::Tcp => start_tcp_shared_instance(config, iface_manager, cancel),
-        SharedInstanceType::Unix => {
+    match config.rpc_instance_type {
+        RpcInstanceType::Tcp => start_tcp_rpc_instance(config, iface_manager, cancel),
+        RpcInstanceType::Unix => {
             log::warn!(
-                "tp({}): shared_instance_type=unix is not implemented; running standalone",
+                "tp({}): rpc_instance_type=unix is not implemented; running standalone",
                 config.name
             );
             config.is_standalone_instance = true;
@@ -1464,32 +1478,32 @@ fn start_shared_instance(
     }
 }
 
-fn start_tcp_shared_instance(
+fn start_tcp_rpc_instance(
     config: &mut TransportConfig,
     iface_manager: Arc<Mutex<InterfaceManager>>,
     cancel: CancellationToken,
 ) {
-    let addr = format!("127.0.0.1:{}", config.shared_instance_port);
+    let addr = format!("{}:{}", config.rpc_bind_host, config.rpc_data_port);
 
     match StdTcpListener::bind(&addr) {
         Ok(listener) => {
-            if config.require_shared_instance {
-                panic!("No shared instance available, but application required it");
+            if config.require_rpc_instance {
+                panic!("No rpc instance available, but application required it");
             }
 
-            config.is_shared_instance = true;
-            start_tcp_shared_data_listener(
+            config.rpc_enabled = true;
+            start_tcp_rpc_data_listener(
                 config.name.clone(),
                 addr.clone(),
                 listener,
                 iface_manager,
                 cancel.clone(),
             );
-            log::debug!("tp({}): started shared instance on {}", config.name, addr);
+            log::debug!("tp({}): started rpc instance on {}", config.name, addr);
         }
         Err(error) => {
             log::trace!(
-                "share_instance: tp({}) connecting local client to <{}>",
+                "rpc: tp({}) connecting local client to <{}>",
                 config.name,
                 addr
             );
@@ -1502,11 +1516,11 @@ fn start_tcp_shared_instance(
                     .spawn(client, TcpClient::spawn);
             });
 
-            config.is_connected_to_shared_instance = true;
+            config.rpc_connected = true;
             config.retransmit = false;
             config.respond_to_probes = false;
             log::debug!(
-                "tp({}): connected to shared instance on {} after bind failed: {}",
+                "tp({}): connected to rpc instance on {} after bind failed: {}",
                 config.name,
                 addr,
                 error
@@ -1515,7 +1529,7 @@ fn start_tcp_shared_instance(
     }
 }
 
-fn start_tcp_shared_data_listener(
+fn start_tcp_rpc_data_listener(
     name: String,
     addr: String,
     listener: StdTcpListener,
@@ -1532,7 +1546,7 @@ fn start_tcp_shared_data_listener(
             Ok(listener) => listener,
             Err(error) => {
                 log::error!(
-                    "share_instance: tp({}) could not start data listener <{}>: {}",
+                    "rpc: tp({}) could not start data listener <{}>: {}",
                     name,
                     addr,
                     error
@@ -1542,7 +1556,7 @@ fn start_tcp_shared_data_listener(
         };
 
         log::debug!(
-            "share_instance: tp({}) listening for data clients on <{}>",
+            "rpc: tp({}) listening for data clients on <{}>",
             name,
             addr
         );
@@ -1556,18 +1570,18 @@ fn start_tcp_shared_data_listener(
                     match client {
                         Ok((stream, remote)) => {
                             log::trace!(
-                                "share_instance: client <{}> connected to <{}>",
+                                "rpc: client <{}> connected to <{}>",
                                 remote,
                                 addr
                             );
                             let iface_manager = iface_manager.clone();
                             tokio::spawn(async move {
-                                handle_shared_data_client(stream, remote.to_string(), iface_manager).await;
+                                handle_rpc_data_client(stream, remote.to_string(), iface_manager).await;
                             });
                         }
                         Err(error) => {
                             log::warn!(
-                                "share_instance: error accepting data client on <{}>: {}",
+                                "rpc: error accepting data client on <{}>: {}",
                                 addr,
                                 error
                             );
@@ -1579,7 +1593,7 @@ fn start_tcp_shared_data_listener(
     });
 }
 
-async fn handle_shared_data_client(
+async fn handle_rpc_data_client(
     stream: TcpStream,
     remote: String,
     iface_manager: Arc<Mutex<InterfaceManager>>,
@@ -1587,24 +1601,25 @@ async fn handle_shared_data_client(
     iface_manager
         .lock()
         .await
-        .spawn_shared_instance_client(TcpClient::new_from_stream(remote, stream), TcpClient::spawn);
+        .spawn_rpc_instance_client(TcpClient::new_from_stream(remote, stream), TcpClient::spawn);
 }
 
-fn start_tcp_shared_rpc(
+fn start_tcp_rpc(
     name: String,
     port: u16,
+    bind_host: String,
     auth_key: Option<Vec<u8>>,
     handler: Arc<Mutex<TransportHandler>>,
     iface_messages: broadcast::Sender<RxMessage>,
     cancel: CancellationToken,
 ) {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("{}:{}", bind_host, port);
     tokio::spawn(async move {
         let listener = match TcpListener::bind(&addr).await {
             Ok(listener) => listener,
             Err(error) => {
                 log::error!(
-                    "share_instance: tp({}) could not bind RPC control listener <{}>: {}",
+                    "rpc: tp({}) could not bind RPC control listener <{}>: {}",
                     name,
                     addr,
                     error
@@ -1614,7 +1629,7 @@ fn start_tcp_shared_rpc(
         };
 
         log::debug!(
-            "share_instance: tp({}) listening for RPC control clients on <{}>",
+            "rpc: tp({}) listening for RPC control clients on <{}>",
             name,
             addr
         );
@@ -1628,7 +1643,7 @@ fn start_tcp_shared_rpc(
                     match client {
                         Ok((stream, remote)) => {
                             log::trace!(
-                                "share_instance: RPC client <{}> connected to <{}>",
+                                "rpc: RPC client <{}> connected to <{}>",
                                 remote,
                                 addr
                             );
@@ -1637,11 +1652,11 @@ fn start_tcp_shared_rpc(
                             let iface_messages = iface_messages.clone();
                             tokio::spawn(async move {
                                 if let Err(error) =
-                                    handle_shared_rpc_client(stream, auth_key.as_deref(), handler, iface_messages)
+                                    handle_rpc_client(stream, auth_key.as_deref(), handler, iface_messages)
                                         .await
                                 {
                                     log::warn!(
-                                        "share_instance: RPC client <{}> failed: {}",
+                                        "rpc: RPC client <{}> failed: {}",
                                         remote,
                                         error
                                     );
@@ -1650,7 +1665,7 @@ fn start_tcp_shared_rpc(
                         }
                         Err(error) => {
                             log::warn!(
-                                "share_instance: error accepting RPC control client on <{}>: {}",
+                                "rpc: error accepting RPC control client on <{}>: {}",
                                 addr,
                                 error
                             );
@@ -1662,22 +1677,22 @@ fn start_tcp_shared_rpc(
     });
 }
 
-async fn handle_shared_rpc_client(
+async fn handle_rpc_client(
     mut stream: TcpStream,
     auth_key: Option<&[u8]>,
     handler: Arc<Mutex<TransportHandler>>,
     iface_messages: broadcast::Sender<RxMessage>,
 ) -> Result<(), String> {
-    shared_rpc_authenticate(&mut stream, auth_key).await?;
+    rpc_authenticate(&mut stream, auth_key).await?;
 
     let request = read_py_connection_frame(&mut stream, 64 * 1024).await?;
-    let request = read_shared_rpc_value(&request)?;
+    let request = read_rpc_value(&request)?;
 
     if let Some(map) = request.as_map() {
-        if let Some(listen_config) = shared_rpc_map_value(map, "listen") {
+        if let Some(listen_config) = rpc_map_value(map, "listen") {
             let destination_filter = listen_config
                 .as_map()
-                .and_then(|m| shared_rpc_map_value(m, "destination"))
+                .and_then(|m| rpc_map_value(m, "destination"))
                 .and_then(|v| v.as_slice())
                 .and_then(|slice| {
                     if slice.len() == crate::hash::ADDRESS_HASH_SIZE {
@@ -1688,31 +1703,31 @@ async fn handle_shared_rpc_client(
                         None
                     }
                 });
-            return handle_shared_rpc_listen(stream, iface_messages, destination_filter).await;
+            return handle_rpc_listen(stream, iface_messages, destination_filter).await;
         }
     }
 
     let response = if let Some(map) = request.as_map() {
-        if shared_rpc_map_str(map, "get") == Some("request_path") {
-            handle_shared_rpc_request_path(map, handler).await
+        if rpc_map_str(map, "get") == Some("request_path") {
+            handle_rpc_request_path(map, handler).await
         } else {
             let mut h = handler.lock().await;
-            handle_shared_rpc_request(&request, Some(&mut h))
+            handle_rpc_request(&request, Some(&mut h))
         }
     } else {
         let mut h = handler.lock().await;
-        handle_shared_rpc_request(&request, Some(&mut h))
+        handle_rpc_request(&request, Some(&mut h))
     };
 
-    let encoded = write_shared_rpc_value(&response)?;
+    let encoded = write_rpc_value(&response)?;
     write_py_connection_frame(&mut stream, &encoded).await
 }
 
-async fn handle_shared_rpc_request_path(
+async fn handle_rpc_request_path(
     map: &[(Value, Value)],
     handler: Arc<Mutex<TransportHandler>>,
 ) -> Value {
-    let Some(dest_bytes) = shared_rpc_map_value(map, "destination_hash").and_then(|v| v.as_slice())
+    let Some(dest_bytes) = rpc_map_value(map, "destination_hash").and_then(|v| v.as_slice())
     else {
         return Value::Boolean(false);
     };
@@ -1725,7 +1740,7 @@ async fn handle_shared_rpc_request_path(
     let address_hash = AddressHash::new(hash);
 
     log::trace!(
-        "tp(shared_instance): RPC request_path destination_hash={:02x?}",
+        "tp(rpc_instance): RPC request_path destination_hash={:02x?}",
         hash,
     );
 
@@ -1773,26 +1788,26 @@ async fn handle_shared_rpc_request_path(
     Value::Map(vec![(Value::from("found"), Value::from(false))])
 }
 
-async fn shared_rpc_authenticate(
+async fn rpc_authenticate(
     stream: &mut TcpStream,
     auth_key: Option<&[u8]>,
 ) -> Result<(), String> {
-    let challenge = shared_rpc_challenge();
+    let challenge = rpc_challenge();
     write_py_connection_frame(stream, &challenge).await?;
 
     let response = read_py_connection_frame(stream, 256).await?;
-    let authenticated = shared_rpc_response_is_authenticated(&challenge, &response, auth_key)?;
+    let authenticated = rpc_response_is_authenticated(&challenge, &response, auth_key)?;
 
     if authenticated {
         write_py_connection_frame(stream, PY_CONN_WELCOME).await?;
-        shared_rpc_answer_peer_challenge(stream, auth_key).await
+        rpc_answer_peer_challenge(stream, auth_key).await
     } else {
         let _ = write_py_connection_frame(stream, PY_CONN_FAILURE).await;
         Err("authentication failed".into())
     }
 }
 
-fn shared_rpc_challenge() -> Vec<u8> {
+fn rpc_challenge() -> Vec<u8> {
     let mut rng = UnwrapErr(SysRng);
     let mut random = [0u8; 40];
     rng.fill_bytes(&mut random);
@@ -1804,14 +1819,14 @@ fn shared_rpc_challenge() -> Vec<u8> {
     challenge
 }
 
-fn shared_rpc_response_is_authenticated(
+fn rpc_response_is_authenticated(
     challenge: &[u8],
     response: &[u8],
     auth_key: Option<&[u8]>,
 ) -> Result<bool, String> {
     let message = &challenge[PY_CONN_CHALLENGE.len()..];
     if let Some(auth_key) = auth_key {
-        let expected = shared_rpc_hmac_response(auth_key, message)?;
+        let expected = rpc_hmac_response(auth_key, message)?;
         let expected_raw = &expected[b"{sha256}".len()..];
         Ok(response == expected.as_slice() || response == expected_raw)
     } else {
@@ -1819,7 +1834,7 @@ fn shared_rpc_response_is_authenticated(
     }
 }
 
-async fn shared_rpc_answer_peer_challenge(
+async fn rpc_answer_peer_challenge(
     stream: &mut TcpStream,
     auth_key: Option<&[u8]>,
 ) -> Result<(), String> {
@@ -1842,10 +1857,10 @@ async fn shared_rpc_answer_peer_challenge(
     }
 
     let auth_key = auth_key.ok_or_else(|| {
-        "peer requested mutual authentication, but no shared_instance rpc_key is configured"
+        "peer requested mutual authentication, but no rpc_key is configured"
             .to_string()
     })?;
-    let response = shared_rpc_hmac_response(auth_key, &peer_challenge[PY_CONN_CHALLENGE.len()..])?;
+    let response = rpc_hmac_response(auth_key, &peer_challenge[PY_CONN_CHALLENGE.len()..])?;
     write_py_connection_frame(stream, &response).await?;
 
     let welcome = read_py_connection_frame(stream, PY_CONN_AUTH_MAX_FRAME).await?;
@@ -1861,7 +1876,7 @@ async fn shared_rpc_answer_peer_challenge(
     }
 }
 
-fn shared_rpc_hmac_response(auth_key: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
+fn rpc_hmac_response(auth_key: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(auth_key).map_err(|error| error.to_string())?;
     mac.update(message);
     let digest = mac.finalize().into_bytes();
@@ -1872,14 +1887,14 @@ fn shared_rpc_hmac_response(auth_key: &[u8], message: &[u8]) -> Result<Vec<u8>, 
     Ok(response)
 }
 
-async fn handle_shared_rpc_listen(
+async fn handle_rpc_listen(
     mut stream: TcpStream,
     iface_messages: broadcast::Sender<RxMessage>,
     destination_filter: Option<AddressHash>,
 ) -> Result<(), String> {
     let mut rx = iface_messages.subscribe();
 
-    let init = write_shared_rpc_value(&Value::Map(vec![(
+    let init = write_rpc_value(&Value::Map(vec![(
         Value::from("status"),
         Value::from("listening"),
     )]))?;
@@ -1935,7 +1950,7 @@ async fn handle_shared_rpc_listen(
                     ),
                 ]);
 
-                let encoded = write_shared_rpc_value(&packet_info)?;
+                let encoded = write_rpc_value(&packet_info)?;
                 write_py_connection_frame(&mut stream, &encoded).await?;
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1943,7 +1958,7 @@ async fn handle_shared_rpc_listen(
                     Value::from("lagged"),
                     Value::from(n as u64),
                 )]);
-                let encoded = write_shared_rpc_value(&lag)?;
+                let encoded = write_rpc_value(&lag)?;
                 write_py_connection_frame(&mut stream, &encoded).await?;
             }
             Err(broadcast::error::RecvError::Closed) => {
@@ -1954,18 +1969,18 @@ async fn handle_shared_rpc_listen(
     Ok(())
 }
 
-fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut TransportHandler>) -> Value {
+fn handle_rpc_request(request: &Value, mut handler: Option<&mut TransportHandler>) -> Value {
     let Some(map) = request.as_map() else {
         return Value::Boolean(false);
     };
 
-    if let Some(operation) = shared_rpc_map_str(map, "get") {
+    if let Some(operation) = rpc_map_str(map, "get") {
         return match operation {
-            "path_table" => shared_rpc_path_table(handler.as_deref_mut()),
-            "rate_table" => shared_rpc_rate_table(handler.as_deref_mut()),
-            "interface_stats" => shared_rpc_interface_stats(),
-            "next_hop_if_name" => shared_rpc_next_hop_if_name(map, handler.as_deref()),
-            "next_hop" => shared_rpc_next_hop(map, handler.as_deref()),
+            "path_table" => rpc_path_table(handler.as_deref_mut()),
+            "rate_table" => rpc_rate_table(handler.as_deref_mut()),
+            "interface_stats" => rpc_interface_stats(),
+            "next_hop_if_name" => rpc_next_hop_if_name(map, handler.as_deref()),
+            "next_hop" => rpc_next_hop(map, handler.as_deref()),
             "packet_snr" => handler
                 .and_then(|h| h.last_snr)
                 .map(Value::from)
@@ -1977,12 +1992,12 @@ fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut Transport
             "packet_q" => Value::Nil,
             "first_hop_timeout" => Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
             "link_count" => Value::from(0),
-            "blackholed_identities" => shared_rpc_blackholed_identities(handler.as_deref_mut()),
-            "is_blackholed" => shared_rpc_is_blackholed(map, handler.as_deref_mut()),
-            "interfaces" => shared_rpc_interfaces(handler.as_deref_mut()),
+            "blackholed_identities" => rpc_blackholed_identities(handler.as_deref_mut()),
+            "is_blackholed" => rpc_is_blackholed(map, handler.as_deref_mut()),
+            "interfaces" => rpc_interfaces(handler.as_deref_mut()),
             _ => {
                 log::warn!(
-                    "share_instance: unsupported RPC get operation <{}>",
+                    "rpc: unsupported RPC get operation <{}>",
                     operation
                 );
                 Value::Boolean(false)
@@ -1990,14 +2005,14 @@ fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut Transport
         };
     }
 
-    if let Some(operation) = shared_rpc_map_str(map, "drop") {
+    if let Some(operation) = rpc_map_str(map, "drop") {
         return match operation {
-            "path" => shared_rpc_drop_path(map, handler.as_deref_mut()),
-            "all_via" => shared_rpc_drop_all_via(map, handler.as_deref_mut()),
-            "announce_queues" => shared_rpc_drop_announce_queues(handler.as_deref_mut()),
+            "path" => rpc_drop_path(map, handler.as_deref_mut()),
+            "all_via" => rpc_drop_all_via(map, handler.as_deref_mut()),
+            "announce_queues" => rpc_drop_announce_queues(handler.as_deref_mut()),
             _ => {
                 log::warn!(
-                    "share_instance: unsupported RPC drop operation <{}>",
+                    "rpc: unsupported RPC drop operation <{}>",
                     operation
                 );
                 Value::Boolean(false)
@@ -2006,28 +2021,28 @@ fn handle_shared_rpc_request(request: &Value, mut handler: Option<&mut Transport
     }
 
     if let Some(identity_bytes) =
-        shared_rpc_map_value(map, "blackhole_identity").and_then(|v| v.as_slice())
+        rpc_map_value(map, "blackhole_identity").and_then(|v| v.as_slice())
     {
-        return shared_rpc_blackhole_identity(identity_bytes, map, handler.as_deref_mut());
+        return rpc_blackhole_identity(identity_bytes, map, handler.as_deref_mut());
     }
 
     if let Some(identity_bytes) =
-        shared_rpc_map_value(map, "unblackhole_identity").and_then(|v| v.as_slice())
+        rpc_map_value(map, "unblackhole_identity").and_then(|v| v.as_slice())
     {
-        return shared_rpc_unblackhole_identity(identity_bytes, handler.as_deref_mut());
+        return rpc_unblackhole_identity(identity_bytes, handler.as_deref_mut());
     }
 
-    if shared_rpc_map_value(map, "destination_data").is_some()
-        || shared_rpc_map_value(map, "identity_data").is_some()
+    if rpc_map_value(map, "destination_data").is_some()
+        || rpc_map_value(map, "identity_data").is_some()
     {
         return Value::Boolean(false);
     }
 
-    log::warn!("share_instance: unsupported RPC request {:?}", request);
+    log::warn!("rpc: unsupported RPC request {:?}", request);
     Value::Boolean(false)
 }
 
-fn shared_rpc_path_table(handler: Option<&mut TransportHandler>) -> Value {
+fn rpc_path_table(handler: Option<&mut TransportHandler>) -> Value {
     let Some(handler) = handler else {
         return Value::Array(vec![]);
     };
@@ -2059,7 +2074,7 @@ fn shared_rpc_path_table(handler: Option<&mut TransportHandler>) -> Value {
     Value::Array(entries)
 }
 
-fn shared_rpc_rate_table(handler: Option<&mut TransportHandler>) -> Value {
+fn rpc_rate_table(handler: Option<&mut TransportHandler>) -> Value {
     let Some(handler) = handler else {
         return Value::Array(vec![]);
     };
@@ -2092,14 +2107,14 @@ fn shared_rpc_rate_table(handler: Option<&mut TransportHandler>) -> Value {
     Value::Array(entries)
 }
 
-fn shared_rpc_blackholed_identities(handler: Option<&mut TransportHandler>) -> Value {
+fn rpc_blackholed_identities(handler: Option<&mut TransportHandler>) -> Value {
     match handler {
         Some(handler) => handler.blackhole_table.to_msgpack(),
         None => Value::Map(vec![]),
     }
 }
 
-fn shared_rpc_is_blackholed(
+fn rpc_is_blackholed(
     map: &[(Value, Value)],
     handler: Option<&mut TransportHandler>,
 ) -> Value {
@@ -2107,7 +2122,7 @@ fn shared_rpc_is_blackholed(
         return Value::Boolean(false);
     };
     if let Some(identity_bytes) =
-        shared_rpc_map_value(map, "identity_hash").and_then(|v| v.as_slice())
+        rpc_map_value(map, "identity_hash").and_then(|v| v.as_slice())
     {
         let identity_hash = AddressHash::new_from_slice(identity_bytes);
         Value::Boolean(handler.blackhole_table.contains(&identity_hash))
@@ -2116,11 +2131,11 @@ fn shared_rpc_is_blackholed(
     }
 }
 
-fn shared_rpc_drop_path(map: &[(Value, Value)], handler: Option<&mut TransportHandler>) -> Value {
+fn rpc_drop_path(map: &[(Value, Value)], handler: Option<&mut TransportHandler>) -> Value {
     let Some(handler) = handler else {
         return Value::Boolean(false);
     };
-    let Some(destination) = shared_rpc_destination_hash(map) else {
+    let Some(destination) = rpc_destination_hash(map) else {
         return Value::Boolean(false);
     };
     let removed = handler
@@ -2132,14 +2147,14 @@ fn shared_rpc_drop_path(map: &[(Value, Value)], handler: Option<&mut TransportHa
     Value::Boolean(removed)
 }
 
-fn shared_rpc_drop_all_via(
+fn rpc_drop_all_via(
     map: &[(Value, Value)],
     handler: Option<&mut TransportHandler>,
 ) -> Value {
     let Some(handler) = handler else {
         return Value::from(0);
     };
-    let Some(via) = shared_rpc_destination_hash(map) else {
+    let Some(via) = rpc_destination_hash(map) else {
         return Value::from(0);
     };
     let count = handler
@@ -2151,7 +2166,7 @@ fn shared_rpc_drop_all_via(
     Value::from(count as u64)
 }
 
-fn shared_rpc_drop_announce_queues(handler: Option<&mut TransportHandler>) -> Value {
+fn rpc_drop_announce_queues(handler: Option<&mut TransportHandler>) -> Value {
     let Some(handler) = handler else {
         return Value::from(0);
     };
@@ -2159,7 +2174,7 @@ fn shared_rpc_drop_announce_queues(handler: Option<&mut TransportHandler>) -> Va
     Value::from(0)
 }
 
-fn shared_rpc_blackhole_identity(
+fn rpc_blackhole_identity(
     identity_bytes: &[u8],
     map: &[(Value, Value)],
     handler: Option<&mut TransportHandler>,
@@ -2174,10 +2189,10 @@ fn shared_rpc_blackhole_identity(
     hash.copy_from_slice(identity_bytes);
     let identity_hash = AddressHash::new(hash);
 
-    let until = shared_rpc_map_value(map, "duration")
+    let until = rpc_map_value(map, "duration")
         .and_then(|v| v.as_f64())
         .map(|secs| time::Instant::now() + time::Duration::from_secs_f64(secs));
-    let reason = shared_rpc_map_value(map, "reason")
+    let reason = rpc_map_value(map, "reason")
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned());
 
@@ -2187,7 +2202,7 @@ fn shared_rpc_blackhole_identity(
         .add(identity_hash, source, until, reason);
     let removed = handler.remove_blackholed_paths();
     log::info!(
-        "share_instance: blackholed identity {}, removed {} path{}",
+        "rpc: blackholed identity {}, removed {} path{}",
         identity_hash,
         removed,
         if removed == 1 { "" } else { "s" },
@@ -2195,7 +2210,7 @@ fn shared_rpc_blackhole_identity(
     Value::Boolean(added)
 }
 
-fn shared_rpc_unblackhole_identity(
+fn rpc_unblackhole_identity(
     identity_bytes: &[u8],
     handler: Option<&mut TransportHandler>,
 ) -> Value {
@@ -2211,18 +2226,18 @@ fn shared_rpc_unblackhole_identity(
     let removed = handler.blackhole_table.remove(&identity_hash);
     if removed {
         log::info!(
-            "share_instance: lifted blackhole for identity {}",
+            "rpc: lifted blackhole for identity {}",
             identity_hash,
         );
     }
     Value::Boolean(removed)
 }
 
-fn shared_rpc_next_hop(map: &[(Value, Value)], handler: Option<&TransportHandler>) -> Value {
+fn rpc_next_hop(map: &[(Value, Value)], handler: Option<&TransportHandler>) -> Value {
     let Some(handler) = handler else {
         return Value::Nil;
     };
-    let Some(destination) = shared_rpc_destination_hash(map) else {
+    let Some(destination) = rpc_destination_hash(map) else {
         return Value::Nil;
     };
 
@@ -2236,14 +2251,14 @@ fn shared_rpc_next_hop(map: &[(Value, Value)], handler: Option<&TransportHandler
         .unwrap_or(Value::Nil)
 }
 
-fn shared_rpc_next_hop_if_name(
+fn rpc_next_hop_if_name(
     map: &[(Value, Value)],
     handler: Option<&TransportHandler>,
 ) -> Value {
     let Some(handler) = handler else {
         return Value::from("None");
     };
-    let Some(destination) = shared_rpc_destination_hash(map) else {
+    let Some(destination) = rpc_destination_hash(map) else {
         return Value::from("None");
     };
 
@@ -2258,8 +2273,8 @@ fn shared_rpc_next_hop_if_name(
         .unwrap_or_else(|| Value::from("None"))
 }
 
-fn shared_rpc_destination_hash(map: &[(Value, Value)]) -> Option<AddressHash> {
-    let value = shared_rpc_map_value(map, "destination_hash")?;
+fn rpc_destination_hash(map: &[(Value, Value)]) -> Option<AddressHash> {
+    let value = rpc_map_value(map, "destination_hash")?;
     let bytes = value.as_slice()?;
     if bytes.len() != crate::hash::ADDRESS_HASH_SIZE {
         return None;
@@ -2270,7 +2285,7 @@ fn shared_rpc_destination_hash(map: &[(Value, Value)]) -> Option<AddressHash> {
     Some(AddressHash::new(hash))
 }
 
-fn shared_rpc_interfaces(handler: Option<&mut TransportHandler>) -> Value {
+fn rpc_interfaces(handler: Option<&mut TransportHandler>) -> Value {
     let Some(handler) = handler else {
         return Value::Array(vec![]);
     };
@@ -2296,7 +2311,7 @@ fn shared_rpc_interfaces(handler: Option<&mut TransportHandler>) -> Value {
     Value::Array(entries)
 }
 
-fn shared_rpc_interface_stats() -> Value {
+fn rpc_interface_stats() -> Value {
     Value::Map(vec![
         (Value::from("interfaces"), Value::Array(vec![])),
         (Value::from("rxb"), Value::from(0)),
@@ -2307,16 +2322,16 @@ fn shared_rpc_interface_stats() -> Value {
     ])
 }
 
-fn shared_rpc_map_str<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a str> {
-    shared_rpc_map_value(map, name).and_then(Value::as_str)
+fn rpc_map_str<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a str> {
+    rpc_map_value(map, name).and_then(Value::as_str)
 }
 
-fn shared_rpc_map_value<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
+fn rpc_map_value<'a>(map: &'a [(Value, Value)], name: &str) -> Option<&'a Value> {
     map.iter()
         .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
 }
 
-fn read_shared_rpc_value(data: &[u8]) -> Result<Value, String> {
+fn read_rpc_value(data: &[u8]) -> Result<Value, String> {
     read_msgpack_value(data).or_else(|msgpack_error| {
         read_python_pickle_value(data).map_err(|pickle_error| {
             format!(
@@ -2335,7 +2350,7 @@ fn read_msgpack_value(data: &[u8]) -> Result<Value, String> {
     Ok(value)
 }
 
-fn write_shared_rpc_value(value: &Value) -> Result<Vec<u8>, String> {
+fn write_rpc_value(value: &Value) -> Result<Vec<u8>, String> {
     let mut encoded = Vec::new();
     write_value(&mut encoded, value).map_err(|error| error.to_string())?;
     Ok(encoded)
@@ -4215,14 +4230,14 @@ async fn manage_transport(
                     }
                 }
 
-                // Forward announces to shared-instance clients without holding
+                // Forward announces to rpc clients without holding
                 // either the handler or iface_manager lock.
                 if packet.header.packet_type == PacketType::Announce {
                     let clients = packet_send_ctx
                         .iface_manager
                         .lock()
                         .await
-                        .shared_instance_clients_except(message.address);
+                        .rpc_instance_clients_except(message.address);
                     for local_iface in clients {
                         let local_announce = Packet {
                             header: Header {
@@ -4904,39 +4919,42 @@ mod tests {
     }
 
     #[test]
-    fn shared_instance_config_matches_python_names() {
+    fn rpc_instance_config_matches_python_names() {
         let mut config = TransportConfig::default();
 
-        assert!(!config.share_instance());
-        assert_eq!(config.shared_instance_type(), SharedInstanceType::Tcp);
-        assert_eq!(config.shared_instance_port(), DEFAULT_SHARED_INSTANCE_PORT);
+        assert!(!config.rpc_instance());
+        assert_eq!(config.rpc_instance_type(), RpcInstanceType::Tcp);
+        assert_eq!(config.rpc_data_port(), DEFAULT_RPC_DATA_PORT);
         assert_eq!(
-            config.instance_control_port(),
-            DEFAULT_INSTANCE_CONTROL_PORT
+            config.rpc_control_port(),
+            DEFAULT_RPC_CONTROL_PORT
         );
+        assert_eq!(config.rpc_bind_host(), DEFAULT_RPC_BIND_HOST);
         assert_eq!(config.instance_name(), DEFAULT_INSTANCE_NAME);
-        assert!(!config.require_shared_instance());
+        assert!(!config.require_rpc_instance());
         assert!(config.rpc_key().is_none());
 
-        config.set_share_instance(true);
-        config.set_require_shared_instance(true);
-        config.set_shared_instance_type(SharedInstanceType::Unix);
-        config.set_shared_instance_port(40000);
-        config.set_instance_control_port(40001);
+        config.set_rpc_instance(true);
+        config.set_require_rpc_instance(true);
+        config.set_rpc_instance_type(RpcInstanceType::Unix);
+        config.set_rpc_data_port(40000);
+        config.set_rpc_control_port(40001);
+        config.set_rpc_bind_host("0.0.0.0");
         config.set_instance_name("mesh-a");
         config.set_rpc_key(vec![0x42; 24]);
 
-        assert!(config.share_instance());
-        assert!(config.require_shared_instance());
-        assert_eq!(config.shared_instance_type(), SharedInstanceType::Unix);
-        assert_eq!(config.shared_instance_port(), 40000);
-        assert_eq!(config.instance_control_port(), 40001);
+        assert!(config.rpc_instance());
+        assert!(config.require_rpc_instance());
+        assert_eq!(config.rpc_instance_type(), RpcInstanceType::Unix);
+        assert_eq!(config.rpc_data_port(), 40000);
+        assert_eq!(config.rpc_control_port(), 40001);
+        assert_eq!(config.rpc_bind_host(), "0.0.0.0");
         assert_eq!(config.instance_name(), "mesh-a");
         assert_eq!(config.rpc_key(), Some(vec![0x42; 24].as_slice()));
     }
 
     #[test]
-    fn shared_instance_rpc_key_hex_matches_python_config_parsing() {
+    fn rpc_key_hex_matches_python_config_parsing() {
         let mut config = TransportConfig::default();
 
         config
@@ -4996,44 +5014,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_share_instance_first_server_second_client() {
+    async fn tcp_rpc_instance_first_server_second_client() {
         let Some(ports) = free_local_ports(1) else {
-            eprintln!("skipping local shared instance test; TCP bind unavailable");
+            eprintln!("skipping local rpc instance test; TCP bind unavailable");
             return;
         };
         let port = ports[0];
 
         let mut first_config = TransportConfig::default();
-        first_config.set_share_instance(true);
-        first_config.set_shared_instance_port(port);
+        first_config.set_rpc_instance(true);
+        first_config.set_rpc_data_port(port);
         let first = Transport::new(first_config);
 
-        assert!(first.is_shared_instance().await);
-        assert!(!first.is_connected_to_shared_instance().await);
+        assert!(first.rpc_enabled().await);
+        assert!(!first.rpc_connected().await);
         assert!(!first.is_standalone_instance().await);
 
         let mut second_config = TransportConfig::default();
-        second_config.set_share_instance(true);
-        second_config.set_shared_instance_port(port);
+        second_config.set_rpc_instance(true);
+        second_config.set_rpc_data_port(port);
         let second = Transport::new(second_config);
 
-        assert!(!second.is_shared_instance().await);
-        assert!(second.is_connected_to_shared_instance().await);
+        assert!(!second.rpc_enabled().await);
+        assert!(second.rpc_connected().await);
         assert!(!second.is_standalone_instance().await);
     }
 
     #[tokio::test]
-    async fn shared_rpc_returns_first_hop_timeout() {
+    async fn rpc_returns_first_hop_timeout() {
         let Some(ports) = free_local_ports(2) else {
-            eprintln!("skipping shared RPC test; TCP bind unavailable");
+            eprintln!("skipping rpc test; TCP bind unavailable");
             return;
         };
 
         let rpc_key = b"test-rpc-key".to_vec();
         let mut config = TransportConfig::default();
-        config.set_share_instance(true);
-        config.set_shared_instance_port(ports[0]);
-        config.set_instance_control_port(ports[1]);
+        config.set_rpc_instance(true);
+        config.set_rpc_data_port(ports[0]);
+        config.set_rpc_control_port(ports[1]);
         config.set_rpc_key(rpc_key.clone());
         let _transport = Transport::new(config);
 
@@ -5054,7 +5072,7 @@ mod tests {
             .await
             .expect("challenge frame");
         assert!(challenge.starts_with(PY_CONN_CHALLENGE));
-        let response = shared_rpc_hmac_response(&rpc_key, &challenge[PY_CONN_CHALLENGE.len()..])
+        let response = rpc_hmac_response(&rpc_key, &challenge[PY_CONN_CHALLENGE.len()..])
             .expect("hmac response");
         write_py_connection_frame(&mut stream, &response)
             .await
@@ -5080,21 +5098,21 @@ mod tests {
         let response = read_py_connection_frame(&mut stream, 256)
             .await
             .expect("response frame");
-        let response = read_shared_rpc_value(&response).expect("decoded response");
+        let response = read_rpc_value(&response).expect("decoded response");
         assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
     }
 
     #[tokio::test]
-    async fn shared_data_port_does_not_write_rpc_auth_probe_to_hdlc_clients() {
+    async fn rpc_data_port_does_not_write_rpc_auth_probe_to_hdlc_clients() {
         let Some(ports) = free_local_ports(2) else {
-            eprintln!("skipping shared data-port silence test; TCP bind unavailable");
+            eprintln!("skipping rpc data-port silence test; TCP bind unavailable");
             return;
         };
 
         let mut config = TransportConfig::default();
-        config.set_share_instance(true);
-        config.set_shared_instance_port(ports[0]);
-        config.set_instance_control_port(ports[1]);
+        config.set_rpc_instance(true);
+        config.set_rpc_data_port(ports[0]);
+        config.set_rpc_control_port(ports[1]);
         let _transport = Transport::new(config);
 
         let addr = format!("127.0.0.1:{}", ports[0]);
@@ -5108,26 +5126,26 @@ mod tests {
                 Err(_) => time::sleep(Duration::from_millis(25)).await,
             }
         }
-        let mut stream = stream.expect("shared data listener accepts connection");
+        let mut stream = stream.expect("rpc data listener accepts connection");
 
         let mut buffer = [0u8; 1];
         let read = time::timeout(Duration::from_millis(250), stream.read(&mut buffer)).await;
-        assert!(read.is_err(), "shared data port wrote non-HDLC bytes");
+        assert!(read.is_err(), "rpc data port wrote non-HDLC bytes");
     }
 
     #[tokio::test]
-    async fn shared_rpc_derives_default_key_from_transport_identity() {
+    async fn rpc_derives_default_key_from_transport_identity() {
         let Some(ports) = free_local_ports(2) else {
-            eprintln!("skipping shared RPC auth test; TCP bind unavailable");
+            eprintln!("skipping rpc auth test; TCP bind unavailable");
             return;
         };
 
-        let identity = PrivateIdentity::new_from_name("shared-rpc-default-key-test");
-        let rpc_key = identity.shared_instance_rpc_key();
-        let mut config = TransportConfig::new("shared-rpc-default-key-test", &identity, false);
-        config.set_share_instance(true);
-        config.set_shared_instance_port(ports[0]);
-        config.set_instance_control_port(ports[1]);
+        let identity = PrivateIdentity::new_from_name("rpc-default-key-test");
+        let rpc_key = identity.rpc_key();
+        let mut config = TransportConfig::new("rpc-default-key-test", &identity, false);
+        config.set_rpc_instance(true);
+        config.set_rpc_data_port(ports[0]);
+        config.set_rpc_control_port(ports[1]);
         let _transport = Transport::new(config);
 
         let addr = format!("127.0.0.1:{}", ports[1]);
@@ -5146,7 +5164,7 @@ mod tests {
         let challenge = read_py_connection_frame(&mut stream, 256)
             .await
             .expect("challenge frame");
-        let response = shared_rpc_hmac_response(&rpc_key, &challenge[PY_CONN_CHALLENGE.len()..])
+        let response = rpc_hmac_response(&rpc_key, &challenge[PY_CONN_CHALLENGE.len()..])
             .expect("hmac response");
         write_py_connection_frame(&mut stream, &response)
             .await
@@ -5160,7 +5178,7 @@ mod tests {
     }
 
     async fn complete_client_side_mutual_auth(stream: &mut TcpStream, rpc_key: &[u8]) {
-        let peer_challenge = shared_rpc_challenge();
+        let peer_challenge = rpc_challenge();
         write_py_connection_frame(stream, &peer_challenge)
             .await
             .expect("peer challenge frame");
@@ -5169,7 +5187,7 @@ mod tests {
             .await
             .expect("peer response frame");
         assert!(
-            shared_rpc_response_is_authenticated(&peer_challenge, &response, Some(rpc_key))
+            rpc_response_is_authenticated(&peer_challenge, &response, Some(rpc_key))
                 .expect("peer response verification")
         );
 
@@ -5179,7 +5197,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_rpc_handles_python_client_requests() {
+    fn rpc_handles_python_client_requests() {
         let expected = [
             ("path_table", Value::Array(vec![])),
             ("rate_table", Value::Array(vec![])),
@@ -5199,39 +5217,39 @@ mod tests {
 
         for (operation, response) in expected {
             let request = Value::Map(vec![(Value::from("get"), Value::from(operation))]);
-            let actual = handle_shared_rpc_request(&request, None);
+            let actual = handle_rpc_request(&request, None);
             assert_eq!(actual, response);
 
-            let encoded = write_shared_rpc_value(&actual).expect("encoded response");
+            let encoded = write_rpc_value(&actual).expect("encoded response");
             let decoded = read_msgpack_value(&encoded).expect("decoded response");
             assert_eq!(decoded, response);
         }
 
         let request = Value::Map(vec![(Value::from("get"), Value::from("interface_stats"))]);
-        let response = handle_shared_rpc_request(&request, None);
+        let response = handle_rpc_request(&request, None);
         let stats = response.as_map().expect("interface stats dict");
         assert_eq!(
-            shared_rpc_map_value(stats, "interfaces"),
+            rpc_map_value(stats, "interfaces"),
             Some(&Value::Array(vec![]))
         );
         assert_eq!(
-            shared_rpc_map_value(stats, "rxb").and_then(Value::as_u64),
+            rpc_map_value(stats, "rxb").and_then(Value::as_u64),
             Some(0)
         );
         assert_eq!(
-            shared_rpc_map_value(stats, "txb").and_then(Value::as_u64),
+            rpc_map_value(stats, "txb").and_then(Value::as_u64),
             Some(0)
         );
         assert_eq!(
-            shared_rpc_map_value(stats, "rxs").and_then(Value::as_u64),
+            rpc_map_value(stats, "rxs").and_then(Value::as_u64),
             Some(0)
         );
         assert_eq!(
-            shared_rpc_map_value(stats, "txs").and_then(Value::as_u64),
+            rpc_map_value(stats, "txs").and_then(Value::as_u64),
             Some(0)
         );
 
-        let encoded = write_shared_rpc_value(&response).expect("encoded stats response");
+        let encoded = write_rpc_value(&response).expect("encoded stats response");
         let decoded = read_msgpack_value(&encoded).expect("decoded stats response");
         assert_eq!(decoded, response);
 
@@ -5239,23 +5257,23 @@ mod tests {
             Value::from("destination_data"),
             Value::from("retain"),
         )]);
-        let response = handle_shared_rpc_request(&request, None);
+        let response = handle_rpc_request(&request, None);
         assert_eq!(response, Value::Boolean(false));
 
         let request = Value::Map(vec![(Value::from("identity_data"), Value::from("retain"))]);
-        let response = handle_shared_rpc_request(&request, None);
+        let response = handle_rpc_request(&request, None);
         assert_eq!(response, Value::Boolean(false));
 
         let unsupported = Value::Map(vec![(Value::from("get"), Value::from("unsupported"))]);
-        let response = handle_shared_rpc_request(&unsupported, None);
+        let response = handle_rpc_request(&unsupported, None);
         assert_eq!(response, Value::Boolean(false));
 
-        let encoded = write_shared_rpc_value(&response).expect("encoded response");
+        let encoded = write_rpc_value(&response).expect("encoded response");
         assert_eq!(encoded.first(), Some(&0xc2));
     }
 
     #[tokio::test]
-    async fn shared_rpc_returns_known_next_hop_path_data() {
+    async fn rpc_returns_known_next_hop_path_data() {
         let transport = Transport::new(Default::default());
         let handler = transport.get_handler();
         let iface = {
@@ -5267,7 +5285,7 @@ mod tests {
         let mut rng = UnwrapErr(SysRng);
         let remote_destination = SingleInputDestination::new(
             PrivateIdentity::new_from_rand(&mut rng),
-            DestinationName::new("example_utilities", "shared.rpc.path"),
+            DestinationName::new("example_utilities", "rpc.path"),
         );
         let mut announce = remote_destination
             .announce(&mut rng, None)
@@ -5294,7 +5312,7 @@ mod tests {
             ),
         ]);
         let mut guard = handler.lock().await;
-        let response = handle_shared_rpc_request(&request, Some(&mut *guard));
+        let response = handle_rpc_request(&request, Some(&mut *guard));
         assert_eq!(response, Value::Binary(next_hop.as_slice().to_vec()));
 
         let request = Value::Map(vec![
@@ -5304,13 +5322,13 @@ mod tests {
                 Value::Binary(destination.as_slice().to_vec()),
             ),
         ]);
-        let response = handle_shared_rpc_request(&request, Some(&mut *guard));
+        let response = handle_rpc_request(&request, Some(&mut *guard));
         assert_eq!(response, Value::from(iface.to_string()));
     }
 
     #[test]
-    fn shared_rpc_decodes_python_pickled_request() {
-        let request = read_shared_rpc_value(&[
+    fn rpc_decodes_python_pickled_request() {
+        let request = read_rpc_value(&[
             0x80, 0x05, 0x95, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0x94, 0x28,
             0x8c, 0x03, b'g', b'e', b't', 0x94, 0x8c, 0x11, b'f', b'i', b'r', b's', b't', b'_',
             b'h', b'o', b'p', b'_', b't', b'i', b'm', b'e', b'o', b'u', b't', 0x94, 0x8c, 0x10,
@@ -5320,7 +5338,7 @@ mod tests {
         ])
         .expect("Python pickle request");
 
-        let response = handle_shared_rpc_request(&request, None);
+        let response = handle_rpc_request(&request, None);
         assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
 
         let encoded = write_python_pickle_value(&response).expect("pickle response");
@@ -5328,8 +5346,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_rpc_decodes_python_msgpack_request() {
-        let request = read_shared_rpc_value(&[
+    fn rpc_decodes_python_msgpack_request() {
+        let request = read_rpc_value(&[
             0x82, 0xa3, b'g', b'e', b't', 0xb1, b'f', b'i', b'r', b's', b't', b'_', b'h', b'o',
             b'p', b'_', b't', b'i', b'm', b'e', b'o', b'u', b't', 0xb0, b'd', b'e', b's', b't',
             b'i', b'n', b'a', b't', b'i', b'o', b'n', b'_', b'h', b'a', b's', b'h', 0xc4, 0x10,
@@ -5338,10 +5356,10 @@ mod tests {
         ])
         .expect("Python MessagePack request");
 
-        let response = handle_shared_rpc_request(&request, None);
+        let response = handle_rpc_request(&request, None);
         assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
 
-        let encoded = write_shared_rpc_value(&response).expect("MessagePack response");
+        let encoded = write_rpc_value(&response).expect("MessagePack response");
         assert_eq!(encoded, vec![0x06]);
     }
 

@@ -141,18 +141,18 @@ async fn backbone_discovery_announce_roundtrip() {
 }
 
 #[tokio::test]
-async fn shared_instance_client_receives_network_discovery_announces() {
+async fn rpc_instance_client_receives_network_discovery_announces() {
     setup();
 
-    let shared_listener = local_tcp_listener();
+    let rpc_listener = local_tcp_listener();
     let server_listener = local_tcp_listener();
     let remote_listener = local_tcp_listener();
     let control_listener = local_tcp_listener();
-    let shared_port = shared_listener.local_addr().unwrap().port();
+    let rpc_port = rpc_listener.local_addr().unwrap().port();
     let server_addr = server_listener.local_addr().unwrap().to_string();
     let remote_port = remote_listener.local_addr().unwrap().port();
     let control_port = control_listener.local_addr().unwrap().port();
-    drop(shared_listener);
+    drop(rpc_listener);
     drop(control_listener);
 
     let mut server_config = TransportConfig::new(
@@ -160,9 +160,9 @@ async fn shared_instance_client_receives_network_discovery_announces() {
         &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     );
-    server_config.set_share_instance(true);
-    server_config.set_shared_instance_port(shared_port);
-    server_config.set_instance_control_port(control_port);
+    server_config.set_rpc_instance(true);
+    server_config.set_rpc_data_port(rpc_port);
+    server_config.set_rpc_control_port(control_port);
     let server = Transport::new(server_config);
     server.iface_manager().lock().await.spawn(
         TcpServer::new_from_listener(server_addr.clone(), server_listener, server.iface_manager()),
@@ -174,8 +174,8 @@ async fn shared_instance_client_receives_network_discovery_announces() {
         &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     );
-    client_config.set_share_instance(true);
-    client_config.set_shared_instance_port(shared_port);
+    client_config.set_rpc_instance(true);
+    client_config.set_rpc_data_port(rpc_port);
     let client = Transport::new(client_config);
     let mut discovery_rx = client.recv_discovery();
 
@@ -196,7 +196,7 @@ async fn shared_instance_client_receives_network_discovery_announces() {
 
     let discovered = time::timeout(Duration::from_secs(10), discovery_rx.recv())
         .await
-        .expect("shared-instance client did not receive discovery announce")
+        .expect("rpc client did not receive discovery announce")
         .unwrap();
 
     assert_eq!(discovered.name, "Remote Discovery");
@@ -205,17 +205,17 @@ async fn shared_instance_client_receives_network_discovery_announces() {
 }
 
 #[tokio::test]
-async fn shared_instance_client_receives_passive_destination_announces() {
+async fn rpc_instance_client_receives_passive_destination_announces() {
     setup();
 
-    let shared_listener = local_tcp_listener();
+    let rpc_listener = local_tcp_listener();
     let server_listener = local_tcp_listener();
     let remote_listener = local_tcp_listener();
     let control_listener = local_tcp_listener();
-    let shared_port = shared_listener.local_addr().unwrap().port();
+    let rpc_port = rpc_listener.local_addr().unwrap().port();
     let server_addr = server_listener.local_addr().unwrap().to_string();
     let control_port = control_listener.local_addr().unwrap().port();
-    drop(shared_listener);
+    drop(rpc_listener);
     drop(control_listener);
 
     let mut server_config = TransportConfig::new(
@@ -223,9 +223,9 @@ async fn shared_instance_client_receives_passive_destination_announces() {
         &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     );
-    server_config.set_share_instance(true);
-    server_config.set_shared_instance_port(shared_port);
-    server_config.set_instance_control_port(control_port);
+    server_config.set_rpc_instance(true);
+    server_config.set_rpc_data_port(rpc_port);
+    server_config.set_rpc_control_port(control_port);
     let server = Transport::new(server_config);
     server.iface_manager().lock().await.spawn(
         TcpServer::new_from_listener(server_addr.clone(), server_listener, server.iface_manager()),
@@ -237,8 +237,8 @@ async fn shared_instance_client_receives_passive_destination_announces() {
         &PrivateIdentity::new_from_rand(&mut UnwrapErr(SysRng)),
         true,
     );
-    client_config.set_share_instance(true);
-    client_config.set_shared_instance_port(shared_port);
+    client_config.set_rpc_instance(true);
+    client_config.set_rpc_data_port(rpc_port);
     let client = Transport::new(client_config);
     let mut announce_rx = client.recv_announces().await;
 
@@ -257,7 +257,7 @@ async fn shared_instance_client_receives_passive_destination_announces() {
 
     let announce = time::timeout(Duration::from_secs(10), announce_rx.recv())
         .await
-        .expect("shared-instance client did not receive passive destination announce")
+        .expect("rpc client did not receive passive destination announce")
         .unwrap();
 
     assert_eq!(

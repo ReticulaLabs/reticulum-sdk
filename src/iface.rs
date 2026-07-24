@@ -463,7 +463,7 @@ struct LocalInterface {
     stop: CancellationToken,
     announce_pacer: Option<AnnouncePacer>,
     saturated_queue_logger: SaturatedQueueLogger,
-    shared_instance_client: bool,
+    rpc_instance_client: bool,
     /// Hardware MTU atomic, shared with the interface for live updates.
     /// `None` means the interface does not participate in link MTU
     /// discovery / upgrades.
@@ -896,7 +896,7 @@ impl InterfaceManager {
         &mut self,
         tx_cap: usize,
         announce_pacer: Option<AnnouncePacer>,
-        shared_instance_client: bool,
+        rpc_instance_client: bool,
         hw_mtu: Option<Arc<AtomicUsize>>,
         ifac_config: Option<IfacConfig>,
         bitrate: Option<f64>,
@@ -935,7 +935,7 @@ impl InterfaceManager {
             stop: stop.clone(),
             announce_pacer,
             saturated_queue_logger: SaturatedQueueLogger::new(address),
-            shared_instance_client,
+            rpc_instance_client,
             hw_mtu,
             ifac_config: ifac_config.clone(),
             bitrate,
@@ -976,7 +976,7 @@ impl InterfaceManager {
     fn new_context_with_options<T: Interface>(
         &mut self,
         inner: T,
-        shared_instance_client: bool,
+        rpc_instance_client: bool,
     ) -> InterfaceContext<T> {
         let bitrate = inner.bitrate();
         let announce_cap = inner.announce_cap();
@@ -1002,7 +1002,7 @@ impl InterfaceManager {
         let channel = self.new_channel_with_pacer(
             DEFAULT_INTERFACE_TX_QUEUE_CAP,
             announce_pacer,
-            shared_instance_client,
+            rpc_instance_client,
             hw_mtu,
             None,
             configured_bitrate(bitrate.unwrap_or(0.0)),
@@ -1058,7 +1058,7 @@ impl InterfaceManager {
         address
     }
 
-    pub fn spawn_shared_instance_client<T: Interface, F, R>(
+    pub fn spawn_rpc_instance_client<T: Interface, F, R>(
         &mut self,
         inner: T,
         worker: F,
@@ -1362,10 +1362,10 @@ impl InterfaceManager {
             .collect()
     }
 
-    pub fn shared_instance_clients_except(&self, address: AddressHash) -> Vec<AddressHash> {
+    pub fn rpc_instance_clients_except(&self, address: AddressHash) -> Vec<AddressHash> {
         self.ifaces
             .iter()
-            .filter(|iface| iface.shared_instance_client && !iface.stop.is_cancelled())
+            .filter(|iface| iface.rpc_instance_client && !iface.stop.is_cancelled())
             .filter(|iface| iface.address != address)
             .map(|iface| iface.address)
             .collect()
