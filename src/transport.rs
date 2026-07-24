@@ -53,9 +53,9 @@ use crate::identity::{PUBLIC_KEY_LENGTH, PrivateIdentity};
 
 use crate::iface::InterfaceManager;
 use crate::iface::InterfaceMode;
-
 use crate::iface::InterfaceQueueLengths;
 use crate::iface::InterfaceRxReceiver;
+use crate::iface::NamedReconnectPacerMetrics;
 use crate::iface::RxMessage;
 use crate::iface::TxMessage;
 use crate::iface::TxMessageType;
@@ -315,6 +315,8 @@ pub struct TransportMetrics {
     pub total_packets_tx: u64,
     /// Total microseconds spent in pacing waits across all interfaces.
     pub total_pacing_wait_us: u64,
+    /// Reconnect-pacer metrics from backbone server interfaces.
+    pub reconnect_pacer_metrics: Vec<NamedReconnectPacerMetrics>,
 }
 
 /// Shared sending context: independently-locked resources used for
@@ -988,6 +990,8 @@ impl Transport {
         let total_packets_tx = interface_queues.interfaces.iter().map(|i| i.packets_tx).sum();
         let total_pacing_wait_us = interface_queues.interfaces.iter().map(|i| i.pacing_wait_us).sum();
 
+        let reconnect_pacer_metrics = self.iface_manager.lock().await.reconnect_pacer_metrics();
+
         TransportMetrics {
             interface_queues,
             path_table_entries,
@@ -1008,6 +1012,7 @@ impl Transport {
             blackhole_entries: handler.blackhole_table.len(),
             total_packets_tx,
             total_pacing_wait_us,
+            reconnect_pacer_metrics,
         }
     }
 

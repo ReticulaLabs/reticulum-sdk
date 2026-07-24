@@ -27,6 +27,7 @@ use crate::hash::ADDRESS_HASH_SIZE;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 use crate::iface::ifac::IfacConfig;
+use crate::iface::reconnect_pacer::ReconnectPacer;
 use crate::packet::{HeaderType, Packet, PacketContext, PacketType};
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
@@ -149,6 +150,21 @@ pub struct InterfaceQueueLengths {
     pub rx: usize,
     /// Per-interface outbound queue lengths.
     pub interfaces: Vec<InterfaceQueueLength>,
+}
+
+/// Reconnect-pacer metrics for a single backbone server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedReconnectPacerMetrics {
+    /// Human-readable address/name of the backbone server (e.g. "0.0.0.0:1234").
+    pub name: String,
+    /// Number of source IPs currently within their backoff window.
+    pub entries_in_backoff: usize,
+    /// Total number of source IPs tracked by this pacer.
+    pub total_tracked_ips: usize,
+    /// Configured initial backoff in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Configured maximum backoff in milliseconds.
+    pub max_backoff_ms: u64,
 }
 
 pub struct InterfaceChannel {
@@ -871,6 +887,8 @@ pub struct InterfaceManager {
     /// Set of destination hashes that are registered locally on this node.
     /// Used to exempt local destinations from interface-mode filtering.
     local_destinations: HashSet<AddressHash>,
+    /// Registered reconnect pacers (keyed by backbone server address).
+    reconnect_pacers: Vec<(String, Arc<Mutex<ReconnectPacer>>)>,
 }
 
 impl InterfaceManager {
@@ -886,6 +904,7 @@ impl InterfaceManager {
             ifaces: Vec::new(),
             iface_index: HashMap::new(),
             local_destinations: HashSet::new(),
+            reconnect_pacers: Vec::new(),
         }
     }
 
@@ -1122,6 +1141,34 @@ impl InterfaceManager {
         for (idx, iface) in self.ifaces.iter().enumerate() {
             self.iface_index.insert(iface.address, idx);
         }
+    }
+
+    /// Register a reconnect pacer for a backbone server.
+    /// The pacer will be included in transport metrics snapshots.
+    pub(crate) fn register_reconnect_pacer(&mut self, name: String, pacer: Arc<Mutex<ReconnectPacer>>) {
+        self.reconnect_pacers.push((name, pacer));
+    }
+
+    /// Unregister a previously registered reconnect pacer by name.
+    pub(crate) fn unregister_reconnect_pacer(&mut self, name: &str) {
+        self.reconnect_pacers.retain(|(n, _)| n != name);
+    }
+
+    /// Collect reconnect-pacer metrics from all registered backbone servers.
+    pub fn reconnect_pacer_metrics(&self) -> Vec<NamedReconnectPacerMetrics> {
+        self.reconnect_pacers
+            .iter()
+            .map(|(name, pacer)| {
+                let metrics = pacer.lock().unwrap().metrics();
+                NamedReconnectPacerMetrics {
+                    name: name.clone(),
+                    entries_in_backoff: metrics.entries_in_backoff,
+                    total_tracked_ips: metrics.total_tracked_ips,
+                    initial_backoff_ms: metrics.initial_backoff_ms,
+                    max_backoff_ms: metrics.max_backoff_ms,
+                }
+            })
+            .collect()
     }
 
     /// Record an incoming announce on an interface and return `true` if the

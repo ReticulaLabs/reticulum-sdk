@@ -187,6 +187,13 @@ impl BackboneServer {
         let ifac_netkey = { context.inner.lock().unwrap().ifac_netkey.clone() };
         let reconnect_pacer = { context.inner.lock().unwrap().reconnect_pacer.clone() };
 
+        // Register this pacer with the interface manager so it appears in
+        // transport metrics snapshots.
+        iface_manager
+            .lock()
+            .await
+            .register_reconnect_pacer(addr.clone(), reconnect_pacer.clone());
+
         let server_address = context.channel.address;
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
