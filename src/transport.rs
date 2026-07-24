@@ -1484,6 +1484,27 @@ fn start_tcp_rpc_instance(
     cancel: CancellationToken,
 ) {
     let addr = format!("{}:{}", config.rpc_bind_host, config.rpc_data_port);
+    if config.rpc_bind_host != DEFAULT_RPC_BIND_HOST {
+        if config.rpc_key.is_none() {
+            let msg = format!(
+                "tp({}): Refusing to listen on a non-loopback address ({}) without a defined rpc_key. \
+                This is a dangerous configuration.", config.name, config.rpc_bind_host
+            );
+            if config.require_rpc_instance {
+                panic!("{}", msg);
+            }
+            log::error!("{}", msg);
+            return;
+        }
+
+        // This is generally only recommended for debugging or attaching
+        // rnmcp to a backbone router for analysis.
+        log::warn!(
+            "tp({}): rpc_bind_host is set to \"{}\" instead of the default \"{}\". \
+             Binding the RPC interface to a non-loopback address is not recommended.",
+            config.name, config.rpc_bind_host, DEFAULT_RPC_BIND_HOST
+        );
+    }
 
     match StdTcpListener::bind(&addr) {
         Ok(listener) => {
