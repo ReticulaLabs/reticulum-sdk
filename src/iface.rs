@@ -1516,10 +1516,9 @@ impl InterfaceManager {
 
                     // Python: "elif not local_destination and interface.mode == MODE_INTERNAL:"
                     if !is_local && iface.mode == InterfaceMode::Internal {
-                        // Block if source interface mode is Boundary (Python line 1233:
-                        // "if from_interface.mode == MODE_BOUNDARY: should_transmit = False")
-                        // In the Rust code, Broadcast(None) always means a locally-originated
-                        // announce (hops == 0) so it never reaches this path.
+                        // Python: "if from_interface.mode == MODE_BOUNDARY:
+                        //          should_transmit = False"
+                        // Python does NOT block MODE_ROAMING from MODE_INTERNAL.
                         if source_mode == Some(InterfaceMode::Boundary) {
                             log::trace!(
                                 "iface: blocking announce on internal iface {} from boundary-mode iface",
@@ -2342,8 +2341,8 @@ mod tests {
         // Roaming (source) excluded by should_send.
         // Boundary blocked by announce filter: Boundary blocks announces from Roaming.
         // AP blocked by announce filter: AP blocks all announces.
+        // Internal receives (no restriction: Python does NOT block Roaming → Internal).
         // Full receives (no restriction).
-        // Internal receives (no restriction: Internal only blocks from Boundary).
         for (lbl, _addr, rx) in &mut h.ifaces {
             let should = *lbl == "full" || *lbl == "internal";
             assert_eq!(

@@ -1622,7 +1622,7 @@ async fn handle_rpc_data_client(
     iface_manager
         .lock()
         .await
-        .spawn_rpc_instance_client(TcpClient::new_from_stream(remote, stream), TcpClient::spawn);
+        .spawn_rpc_instance_client(TcpClient::new_from_stream(remote, stream).with_interface_mode(InterfaceMode::Boundary), TcpClient::spawn);
 }
 
 fn start_tcp_rpc(
