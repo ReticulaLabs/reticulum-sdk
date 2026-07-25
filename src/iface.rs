@@ -1377,11 +1377,13 @@ impl InterfaceManager {
     }
 
     /// Return the interface mode for the given interface address, or
-    /// `InterfaceMode::Full` if the interface is not found or cancelled.
+    /// `InterfaceMode::Boundary` if the interface is not found or cancelled,
+    /// so that orphaned announce-table entries from disconnected interfaces
+    /// are blocked by the Internal-mode filter.
     pub fn interface_mode(&self, address: &AddressHash) -> InterfaceMode {
         self.iface_by_address(address)
             .map(|i| i.mode)
-            .unwrap_or(InterfaceMode::Full)
+            .unwrap_or(InterfaceMode::Boundary)
     }
 
     /// Return the path expiry duration appropriate for the interface
