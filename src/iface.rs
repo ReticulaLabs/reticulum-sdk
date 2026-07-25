@@ -141,6 +141,7 @@ pub struct InterfaceInfo {
     pub interface_type: String,
     pub address: AddressHash,
     pub error_count: u64,
+    pub mode: InterfaceMode,
 }
 
 /// Queue length snapshot for the interface manager.
@@ -271,6 +272,18 @@ impl InterfaceMode {
         InterfaceMode::Roaming,
         InterfaceMode::Internal,
     ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InterfaceMode::Full => "full",
+            InterfaceMode::PointToPoint => "point_to_point",
+            InterfaceMode::AccessPoint => "access_point",
+            InterfaceMode::Roaming => "roaming",
+            InterfaceMode::Boundary => "boundary",
+            InterfaceMode::Gateway => "gateway",
+            InterfaceMode::Internal => "internal",
+        }
+    }
 }
 
 pub trait Interface {
@@ -1406,6 +1419,7 @@ impl InterfaceManager {
                 interface_type: iface.interface_type.clone(),
                 address: iface.address,
                 error_count: iface.error_counter.load(Ordering::Relaxed),
+                mode: iface.mode,
             })
             .collect()
     }

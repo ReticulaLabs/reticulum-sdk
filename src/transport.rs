@@ -2331,6 +2331,7 @@ fn rpc_interfaces(handler: Option<&mut TransportHandler>) -> Value {
                     Value::Binary(info.address.as_slice().to_vec()),
                 ),
                 (Value::from("error_count"), Value::from(info.error_count)),
+                (Value::from("mode"), Value::from(info.mode.as_str())),
             ])
         })
         .collect();
