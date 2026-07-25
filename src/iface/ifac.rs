@@ -1,8 +1,19 @@
 use ed25519_dalek::{SIGNATURE_LENGTH, Signature, Signer, SigningKey, VerifyingKey};
+use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 
 use crate::error::RnsError;
 use crate::packet::{Header, IfacFlag, Packet, PacketIfac};
+
+/// IFAC derivation salt, matching `RNS.Reticulum.IFAC_SALT` in the Python
+/// reference implementation (`RNS/Reticulum.py`).
+///
+/// This constant must remain byte-for-byte identical to the Python value
+/// for IFAC-signed packets to be interoperable across implementations.
+const IFAC_SALT: [u8; 32] = [
+    0xad, 0xf5, 0x4d, 0x88, 0x2c, 0x9a, 0x9b, 0x80, 0x77, 0x1e, 0xb4, 0x99, 0x5d, 0x70, 0x2d, 0x4a,
+    0x3e, 0x73, 0x33, 0x91, 0xb2, 0xa0, 0xf5, 0x3f, 0x41, 0x6d, 0x9f, 0x90, 0x7e, 0x55, 0xcf, 0xf8,
+];
 
 /// Configuration for Interface Access Codes (IFAC) on a single interface.
 ///
@@ -23,14 +34,48 @@ pub struct IfacConfig {
 }
 
 impl IfacConfig {
-    /// Derive an IFAC identity from an access code.
+    /// Derive an IFAC identity from a network name and optional key, using
+    /// the exact algorithm from the Python reference implementation
+    /// (`RNS/Interfaces/TCPInterface.py` `TCPServerInterface.incoming_connection`,
+    /// and `RNS/Reticulum.py._synthesize_interface`):
     ///
-    /// Hashes the access code with SHA-256 to produce a deterministic
-    /// Ed25519 keypair, exactly like the Python reference implementation:
-    /// `RNS.Interfaces.Interface._derive_access_identity()`.
-    pub fn derive(access_code: &[u8], ifac_len: usize) -> Self {
-        let seed: [u8; 32] = Sha256::digest(access_code).into();
-        let sign_key = SigningKey::from_bytes(&seed);
+    /// ```text
+    /// ifac_origin       = SHA256(netname_utf8) || SHA256(netkey_utf8)   # omitted if None
+    /// ifac_origin_hash  = SHA256(ifac_origin)
+    /// ifac_key          = HKDF-SHA256(64 bytes, ikm=ifac_origin_hash, salt=IFAC_SALT, info=None)
+    /// signing_seed      = ifac_key[32..64]
+    /// ```
+    ///
+    /// The Ed25519 signing key is derived from `ifac_key[32..64]`. The
+    /// X25519 portion (`ifac_key[0..32]`) is what the Python reference
+    /// stores in `interface.ifac_key` and is used to construct
+    /// `RNS.Identity.from_bytes(ifac_key)`.
+    ///
+    /// At least one of `netname` / `netkey` must be `Some`. If both are
+    /// `None`, the resulting `ifac_origin` is empty and the derived key is
+    /// ill-defined; this function returns an empty signing key in that case
+    /// (callers are expected to provide at least one input).
+    pub fn derive(netname: Option<&str>, netkey: Option<&str>, ifac_len: usize) -> Self {
+        let mut ifac_origin = Vec::with_capacity(64);
+        if let Some(name) = netname {
+            ifac_origin.extend_from_slice(&Sha256::digest(name.as_bytes()));
+        }
+        if let Some(key) = netkey {
+            ifac_origin.extend_from_slice(&Sha256::digest(key.as_bytes()));
+        }
+
+        let ifac_origin_hash = Sha256::digest(&ifac_origin);
+        let mut ifac_key = [0u8; 64];
+        // The Python `hkdf()` is HKDF-SHA256 with `info=None` (empty).
+        // HKDF-Expand with an empty info produces a well-defined output
+        // for any length, so this match is wire-compatible.
+        let _ = Hkdf::<Sha256>::new(Some(&IFAC_SALT), &ifac_origin_hash)
+            .expand(&[], &mut ifac_key[..]);
+
+        let sign_seed: [u8; 32] = ifac_key[32..64]
+            .try_into()
+            .expect("hkdf produced 64 bytes");
+        let sign_key = SigningKey::from_bytes(&sign_seed);
         let verify_key = sign_key.verifying_key();
         let ifac_len = ifac_len.min(SIGNATURE_LENGTH);
         Self {
@@ -142,29 +187,75 @@ mod tests {
 
     #[test]
     fn derive_is_deterministic() {
-        let a = IfacConfig::derive(b"test_access_code", 64);
-        let b = IfacConfig::derive(b"test_access_code", 64);
+        let a = IfacConfig::derive(Some("test_access_code"), Some("test_access_code"), 64);
+        let b = IfacConfig::derive(Some("test_access_code"), Some("test_access_code"), 64);
         assert_eq!(a.sign_key.to_bytes(), b.sign_key.to_bytes());
     }
 
     #[test]
     fn different_access_codes_differ() {
-        let a = IfacConfig::derive(b"code_a", 64);
-        let b = IfacConfig::derive(b"code_b", 64);
+        let a = IfacConfig::derive(Some("code_a"), None, 64);
+        let b = IfacConfig::derive(Some("code_b"), None, 64);
         assert_ne!(a.sign_key.to_bytes(), b.sign_key.to_bytes());
     }
 
     #[test]
     fn ifac_len_clamps_to_signature_length() {
-        let config = IfacConfig::derive(b"test", 200);
+        let config = IfacConfig::derive(Some("test"), None, 200);
         assert_eq!(config.ifac_len, SIGNATURE_LENGTH);
-        let config = IfacConfig::derive(b"test", 0);
+        let config = IfacConfig::derive(Some("test"), None, 0);
         assert_eq!(config.ifac_len, 0);
+    }
+
+    /// Test vector verified against the Python reference implementation
+    /// (`RNS.Interfaces.TCPInterface` `TCPServerInterface.incoming_connection`):
+    ///
+    /// For `netname="test", netkey=None`:
+    ///   ifac_origin       = SHA256("test")                              # 9f86d081...
+    ///   ifac_origin_hash  = SHA256(ifac_origin)                         # 954d5a49...
+    ///   ifac_key          = HKDF-SHA256(64, ifac_origin_hash, IFAC_SALT) # a370c4fe...7f8294df...
+    ///   signing_seed      = ifac_key[32..64]                             # 7f8294df95dc55f9...
+    ///   verify_key        = Ed25519(signing_seed).public                # b68a5da769bac1467dee00c9d103ca14e2befa6658242f378034ed9d5377daab
+    #[test]
+    fn derive_matches_python_reference_vector() {
+        let config = IfacConfig::derive(Some("test"), None, 64);
+        assert_eq!(
+            config.sign_key.to_bytes().to_vec(),
+            vec![
+                0x7f, 0x82, 0x94, 0xdf, 0x95, 0xdc, 0x55, 0xf9, 0x04, 0x6b, 0xf1, 0x9d, 0x06, 0x51,
+                0xd3, 0xd3, 0xb8, 0x1e, 0xef, 0xc5, 0xe9, 0x92, 0x27, 0xab, 0x0e, 0xae, 0xd6, 0x1c,
+                0x97, 0xc9, 0xf0, 0xba,
+            ],
+        );
+        assert_eq!(
+            config.verifying_key().to_bytes().to_vec(),
+            vec![
+                0xb6, 0x8a, 0x5d, 0xa7, 0x69, 0xba, 0xc1, 0x46, 0x7d, 0xee, 0x00, 0xc9, 0xd1, 0x03,
+                0xca, 0x14, 0xe2, 0xbe, 0xfa, 0x66, 0x58, 0x24, 0x2f, 0x37, 0x80, 0x34, 0xed, 0x9d,
+                0x53, 0x77, 0xda, 0xab,
+            ],
+        );
+    }
+
+    /// Test vector for `netname="test", netkey="secret"`. Matches:
+    ///   ifac_origin_hash = c8e2d6f65e9122c16eaed8a63837e86ddd897a8757b26d0d34f2d467e673a0ee
+    ///   ifac_key[32..64] = 374ad85a9a55820bc7b60d8d9248008cdf4650d73b4becdd21a3a97af07fd90c
+    #[test]
+    fn derive_with_netkey_matches_python_reference_vector() {
+        let config = IfacConfig::derive(Some("test"), Some("secret"), 64);
+        assert_eq!(
+            config.sign_key.to_bytes().to_vec(),
+            vec![
+                0x37, 0x4a, 0xd8, 0x5a, 0x9a, 0x55, 0x82, 0x0b, 0xc7, 0xb6, 0x0d, 0x8d, 0x92, 0x48,
+                0x00, 0x8c, 0xdf, 0x46, 0x50, 0xd7, 0x3b, 0x4b, 0xec, 0xdd, 0x21, 0xa3, 0xa9, 0x7a,
+                0xf0, 0x7f, 0xd9, 0x0c,
+            ],
+        );
     }
 
     #[test]
     fn attach_and_verify_roundtrip() {
-        let config = IfacConfig::derive(b"secret", 64);
+        let config = IfacConfig::derive(Some("secret"), None, 64);
 
         let mut packet = Packet {
             header: Header {
@@ -192,8 +283,8 @@ mod tests {
 
     #[test]
     fn verify_rejects_tampered_data() {
-        let alice = IfacConfig::derive(b"alice", 64);
-        let eve = IfacConfig::derive(b"eve", 64);
+        let alice = IfacConfig::derive(Some("alice"), None, 64);
+        let eve = IfacConfig::derive(Some("eve"), None, 64);
 
         let mut packet = Packet {
             header: Header {
@@ -221,7 +312,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_modified_payload() {
-        let config = IfacConfig::derive(b"secret", 64);
+        let config = IfacConfig::derive(Some("secret"), None, 64);
 
         let mut packet = Packet {
             header: Header {
@@ -247,7 +338,7 @@ mod tests {
 
     #[test]
     fn truncated_ifac_still_verifies() {
-        let config = IfacConfig::derive(b"truncated_test", 16);
+        let config = IfacConfig::derive(Some("truncated_test"), None, 16);
 
         let mut packet = Packet {
             header: Header {
@@ -279,7 +370,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_packet_without_ifac_flag() {
-        let config = IfacConfig::derive(b"test", 64);
+        let config = IfacConfig::derive(Some("test"), None, 64);
 
         let packet = Packet {
             header: Header {
@@ -299,7 +390,7 @@ mod tests {
 
     #[test]
     fn verify_raw_matches_serialized_ifac_flow() {
-        let config = IfacConfig::derive(b"roundtrip_test", 64);
+        let config = IfacConfig::derive(Some("roundtrip_test"), None, 64);
 
         let mut packet = Packet {
             header: Header {
