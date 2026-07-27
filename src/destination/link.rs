@@ -1020,7 +1020,7 @@ impl Link {
     }
 }
 
-fn validate_proof_packet(
+pub(crate) fn validate_proof_packet(
     destination: &DestinationDesc,
     id: &LinkId,
     packet: &Packet,

@@ -3,7 +3,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::destination::link::LinkId;
 use crate::hash::AddressHash;
-use crate::packet::{Header, IfacFlag, Packet};
+use crate::packet::{Header, IfacFlag, Packet, PacketContext};
 
 pub struct LinkEntry {
     pub timestamp: Instant,
@@ -14,8 +14,33 @@ pub struct LinkEntry {
     pub taken_hops: u8,
     pub remaining_hops: u8,
     pub validated: bool,
+    /// Set true once the path table for `original_destination` has been
+    /// rebalanced based on the actual hop count learned from an LRPROOF.
+    /// Prevents re-rebalancing on every subsequent proof received for the
+    /// same link.
+    pub rebalanced: bool,
     /// Cumulative number of data packets forwarded through this link entry.
     pub forward_count: u64,
+}
+
+/// Result of processing an inbound proof against the link table.
+///
+/// `propagation` is the packet/interface to forward the proof to (always
+/// present when the function returns `Some`).
+///
+/// `rebalance` is `Some` only when the proof had `PacketContext::LinkRequestProof`
+/// and the entry has not already been rebalanced. The caller is expected to
+/// verify the proof's signature against the destination's identity before
+/// applying the rebalance to the path table.
+pub struct HandleProofOutcome {
+    pub propagation: (Packet, AddressHash),
+    pub rebalance: Option<RebalanceInfo>,
+}
+
+/// Information needed to rebalance the path table after a link-request proof.
+pub struct RebalanceInfo {
+    pub destination: AddressHash,
+    pub hops: u8,
 }
 
 fn propagate(packet: &Packet, iface: AddressHash) -> (Packet, AddressHash) {
@@ -72,6 +97,7 @@ impl LinkTable {
             taken_hops,
             remaining_hops,
             validated: false,
+            rebalanced: false,
             forward_count: 0,
         };
 
@@ -196,26 +222,41 @@ impl LinkTable {
         })
     }
 
-    pub fn handle_proof(&mut self, proof: &Packet) -> Option<(Packet, AddressHash)> {
-        match self.0.get_mut(&proof.destination) {
-            Some(entry) => {
-                log::trace!(
-                    "link_table: forward proof for link {} ({} hops) to {}",
-                    proof.destination,
-                    proof.header.hops,
-                    entry.received_from,
-                );
+    /// Process an incoming proof packet for a relayed link.
+    ///
+    /// Returns `Some(HandleProofOutcome)` if a link entry exists for the
+    /// proof's destination. The outcome contains the packet/iface to forward
+    /// the proof to, and (only for LRPROOF context, only if the entry has
+    /// not already been rebalanced) an optional rebalance request describing
+    /// the authoritative hop count learned from the proof.
+    pub fn handle_proof(&mut self, proof: &Packet) -> Option<HandleProofOutcome> {
+        let entry = self.0.get_mut(&proof.destination)?;
 
-                entry.remaining_hops = proof.header.hops;
-                entry.validated = true;
+        log::trace!(
+            "link_table: forward proof for link {} ({} hops, ctx={:?}) to {}",
+            proof.destination,
+            proof.header.hops,
+            proof.context,
+            entry.received_from,
+        );
 
-                Some(propagate(proof, entry.received_from))
-            }
-            None => {
-                log::trace!("link_table: no entry for proof dst={}", proof.destination,);
-                None
-            }
-        }
+        entry.remaining_hops = proof.header.hops;
+        entry.validated = true;
+
+        let rebalance = if proof.context == PacketContext::LinkRequestProof && !entry.rebalanced {
+            entry.rebalanced = true;
+            Some(RebalanceInfo {
+                destination: entry.original_destination,
+                hops: proof.header.hops,
+            })
+        } else {
+            None
+        };
+
+        Some(HandleProofOutcome {
+            propagation: propagate(proof, entry.received_from),
+            rebalance,
+        })
     }
 
     /// Returns the maximum forward count across all validated entries,
@@ -318,7 +359,10 @@ mod tests {
         table.add(&request, destination, request_iface, destination_iface, 0);
 
         let proof = link_data(link_id, 0);
-        table.handle_proof(&proof).expect("link proof forwards");
+        table
+            .handle_proof(&proof)
+            .expect("link proof forwards")
+            .propagation;
 
         let forward = link_data(link_id, 0);
         let (forwarded, iface) = table
@@ -349,7 +393,10 @@ mod tests {
         table.add(&request, destination, request_iface, destination_iface, 0);
 
         let proof = link_data(link_id, 0);
-        table.handle_proof(&proof).expect("link proof forwards");
+        table
+            .handle_proof(&proof)
+            .expect("link proof forwards")
+            .propagation;
 
         // Forward a packet that has ifac_flag=Authenticated but no ifac data.
         // propagate() must reset the flag to Open to keep serialization consistent.
@@ -405,9 +452,108 @@ mod tests {
 
         let (propagated, _iface) = table
             .handle_proof(&proof)
-            .expect("proof should be forwarded");
+            .expect("proof should be forwarded")
+            .propagation;
 
         assert_eq!(propagated.header.ifac_flag, IfacFlag::Open);
         assert!(propagated.ifac.is_none());
+    }
+
+    #[test]
+    fn link_entry_starts_with_rebalanced_false() {
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let request_iface = AddressHash::new_from_slice(b"request-iface");
+        let destination_iface = AddressHash::new_from_slice(b"destination-iface");
+        let request = link_request(destination);
+        let mut table = LinkTable::new();
+
+        table.add(&request, destination, request_iface, destination_iface, 0);
+
+        let link_id = LinkId::from(&request);
+        let rebalanced_before = table.0.get(&link_id).unwrap().rebalanced;
+        assert!(!rebalanced_before);
+        assert!(!table.0.get(&link_id).unwrap().validated);
+    }
+
+    #[test]
+    fn lrproof_signals_rebalance_once() {
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let request_iface = AddressHash::new_from_slice(b"request-iface");
+        let destination_iface = AddressHash::new_from_slice(b"destination-iface");
+        let request = link_request(destination);
+        let link_id = LinkId::from(&request);
+        let mut table = LinkTable::new();
+
+        table.add(&request, destination, request_iface, destination_iface, 0);
+
+        let lrproof = Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+                hops: 2,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::LinkRequestProof,
+            data: Default::default(),
+        };
+
+        let outcome = table
+            .handle_proof(&lrproof)
+            .expect("lrproof should be forwarded");
+
+        let rebalance = outcome
+            .rebalance
+            .expect("lrproof should signal a rebalance on first receipt");
+        assert_eq!(rebalance.destination, destination);
+        assert_eq!(rebalance.hops, 2);
+        assert!(table.0.get(&link_id).unwrap().rebalanced);
+
+        // Second LRPROOF for the same link must NOT signal another rebalance.
+        let outcome2 = table
+            .handle_proof(&lrproof)
+            .expect("lrproof forwards on second receipt");
+        assert!(
+            outcome2.rebalance.is_none(),
+            "second LRPROOF for the same link must not re-trigger rebalance"
+        );
+    }
+
+    #[test]
+    fn non_lrproof_does_not_signal_rebalance() {
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let request_iface = AddressHash::new_from_slice(b"request-iface");
+        let destination_iface = AddressHash::new_from_slice(b"destination-iface");
+        let request = link_request(destination);
+        let link_id = LinkId::from(&request);
+        let mut table = LinkTable::new();
+
+        table.add(&request, destination, request_iface, destination_iface, 0);
+
+        // A regular message proof (context=None) must not request a rebalance,
+        // even though the entry is otherwise validated by handle_proof.
+        let regular_proof = Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+                hops: 0,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::None,
+            data: Default::default(),
+        };
+
+        let outcome = table
+            .handle_proof(&regular_proof)
+            .expect("regular proof should forward");
+        assert!(
+            outcome.rebalance.is_none(),
+            "non-LRPROOF context must never signal a rebalance"
+        );
     }
 }

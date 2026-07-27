@@ -44,6 +44,7 @@ use crate::destination::link::LinkId;
 use crate::destination::link::LinkStatus;
 use crate::destination::link::link_signalling_bytes;
 use crate::destination::link::mtu_from_signalling_bytes;
+use crate::destination::link::validate_proof_packet;
 
 use crate::error::RnsError;
 
@@ -175,6 +176,16 @@ pub struct TransportConfig {
 
     /// Attempt to reopen lost links once they have been closed.
     restart_outlinks: bool,
+
+    /// Enable dynamic in-place path rebalancing when a link-request proof
+    /// (LRPROOF) reveals a shorter hop count to a destination than the
+    /// current path-table entry. Matches the behaviour of Reticulum
+    /// reference implementations (Python RNS 1.4.1+).
+    ///
+    /// When `true`, the hop count of a path is updated in place if a
+    /// cryptographically-verified LRPROOF reports fewer hops than the
+    /// current entry. The rebalance happens at most once per link.
+    path_rebalance: bool,
 
     /// Resend announces of remote destinations at a slower pace once
     /// the initial round of announces is over.
@@ -502,6 +513,7 @@ impl TransportConfig {
             retransmit: false,
             reroute_eager: false,
             restart_outlinks: false,
+            path_rebalance: true,
             announce_forever: false,
             respond_to_probes: false,
             publish_blackhole: false,
@@ -533,6 +545,20 @@ impl TransportConfig {
 
     pub fn set_reroute_eager(&mut self, reroute_eager: bool) {
         self.reroute_eager = reroute_eager;
+    }
+
+    /// Enable or disable in-place path-table rebalancing on link-request
+    /// proofs. When enabled (the default), an LRPROOF that reports fewer
+    /// hops to a destination than the current path-table entry causes the
+    /// entry's hop count to be updated in place. The rebalance is gated by
+    /// cryptographic signature verification of the proof against the
+    /// destination's identity, and happens at most once per link.
+    pub fn set_path_rebalance(&mut self, path_rebalance: bool) {
+        self.path_rebalance = path_rebalance;
+    }
+
+    pub fn path_rebalance(&self) -> bool {
+        self.path_rebalance
     }
 
     pub fn set_restart_outlinks(&mut self, restart_outlinks: bool) {
@@ -694,6 +720,7 @@ impl Default for TransportConfig {
             retransmit: false,
             reroute_eager: false,
             restart_outlinks: false,
+            path_rebalance: true,
             announce_forever: false,
             respond_to_probes: false,
             publish_blackhole: false,
@@ -2940,6 +2967,17 @@ async fn handle_proof(
                 );
                 let rtt_packet = link.create_rtt();
                 pending.push(handler.send_ctx.prepare_send_packet(rtt_packet));
+
+                if handler.config.path_rebalance
+                    && packet.context == crate::packet::PacketContext::LinkRequestProof
+                {
+                    apply_path_rebalance(
+                        handler,
+                        link.destination().address_hash,
+                        packet.header.hops,
+                        "out_link_proof",
+                    );
+                }
             }
             _ => {}
         }
@@ -2957,12 +2995,23 @@ async fn handle_proof(
         let _ = handler.receipt_tx.send(receipt);
     }
 
-    let maybe_packet = handler.link_table.handle_proof(packet);
+    let outcome = handler.link_table.handle_proof(packet);
 
-    if let Some((packet, iface)) = maybe_packet {
+    if let Some(outcome) = outcome {
+        if let Some(rebalance) = outcome.rebalance
+            && handler.config.path_rebalance
+            && verify_relay_lrproof(handler, packet, rebalance.destination)
+        {
+            apply_path_rebalance(
+                handler,
+                rebalance.destination,
+                rebalance.hops,
+                "relay_lrproof",
+            );
+        }
         pending.push(TxMessage {
-            tx_type: TxMessageType::Direct(iface),
-            packet,
+            tx_type: TxMessageType::Direct(outcome.propagation.1),
+            packet: outcome.propagation.0,
         });
     }
 
@@ -2973,6 +3022,78 @@ async fn handle_proof(
             tx_type: TxMessageType::Direct(iface),
             packet,
         });
+    }
+}
+
+/// Apply a verified path-table rebalance for `destination`.
+///
+/// This unconditionally updates the path table. Callers are responsible
+/// for ensuring the hop count is trustworthy: either the proof was just
+/// validated by `Link::handle_proof_packet` (out-link case) or its
+/// signature was independently verified against the destination's
+/// identity (relay case).
+fn apply_path_rebalance(
+    handler: &mut TransportHandler,
+    destination: AddressHash,
+    proof_hops: u8,
+    source: &'static str,
+) {
+    handler
+        .send_ctx
+        .path_table
+        .write()
+        .unwrap()
+        .rebalance_hops(&destination, proof_hops, source);
+}
+
+/// Verify a relayed link-request proof against the destination's identity.
+///
+/// Returns `true` only if the relay has the destination's identity cached
+/// (i.e. it has previously heard the destination's announce) AND the
+/// proof's signature validates against that identity. This matches the
+/// Python RNS 1.4.1 mid-path rebalance behaviour, which also requires
+/// `link_entry[IDX_LT_PEER]` (the destination's identity) to be known.
+fn verify_relay_lrproof(
+    handler: &TransportHandler,
+    proof: &Packet,
+    destination: AddressHash,
+) -> bool {
+    let dest = match handler.single_out_destinations.get(&destination) {
+        Some(arc) => arc,
+        None => {
+            log::trace!(
+                "tp({}): relay lrproof rebalance for {} skipped (destination not in single_out_destinations)",
+                handler.config.name,
+                destination
+            );
+            return false;
+        }
+    };
+
+    let desc = match dest.try_lock() {
+        Ok(d) => d.desc.clone(),
+        Err(_) => {
+            log::trace!(
+                "tp({}): relay lrproof rebalance for {} skipped (destination lock contended)",
+                handler.config.name,
+                destination
+            );
+            return false;
+        }
+    };
+
+    let link_id = proof.destination;
+    match validate_proof_packet(&desc, &link_id, proof) {
+        Ok(_) => true,
+        Err(err) => {
+            log::debug!(
+                "tp({}): relay lrproof rebalance for {} rejected (proof validation failed: {:?})",
+                handler.config.name,
+                destination,
+                err
+            );
+            false
+        }
     }
 }
 

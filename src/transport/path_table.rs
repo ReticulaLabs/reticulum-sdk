@@ -270,6 +270,48 @@ self_referential_transport={}",
         }
     }
 
+    /// In-place update of a path's hop count, used for link-proof rebalancing.
+    ///
+    /// When a link-request proof (LRPROOF) is received for a destination, the
+    /// hop count of the proof is authoritative — it is the actual number of
+    /// hops to the destination, cryptographically attested by the destination.
+    /// If the path table's recorded hop count differs, update it in place.
+    ///
+    /// Returns `Some((old_hops, new_hops))` if a rebalance was performed, or
+    /// `None` if the destination is unknown, the hops already match, or the
+    /// rebalance would make the path longer.
+    pub fn rebalance_hops(
+        &mut self,
+        destination: &AddressHash,
+        new_hops: u8,
+        source: &str,
+    ) -> Option<(u8, u8)> {
+        let entry = self.map.get_mut(destination)?;
+        if new_hops == entry.hops {
+            return None;
+        }
+        if new_hops > entry.hops {
+            log::trace!(
+                "path_table: ignoring longer rebalance for {} from {} to {} (source={})",
+                destination,
+                entry.hops,
+                new_hops,
+                source
+            );
+            return None;
+        }
+        let old_hops = entry.hops;
+        entry.hops = new_hops;
+        log::debug!(
+            "path_table: rebalanced path to {} from {} to {} hops (source={})",
+            destination,
+            old_hops,
+            new_hops,
+            source
+        );
+        Some((old_hops, new_hops))
+    }
+
     pub fn handle_packet(&self, packet: Packet) -> (Packet, Option<AddressHash>) {
         if packet.header.packet_type == PacketType::Announce {
             return (packet, None);
@@ -1044,5 +1086,68 @@ mod tests {
 
         assert_eq!(forwarded_iface, None);
         assert_eq!(forwarded.header.destination_type, DestinationType::Group);
+    }
+
+    fn install_announce_with_hops(table: &mut PathTable, destination: AddressHash, iface: AddressHash, hops: u8) {
+        let announce = Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                hops,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
+    }
+
+    #[test]
+    fn rebalance_hops_shortens_recorded_path() {
+        let destination = AddressHash::new_from_slice(b"rebalance-target");
+        let iface = AddressHash::new_from_slice(b"rebalance-iface");
+        let mut table = PathTable::new(false);
+
+        install_announce_with_hops(&mut table, destination, iface, 5);
+        assert_eq!(table.get(&destination).unwrap().hops, 5);
+
+        let rebalanced = table.rebalance_hops(&destination, 2, "test");
+        assert_eq!(rebalanced, Some((5, 2)));
+        assert_eq!(table.get(&destination).unwrap().hops, 2);
+    }
+
+    #[test]
+    fn rebalance_hops_ignores_equal_hops() {
+        let destination = AddressHash::new_from_slice(b"rebalance-equal");
+        let iface = AddressHash::new_from_slice(b"rebalance-iface");
+        let mut table = PathTable::new(false);
+
+        install_announce_with_hops(&mut table, destination, iface, 3);
+        let rebalanced = table.rebalance_hops(&destination, 3, "test");
+        assert_eq!(rebalanced, None);
+        assert_eq!(table.get(&destination).unwrap().hops, 3);
+    }
+
+    #[test]
+    fn rebalance_hops_ignores_longer_hops() {
+        let destination = AddressHash::new_from_slice(b"rebalance-longer");
+        let iface = AddressHash::new_from_slice(b"rebalance-iface");
+        let mut table = PathTable::new(false);
+
+        install_announce_with_hops(&mut table, destination, iface, 2);
+        let rebalanced = table.rebalance_hops(&destination, 7, "test");
+        assert_eq!(rebalanced, None);
+        assert_eq!(table.get(&destination).unwrap().hops, 2);
+    }
+
+    #[test]
+    fn rebalance_hops_returns_none_for_unknown_destination() {
+        let destination = AddressHash::new_from_slice(b"rebalance-unknown");
+        let mut table = PathTable::new(false);
+        let rebalanced = table.rebalance_hops(&destination, 1, "test");
+        assert_eq!(rebalanced, None);
     }
 }
