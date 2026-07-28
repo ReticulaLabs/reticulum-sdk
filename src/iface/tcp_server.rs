@@ -86,6 +86,7 @@ impl TcpServer {
         let accept_trace_label = { context.inner.lock().unwrap().accept_trace_label.clone() };
         let bitrate = { context.inner.lock().unwrap().bitrate };
         let max_connections = { context.inner.lock().unwrap().max_connections };
+        let mode = { context.inner.lock().unwrap().mode };
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -187,7 +188,8 @@ impl TcpServer {
 
                             iface_manager.spawn(
                                 TcpClient::new_from_stream(client.1.to_string(), client.0)
-                                    .with_optional_bitrate(bitrate),
+                                    .with_optional_bitrate(bitrate)
+                                    .with_interface_mode(mode),
                                 |context| async move {
                                     TcpClient::spawn(context).await;
                                     connections.fetch_sub(1, Ordering::Relaxed);
@@ -246,5 +248,73 @@ mod tests {
                 .bitrate(),
             Some(2_000_000.0)
         );
+    }
+
+    #[test]
+    fn server_interface_mode_defaults_to_full() {
+        let iface_manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(1)));
+        assert_eq!(
+            TcpServer::new("127.0.0.1:0", iface_manager).interface_mode(),
+            InterfaceMode::Full
+        );
+    }
+
+    #[test]
+    fn server_interface_mode_can_be_configured() {
+        let iface_manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(1)));
+        assert_eq!(
+            TcpServer::new("127.0.0.1:0", iface_manager)
+                .with_interface_mode(InterfaceMode::Boundary)
+                .interface_mode(),
+            InterfaceMode::Boundary
+        );
+    }
+
+    #[tokio::test]
+    async fn server_spawned_client_inherits_interface_mode() {
+        // Mirrors the TcpClient construction used at line ~189 in
+        // TcpServer::spawn() for incoming TCP connections, but with the
+        // server's mode pre-applied via with_interface_mode(). This
+        // validates the fix that incoming TcpClient interfaces inherit
+        // the parent TcpServer's mode (so a Boundary-mode server
+        // correctly spawns Boundary-mode children, which keeps the
+        // Boundary -> Internal announce filter active and protects
+        // low-bitrate internal interfaces like LoRA from announce
+        // backlog).
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Stand up a real listening socket so the connecting stream is
+        // accepted before we hand it to TcpClient::new_from_stream.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let connect = tokio::spawn(async move {
+            TcpStream::connect(addr).await.expect("connect to listener")
+        });
+        let (stream, _peer) = listener.accept().await.expect("accept");
+        connect.await.expect("connect task");
+
+        let child = TcpClient::new_from_stream(addr.to_string(), stream)
+            .with_optional_bitrate(None)
+            .with_interface_mode(InterfaceMode::Boundary);
+        assert_eq!(child.interface_mode(), InterfaceMode::Boundary);
+
+        // Repeat for Internal mode to confirm the chain honors arbitrary
+        // configured modes, not just Boundary.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let connect = tokio::spawn(async move {
+            TcpStream::connect(addr).await.expect("connect to listener")
+        });
+        let (stream, _peer) = listener.accept().await.expect("accept");
+        connect.await.expect("connect task");
+        let child_internal = TcpClient::new_from_stream(addr.to_string(), stream)
+            .with_optional_bitrate(None)
+            .with_interface_mode(InterfaceMode::Internal);
+        assert_eq!(child_internal.interface_mode(), InterfaceMode::Internal);
     }
 }

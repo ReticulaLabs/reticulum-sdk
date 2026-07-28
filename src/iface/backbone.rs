@@ -186,6 +186,7 @@ impl BackboneServer {
         let ifac_netname = { context.inner.lock().unwrap().ifac_netname.clone() };
         let ifac_netkey = { context.inner.lock().unwrap().ifac_netkey.clone() };
         let reconnect_pacer = { context.inner.lock().unwrap().reconnect_pacer.clone() };
+        let mode = { context.inner.lock().unwrap().mode };
 
         // Register this pacer with the interface manager so it appears in
         // transport metrics snapshots.
@@ -290,7 +291,8 @@ impl BackboneServer {
                                 BackboneClient::new_from_stream(client.1.to_string(), client.0)
                                     .with_optional_bitrate(bitrate)
                                     .with_hw_mtu(hw_mtu)
-                                    .with_ifac(ifac_netname.clone(), ifac_netkey.clone()),
+                                    .with_ifac(ifac_netname.clone(), ifac_netkey.clone())
+                                    .with_interface_mode(mode),
                                 |context| async move {
                                     BackboneClient::spawn(context).await;
                                 },
@@ -770,5 +772,44 @@ mod tests {
     fn client_hw_mtu_defaults_to_one_mib() {
         let client = BackboneClient::new("127.0.0.1:0");
         assert_eq!(client.hw_mtu(), BACKBONE_DEFAULT_HW_MTU);
+    }
+
+    #[test]
+    fn client_mode_defaults_to_full() {
+        let client = BackboneClient::new("127.0.0.1:0");
+        assert_eq!(client.interface_mode(), InterfaceMode::Full);
+    }
+
+    #[test]
+    fn client_mode_can_be_configured() {
+        let client =
+            BackboneClient::new("127.0.0.1:0").with_interface_mode(InterfaceMode::Boundary);
+        assert_eq!(client.interface_mode(), InterfaceMode::Boundary);
+    }
+
+    #[test]
+    fn server_inherited_child_client_uses_server_mode() {
+        // Mirrors the BackboneClient construction used at line ~290 in
+        // BackboneServer::spawn() for incoming TCP connections, but with
+        // the server's mode pre-applied via with_interface_mode(). This
+        // validates the fix that incoming BackboneClient interfaces
+        // inherit the parent BackboneServer's mode (so a Boundary-mode
+        // server correctly spawns Boundary-mode children, which in turn
+        // keeps the Boundary -> Internal announce filter active on the
+        // transport and protects low-bitrate internal interfaces like
+        // LoRA from announce backlog).
+        let child = BackboneClient::new("127.0.0.1:0")
+            .with_optional_bitrate(Some(BACKBONE_DEFAULT_BITRATE))
+            .with_hw_mtu(BACKBONE_DEFAULT_HW_MTU)
+            .with_ifac(None, None)
+            .with_interface_mode(InterfaceMode::Boundary);
+        assert_eq!(child.interface_mode(), InterfaceMode::Boundary);
+
+        let child_internal = BackboneClient::new("127.0.0.1:0")
+            .with_optional_bitrate(Some(BACKBONE_DEFAULT_BITRATE))
+            .with_hw_mtu(BACKBONE_DEFAULT_HW_MTU)
+            .with_ifac(None, None)
+            .with_interface_mode(InterfaceMode::Internal);
+        assert_eq!(child_internal.interface_mode(), InterfaceMode::Internal);
     }
 }
