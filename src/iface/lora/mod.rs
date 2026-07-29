@@ -355,6 +355,7 @@ pub struct LoRaConfig {
     pub command_delay: Duration,
     pub rx_poll_interval: Duration,
     pub flow_control: bool,
+    pub sx1261_mode: bool,
 }
 
 impl LoRaConfig {
@@ -388,6 +389,7 @@ impl LoRaConfig {
             command_delay: DEFAULT_COMMAND_DELAY,
             rx_poll_interval: DEFAULT_RX_POLL_INTERVAL,
             flow_control: false,
+            sx1261_mode: false,
         }
     }
 
@@ -441,6 +443,11 @@ impl LoRaConfig {
 
     pub fn with_flow_control(mut self, fc: bool) -> Self {
         self.flow_control = fc;
+        self
+    }
+
+    pub fn with_sx1261_mode(mut self, enabled: bool) -> Self {
+        self.sx1261_mode = enabled;
         self
     }
 

@@ -306,23 +306,34 @@ impl SX1262 {
         self.write_command(CMD_SET_TX_PARAMS, &[power, RAMP_800U])
     }
 
-    fn set_pa_config(&mut self, power_dbm: i8) -> Result<(), LoRaError> {
-        let clamped = power_dbm.clamp(-9, 22);
+    fn set_pa_config(&mut self, power_dbm: i8, sx1261_mode: bool) -> Result<(), LoRaError> {
+        let clamped = power_dbm.clamp(-9, if sx1261_mode { 15 } else { 22 });
         // SX1262 optimal PA settings per datasheet Table 13-21
-        let (pa_duty_cycle, hp_max) = if clamped >= 22 {
-            (0x04, 0x07)
-        } else if clamped >= 20 {
-            (0x03, 0x05)
-        } else if clamped >= 17 {
-            (0x02, 0x03)
-        } else if clamped >= 14 {
-            (0x02, 0x02)
+        let (pa_duty_cycle, hp_max, device_sel) = if sx1261_mode {
+            if clamped >= 15 {
+                (0x04, 0x00, 0x01) // SX1261: +15 dBm max
+            } else if clamped >= 14 {
+                (0x02, 0x00, 0x01) // +14 dBm
+            } else if clamped >= 10 {
+                (0x01, 0x00, 0x01) // +10 dBm
+            } else {
+                (0x00, 0x00, 0x01) // min power
+            }
         } else {
-            (0x00, 0x00)
+            if clamped >= 22 {
+                (0x04, 0x07, 0x00) // SX1262: +22 dBm
+            } else if clamped >= 20 {
+                (0x03, 0x05, 0x00) // +20 dBm
+            } else if clamped >= 17 {
+                (0x02, 0x03, 0x00) // +17 dBm
+            } else if clamped >= 14 {
+                (0x02, 0x02, 0x00) // +14 dBm
+            } else {
+                (0x00, 0x00, 0x00) // min power
+            }
         };
-        // deviceSel: 0x00 = SX1262 high-power PA, 0x01 = SX1261 low-power PA
         // paLut: always 0x01 (reserved)
-        self.write_command(CMD_SET_PA_CONFIG, &[pa_duty_cycle, hp_max, 0x00, 0x01])
+        self.write_command(CMD_SET_PA_CONFIG, &[pa_duty_cycle, hp_max, device_sel, 0x01])
     }
 
     fn set_buffer_base_address(&mut self) -> Result<(), LoRaError> {
@@ -515,7 +526,7 @@ impl LoRaChipset for SX1262 {
             reset: gpio.reset,
             dio1: gpio.dio1,
             config: None,
-            command_delay: Duration::from_millis(2),
+            command_delay: Duration::from_millis(50),
             rx_active: false,
             tx_active: false,
         }
@@ -562,7 +573,7 @@ impl LoRaChipset for SX1262 {
         self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
 
         // Set PA config based on TX power
-        self.set_pa_config(config.tx_power)?;
+        self.set_pa_config(config.tx_power, config.sx1261_mode)?;
 
         // Configure radio parameters
         self.set_rf_frequency(config.frequency)?;
@@ -634,6 +645,10 @@ impl LoRaChipset for SX1262 {
         self.tx_active = true;
         self.rx_active = false;
 
+        // CMD_WRITE_BUFFER and packet params must be issued in STDBY mode,
+        // not while the chip is in RX.  Exit RX first.
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
+
         // Write payload to TX FIFO at offset 0
         let mut write_args = vec![0x00];
         write_args.extend_from_slice(payload);
@@ -648,14 +663,41 @@ impl LoRaChipset for SX1262 {
         // BW500 workaround for TX
         self.fix_lora_bw500(cfg.bandwidth as u32)?;
 
-        // CMD_SET_TX requires the device to be in STDBY / FS mode, not RX.
-        // Use STDBY_XOSC so the PLL has a stable reference before TX.
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
-
         // Trigger TX with no timeout
         self.write_command(CMD_SET_TX, &[0x00, 0x00, 0x00])?;
 
-        log::trace!("sx1262: transmitted {} bytes", payload.len());
+        // Poll briefly for TX_DONE without BUSY; the chip may silently
+        // reject CMD_SET_TX if the PA config, PLL or frequency is invalid.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut tx_ok = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            let irq_data = self.read_command(CMD_GET_IRQ_STATUS, 2, &[])?;
+            if irq_data.len() >= 2 {
+                let irq = (irq_data[0] as u16) << 8 | irq_data[1] as u16;
+                if irq & IRQ_TX_DONE != 0 {
+                    tx_ok = true;
+                    break;
+                }
+            }
+        }
+
+        if tx_ok {
+            self.clear_irq_status(IRQ_TX_DONE)?;
+            log::trace!("sx1262: TX_DONE after {} bytes", payload.len());
+        } else {
+            log::error!(
+                "sx1262: TX failed — no TX_DONE within 500ms \
+                 (chip may have rejected CMD_SET_TX)"
+            );
+            // Return to a known state so the poll loop can recover.
+            self.clear_irq_status(0xFFFF)?;
+            self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+            self.tx_active = false;
+            return Err(LoRaError::Chipset("TX never started — chip rejected CMD_SET_TX".into()));
+        }
+
+        self.tx_active = false;
         Ok(())
     }
 
