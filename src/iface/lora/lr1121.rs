@@ -436,14 +436,14 @@ impl LR1121 {
         if enabled {
             // Core1121-HF PE4259 SPDT: V1(DIO5/RFSW0), V2(DIO6/RFSW1).
             self.write_command(CMD_SET_DIO_AS_RF_SWITCH, &[
-                RFSW0_HIGH | RFSW1_HIGH,  // RfswEnableCfg enable: DIO5, DIO6
+                RFSW0_HIGH | RFSW1_HIGH,  // RfswEnableCfg enable DIO5,6
                 0x00,                     // RfswStbyCfg standby
                 RFSW0_HIGH,               // RfswRxCfg RX
                 RFSW0_HIGH | RFSW1_HIGH,  // RfSwTxCfg TX
-                RFSW3_HIGH,               // RfSwTxHPCfg: High Power TX
-                RFSW1_HIGH,               // RfSwTxHfCfg: High Frequency TX
-                0x00,                     // RFU. Wifi? GNSS?
-                0x00,                     // RFU. Wifi? GNSS?
+                RFSW1_HIGH,               // RfSwTxHPCfg: High Power TX
+                0x00,                     // RfSwTxHfCfg: High Frequency TX
+                0x00,                     // RFU. GNSS?
+                0x00,                     // RFU. Wifi?
             ])?;
         }
         Ok(())
