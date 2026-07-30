@@ -553,22 +553,8 @@ impl LoRaChipset for SX1262 {
         let fw_version = self.read_register(0x0150).unwrap_or(0xFF);
         log::info!("sx1262: chip version register 0x0150 = 0x{fw_version:02X}");
 
-        // Waveshare Core1262 modules return firmware version 0x00 and require
-        // specific hardware configuration: DIO2 controls the RF switch and
-        // DIO3 supplies the TCXO.  Auto-apply these when the version
-        // register indicates a Core1262-compatible chip.
-        let core1262_compat = fw_version == 0x00;
-        let enable_dio2_rf = config.dio_rf_switch || core1262_compat;
-        let tcxo_v = config.tcxo_voltage.or_else(|| {
-            if core1262_compat { Some(1.7) } else { None }
-        });
-
-        if core1262_compat {
-            log::info!(
-                "sx1262: Core1262-compatible chip detected, enabling DIO2 RF switch \
-                 and 1.7V TCXO"
-            );
-        }
+        let enable_dio2_rf = config.dio_rf_switch;
+        let tcxo_v = config.tcxo_voltage;
 
         // Set packet type to LoRa
         self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
