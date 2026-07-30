@@ -288,20 +288,26 @@ impl SX1262 {
         self.fix_inverted_iq(iq != 0)
     }
 
-    fn set_tx_params(&mut self, power_dbm: i8) -> Result<(), LoRaError> {
-        let clamped = power_dbm.clamp(-9, 22);
-        // SX1262 high-power PA (deviceSel=0x00):
-        //   Optimal settings (Table 13-21): power is always 0x16 (+22 dBm),
-        //     actual output set by PA config.
-        //   Non-optimal: power byte is 2's complement of dBm value.
-        let power = if clamped >= 14 {
+    fn set_tx_params(&mut self, power_dbm: i8, sx1261_mode: bool) -> Result<(), LoRaError> {
+        let clamped = power_dbm.clamp(-9, if sx1261_mode { 15 } else { 22 });
+        // SX1262 (deviceSel=0): optimal power byte is 0x16 for all ≥14 dBm;
+        //   actual output is set by PA config.
+        // SX1261 (deviceSel=1): power byte = clamped + 9, with +15 dBm max.
+        let power = if sx1261_mode {
+            (clamped + 9) as u8
+        } else if clamped >= 14 {
             0x16
         } else {
             clamped as u8
         };
 
-        // Set over-current protection — matches RNode OCP_TUNED
-        self.write_register(REG_OCP, &[OCP_125MA])?;
+        // Set over-current protection
+        let ocp = if sx1261_mode {
+            0x10 // 85 mA for SX1261
+        } else {
+            OCP_125MA // 125 mA for SX1262
+        };
+        self.write_register(REG_OCP, &[ocp])?;
 
         self.write_command(CMD_SET_TX_PARAMS, &[power, RAMP_800U])
     }
@@ -544,6 +550,27 @@ impl LoRaChipset for SX1262 {
         // Quick SPI ping to confirm the chip is alive and in the right mode
         self.ping()?;
 
+        // Read chip version for diagnostics
+        let fw_version = self.read_register(0x0150).unwrap_or(0xFF);
+        log::info!("sx1262: chip version register 0x0150 = 0x{fw_version:02X}");
+
+        // Waveshare Core1262 modules return firmware version 0x00 and require
+        // specific hardware configuration: DIO2 controls the RF switch and
+        // DIO3 supplies the TCXO.  Auto-apply these when the version
+        // register indicates a Core1262-compatible chip.
+        let core1262_compat = fw_version == 0x00;
+        let enable_dio2_rf = config.dio2_rf_switch || core1262_compat;
+        let tcxo_v = config.tcxo_voltage.or_else(|| {
+            if core1262_compat { Some(1.8) } else { None }
+        });
+
+        if core1262_compat {
+            log::info!(
+                "sx1262: Core1262-compatible chip detected, enabling DIO2 RF switch \
+                 and 1.8V TCXO"
+            );
+        }
+
         // Set packet type to LoRa
         self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
 
@@ -551,10 +578,10 @@ impl LoRaChipset for SX1262 {
         self.set_regulator_mode()?;
 
         // Configure DIO2 as RF switch if needed
-        self.set_dio2_as_rf_switch(config.dio2_rf_switch)?;
+        self.set_dio2_as_rf_switch(enable_dio2_rf)?;
 
         // Configure TCXO if needed
-        if let Some(v) = config.tcxo_voltage {
+        if let Some(v) = tcxo_v {
             self.set_dio3_as_tcxo_ctrl(v)?;
         }
 
@@ -584,7 +611,7 @@ impl LoRaChipset for SX1262 {
         )?;
 
         // Set TX parameters (also applies OCP)
-        self.set_tx_params(config.tx_power)?;
+        self.set_tx_params(config.tx_power, config.sx1261_mode)?;
 
         // LNA boost — improves receiver sensitivity
         self.write_register(REG_LNA, &[0x96])?;
