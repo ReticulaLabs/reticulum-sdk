@@ -349,7 +349,7 @@ pub struct LoRaConfig {
     pub crc_enabled: bool,
     pub implicit_header: bool,
     pub iq_inverted: bool,
-    pub dio2_rf_switch: bool,
+    pub dio_rf_switch: bool,
     pub tcxo_voltage: Option<f64>,
     pub spi_speed: u32,
     pub command_delay: Duration,
@@ -383,7 +383,7 @@ impl LoRaConfig {
             crc_enabled: true,
             implicit_header: false,
             iq_inverted: false,
-            dio2_rf_switch: false,
+            dio_rf_switch: true,
             tcxo_voltage: None,
             spi_speed: 4_000_000,
             command_delay: DEFAULT_COMMAND_DELAY,
@@ -421,8 +421,8 @@ impl LoRaConfig {
         self
     }
 
-    pub fn with_dio2_rf_switch(mut self, enabled: bool) -> Self {
-        self.dio2_rf_switch = enabled;
+    pub fn with_dio_rf_switch(mut self, enabled: bool) -> Self {
+        self.dio_rf_switch = enabled;
         self
     }
 

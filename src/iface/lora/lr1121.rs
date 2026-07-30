@@ -56,6 +56,13 @@ const CMD_SET_TX_PARAMS: u16 = 0x0211;
 const CMD_SET_PA_CONFIG: u16 = 0x0215;
 const CMD_SET_LORA_SYNC_WORD: u16 = 0x022B;
 
+// RF Switch Settings
+const RFSW0_HIGH: u8 = 0b00001; // DIO5 Built-in RfSw
+const RFSW1_HIGH: u8 = 0b00010; // DIO6 Built-in RfSw
+const RFSW2_HIGH: u8 = 0b00100; // DIO7
+const RFSW3_HIGH: u8 = 0b01000; // DIO8
+//const RFSW4_HIGH: u8 = 0b10000; // DIO9??
+
 // Buffer access
 const CMD_WRITE_BUFFER_8: u16 = 0x0109;
 const CMD_READ_BUFFER_8: u16 = 0x010A;
@@ -427,20 +434,16 @@ impl LR1121 {
 
     fn set_dio_as_rf_switch(&mut self, enabled: bool) -> Result<(), LoRaError> {
         if enabled {
-            // Each byte configures the RF switch control lines (RFSW0..RFSW4)
-            // for a specific chip operating mode. Bit n = RFSWn driven HIGH.
-            // Waveshare Core1121-HF uses RFSW3 (bit 3 = 0x08) on DIO7:
-            //   RX/standby:  RFSW3 LOW  → antenna to receiver
-            //   TX modes:    RFSW3 HIGH → antenna to PA
+            // Core1121-HF PE4259 SPDT: V1(DIO5/RFSW0), V2(DIO6/RFSW1).
             self.write_command(CMD_SET_DIO_AS_RF_SWITCH, &[
-                0x08,  // enable = RFSW3
-                0x00,  // standby: all low
-                0x00,  // rx: all low
-                0x08,  // tx: RFSW3 high
-                0x08,  // tx_hp: RFSW3 high
-                0x00,  // tx_hf: all low
-                0x00,  // gnss: all low
-                0x00,  // wifi: all low
+                RFSW0_HIGH | RFSW1_HIGH,  // RfswEnableCfg enable: DIO5, DIO6
+                0x00,                     // RfswStbyCfg standby
+                RFSW0_HIGH,               // RfswRxCfg RX
+                RFSW0_HIGH | RFSW1_HIGH,  // RfSwTxCfg TX
+                RFSW3_HIGH,               // RfSwTxHPCfg: High Power TX
+                RFSW1_HIGH,               // RfSwTxHfCfg: High Frequency TX
+                0x00,                     // RFU. Wifi? GNSS?
+                0x00,                     // RFU. Wifi? GNSS?
             ])?;
         }
         Ok(())
@@ -587,8 +590,8 @@ impl LoRaChipset for LR1121 {
         // Set PA config based on power and frequency band
         self.set_pa_config(config.tx_power, self.band)?;
 
-        // Configure DIO2 as RF switch if needed
-        self.set_dio_as_rf_switch(config.dio2_rf_switch)?;
+        // Configure DIO as RF switch if needed
+        self.set_dio_as_rf_switch(config.dio_rf_switch)?;
 
         // Configure radio parameters
         self.set_rf_frequency(config.frequency)?;

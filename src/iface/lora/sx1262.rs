@@ -558,7 +558,7 @@ impl LoRaChipset for SX1262 {
         // DIO3 supplies the TCXO.  Auto-apply these when the version
         // register indicates a Core1262-compatible chip.
         let core1262_compat = fw_version == 0x00;
-        let enable_dio2_rf = config.dio2_rf_switch || core1262_compat;
+        let enable_dio2_rf = config.dio_rf_switch || core1262_compat;
         let tcxo_v = config.tcxo_voltage.or_else(|| {
             if core1262_compat { Some(1.7) } else { None }
         });
