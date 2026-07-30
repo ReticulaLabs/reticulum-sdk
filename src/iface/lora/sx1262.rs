@@ -289,27 +289,26 @@ impl SX1262 {
     }
 
     fn set_tx_params(&mut self, power_dbm: i8, sx1261_mode: bool) -> Result<(), LoRaError> {
-        let clamped = power_dbm.clamp(-9, if sx1261_mode { 15 } else { 22 });
-        // SX1262 (deviceSel=0): optimal power byte is 0x16 for all ≥14 dBm;
-        //   actual output is set by PA config.
-        // SX1261 (deviceSel=1): power byte = clamped + 9, with +15 dBm max.
-        let power = if sx1261_mode {
-            (clamped + 9) as u8
-        } else if clamped >= 14 {
-            0x16
+        if sx1261_mode {
+            let clamped = power_dbm.clamp(-17, 15);
+            if clamped == 15 {
+                self.write_command(CMD_SET_PA_CONFIG, &[0x06, 0x00, 0x01, 0x01])?;
+            } else {
+                self.write_command(CMD_SET_PA_CONFIG, &[0x04, 0x00, 0x01, 0x01])?;
+            }
+            let power = if clamped >= 14 { 14u8 } else { clamped.max(-17) as u8 };
+            self.write_register(REG_OCP, &[0x10])?;
+            self.write_command(CMD_SET_TX_PARAMS, &[power, RAMP_800U])
         } else {
-            clamped as u8
-        };
-
-        // Set over-current protection
-        let ocp = if sx1261_mode {
-            0x10 // 85 mA for SX1261
-        } else {
-            OCP_125MA // 125 mA for SX1262
-        };
-        self.write_register(REG_OCP, &[ocp])?;
-
-        self.write_command(CMD_SET_TX_PARAMS, &[power, RAMP_800U])
+            let clamped = power_dbm.clamp(-9, 22);
+            // Semtech HAL: always use optimal PA config for SX1262
+            self.write_command(CMD_SET_PA_CONFIG, &[0x04, 0x07, 0x00, 0x01])?;
+            // Errata 15.2: Better resistance to antenna mismatch
+            let val = self.read_register(REG_TX_CLAMP_CONFIG)?;
+            self.write_register(REG_TX_CLAMP_CONFIG, &[val | 0x1E])?;
+            self.write_register(REG_OCP, &[OCP_125MA])?;
+            self.write_command(CMD_SET_TX_PARAMS, &[clamped as u8, RAMP_800U])
+        }
     }
 
     fn set_pa_config(&mut self, power_dbm: i8, sx1261_mode: bool) -> Result<(), LoRaError> {
@@ -387,8 +386,8 @@ impl SX1262 {
         } else {
             0x07
         };
-        // Use 5ms delay as a conservative default
-        let delay: u32 = 0x0280;
+        // Use 100ms TCXO startup timeout for reliable cold-start
+        let delay: u32 = 0x0CCC;
         self.write_command(
             CMD_SET_DIO3_AS_TCXO_CTRL,
             &[code, (delay >> 16) as u8, (delay >> 8) as u8, delay as u8],
@@ -561,13 +560,13 @@ impl LoRaChipset for SX1262 {
         let core1262_compat = fw_version == 0x00;
         let enable_dio2_rf = config.dio2_rf_switch || core1262_compat;
         let tcxo_v = config.tcxo_voltage.or_else(|| {
-            if core1262_compat { Some(1.8) } else { None }
+            if core1262_compat { Some(1.7) } else { None }
         });
 
         if core1262_compat {
             log::info!(
                 "sx1262: Core1262-compatible chip detected, enabling DIO2 RF switch \
-                 and 1.8V TCXO"
+                 and 1.7V TCXO"
             );
         }
 
@@ -598,9 +597,6 @@ impl LoRaChipset for SX1262 {
         // Switch to STDBY_XOSC for a stable XO reference before frequency
         // synthesis and TX/RX operations.
         self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
-
-        // Set PA config based on TX power
-        self.set_pa_config(config.tx_power, config.sx1261_mode)?;
 
         // Configure radio parameters
         self.set_rf_frequency(config.frequency)?;
@@ -711,6 +707,10 @@ impl LoRaChipset for SX1262 {
 
         if tx_ok {
             self.clear_irq_status(IRQ_TX_DONE)?;
+            self.tx_active = false;
+            // Re-enter RX mode so the chip can receive and the poll loop
+            // doesn't keep seeing IRQ=0 in standby.
+            self.start_receive()?;
             log::trace!("sx1262: TX_DONE after {} bytes", payload.len());
         } else {
             log::error!(
@@ -724,7 +724,6 @@ impl LoRaChipset for SX1262 {
             return Err(LoRaError::Chipset("TX never started — chip rejected CMD_SET_TX".into()));
         }
 
-        self.tx_active = false;
         Ok(())
     }
 
