@@ -60,6 +60,15 @@ const CMD_SET_LORA_SYNC_WORD: u16 = 0x022B;
 const CMD_WRITE_BUFFER_8: u16 = 0x0109;
 const CMD_READ_BUFFER_8: u16 = 0x010A;
 
+// Register/memory access
+const CMD_WRITE_REGMEM32_MASK: u16 = 0x010C;
+
+// LF clock config
+const CMD_CFG_LFCLK: u16 = 0x0116;
+
+// RX boosted mode
+const CMD_SET_RX_BOOSTED: u16 = 0x0227;
+
 // ── Packet types (LR1121 UM §8.1.1) ──────────────────────────────────────
 // 0x00 = None, 0x01 = (G)FSK, 0x02 = LoRa, 0x03 = Sigfox, 0x04 = LR-FHSS
 
@@ -249,8 +258,9 @@ impl LR1121 {
         if let Some((prev_opcode, prev_stat1)) = self.prev_status.take() {
             let prev_cmd_status = (prev_stat1 >> 1) & 0x07;
             match prev_cmd_status {
-                0 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_FAIL"),
-                1 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_PERR"),
+                5 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_ERR_RC_53MHZ"),
+                6 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_TX_DONE"),
+                7 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_RX_DONE"),
                 _ => {}
             }
         }
@@ -277,8 +287,9 @@ impl LR1121 {
         if let Some((prev_opcode, prev_stat1)) = self.prev_status.take() {
             let prev_cmd_status = (prev_stat1 >> 1) & 0x07;
             match prev_cmd_status {
-                0 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_FAIL"),
-                1 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_PERR"),
+                5 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_ERR_RC_53MHZ"),
+                6 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_TX_DONE"),
+                7 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_RX_DONE"),
                 _ => {}
             }
         }
@@ -306,8 +317,9 @@ impl LR1121 {
         if let Some((prev_opcode, prev_stat1)) = self.prev_status.take() {
             let prev_cmd_status = (prev_stat1 >> 1) & 0x07;
             match prev_cmd_status {
-                0 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_FAIL"),
-                1 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_PERR"),
+                5 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_ERR_RC_53MHZ"),
+                6 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_TX_DONE"),
+                7 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_RX_DONE"),
                 _ => {}
             }
         }
@@ -410,6 +422,39 @@ impl LR1121 {
                 0, 0, 0, 0,
             ],
         )?;
+        Ok(())
+    }
+
+    fn set_dio_as_rf_switch(&mut self, enabled: bool) -> Result<(), LoRaError> {
+        if enabled {
+            // Each byte configures the RF switch control lines (RFSW0..RFSW4)
+            // for a specific chip operating mode. Bit n = RFSWn driven HIGH.
+            // Waveshare Core1121-HF uses RFSW3 (bit 3 = 0x08) on DIO7:
+            //   RX/standby:  RFSW3 LOW  → antenna to receiver
+            //   TX modes:    RFSW3 HIGH → antenna to PA
+            self.write_command(CMD_SET_DIO_AS_RF_SWITCH, &[
+                0x08,  // enable = RFSW3
+                0x00,  // standby: all low
+                0x00,  // rx: all low
+                0x08,  // tx: RFSW3 high
+                0x08,  // tx_hp: RFSW3 high
+                0x00,  // tx_hf: all low
+                0x00,  // gnss: all low
+                0x00,  // wifi: all low
+            ])?;
+        }
+        Ok(())
+    }
+
+    fn apply_high_acp_workaround(&mut self) -> Result<(), LoRaError> {
+        // Semtech workaround: clear bit 30 of register 0x00F30054
+        // before RX, TX, CAD to avoid high adjacent channel power.
+        let args = [
+            0x00, 0xF3, 0x00, 0x54,  // address
+            0x40, 0x00, 0x00, 0x00,  // mask = 1 << 30
+            0x00, 0x00, 0x00, 0x00,  // data = 0
+        ];
+        self.write_command(CMD_WRITE_REGMEM32_MASK, &args)?;
         Ok(())
     }
 
@@ -519,7 +564,10 @@ impl LoRaChipset for LR1121 {
         self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
         std::thread::sleep(Duration::from_millis(10));
 
-        // 4. Calibrate image for target sub-GHz band
+        // 4. Configure LF clock (internal RC 32kHz)
+        self.write_command(CMD_CFG_LFCLK, &[0x00])?;
+
+        // 5. Calibrate image for target sub-GHz band
         self.calibrate_image(config.frequency)?;
 
         // 5. Set regulator mode (DC-DC)
@@ -538,6 +586,9 @@ impl LoRaChipset for LR1121 {
 
         // Set PA config based on power and frequency band
         self.set_pa_config(config.tx_power, self.band)?;
+
+        // Configure DIO2 as RF switch if needed
+        self.set_dio_as_rf_switch(config.dio2_rf_switch)?;
 
         // Configure radio parameters
         self.set_rf_frequency(config.frequency)?;
@@ -593,6 +644,9 @@ impl LoRaChipset for LR1121 {
         let iq = if cfg.iq_inverted { 0x01 } else { 0x00 };
         self.set_packet_params(cfg.preamble_length, header_mode, payload.len() as u8, crc, iq)?;
 
+        // Apply high ACP workaround for compliant TX spectrum
+        self.apply_high_acp_workaround()?;
+
         // Ensure stable XOSC reference, then TX.
         self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
         self.write_command(CMD_SET_TX, &[0x00, 0x00, 0x00])?;
@@ -613,7 +667,14 @@ impl LoRaChipset for LR1121 {
 
         self.set_packet_params(cfg.preamble_length, header_mode, 0xFF, crc, iq)?;
 
-        // Enter continuous RX (0xFFFFFF disables timeout)
+        // Apply high ACP workaround for sensitive RX
+        self.apply_high_acp_workaround()?;
+
+        // Enable RX boosted mode for improved sensitivity
+        self.write_command(CMD_SET_RX_BOOSTED, &[0x01])?;
+
+        // Ensure stable XOSC reference, then enter continuous RX
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
         self.write_command(CMD_SET_RX, &[0xFF, 0xFF, 0xFF])?;
 
         self.rx_active = true;
