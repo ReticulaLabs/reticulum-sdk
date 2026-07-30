@@ -617,13 +617,14 @@ impl LoRaChipset for LR1121 {
         self.config = Some(config.clone());
 
         log::info!(
-            "lr1121: configured band={:?} freq={} Hz bw={} kHz sf={} cr={} power={} dBm",
+            "lr1121: configured band={:?} freq={} Hz bw={} kHz sf={} cr={} power={} dBm tcxo={}v",
             self.band,
             config.frequency,
             config.bandwidth / 1000.0,
             config.spreading_factor,
             config.coding_rate,
             config.tx_power,
+            config.tcxo_voltage.unwrap_or(0.0),
         );
 
         Ok(())

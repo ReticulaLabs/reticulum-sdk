@@ -553,9 +553,6 @@ impl LoRaChipset for SX1262 {
         let fw_version = self.read_register(0x0150).unwrap_or(0xFF);
         log::info!("sx1262: chip version register 0x0150 = 0x{fw_version:02X}");
 
-        let enable_dio2_rf = config.dio_rf_switch;
-        let tcxo_v = config.tcxo_voltage;
-
         // Set packet type to LoRa
         self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
 
@@ -563,10 +560,10 @@ impl LoRaChipset for SX1262 {
         self.set_regulator_mode()?;
 
         // Configure DIO2 as RF switch if needed
-        self.set_dio2_as_rf_switch(enable_dio2_rf)?;
+        self.set_dio2_as_rf_switch(config.dio_rf_switch)?;
 
         // Configure TCXO if needed
-        if let Some(v) = tcxo_v {
+        if let Some(v) = config.tcxo_voltage {
             self.set_dio3_as_tcxo_ctrl(v)?;
         }
 
@@ -621,12 +618,13 @@ impl LoRaChipset for SX1262 {
         self.validate_communication(config.sync_word)?;
 
         log::info!(
-            "sx1262: configured freq={} Hz bw={} kHz sf={} cr={} power={} dBm",
+            "sx1262: configured freq={} Hz bw={} kHz sf={} cr={} power={} dBm tcxo={}v",
             config.frequency,
             config.bandwidth / 1000.0,
             config.spreading_factor,
             config.coding_rate,
             config.tx_power,
+            config.tcxo_voltage.unwrap_or(0.0),
         );
 
         Ok(())
