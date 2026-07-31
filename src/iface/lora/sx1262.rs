@@ -643,6 +643,17 @@ impl SX1262 {
         self.write_command(CMD_CLEAR_DEVICE_ERRORS, &[0x00, 0x00])
     }
 
+    /// Read the current IRQ status word (GetIrqStatus, 0x12).
+    /// Bit 0 = TX_DONE, bit 1 = RX_DONE, bit 9 = timeout.
+    pub fn get_irq_status(&mut self) -> Result<u16, LoRaError> {
+        let data = self.read_command(CMD_GET_IRQ_STATUS, 2, &[])?;
+        if data.len() >= 2 {
+            Ok(((data[0] as u16) << 8) | data[1] as u16)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Explicitly enter STDBY_XOSC so the host can verify the XO actually
     /// starts (diagnostic helper; status is visible on the next read).
     pub fn set_standby_xosc(&mut self) -> Result<(), LoRaError> {

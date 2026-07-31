@@ -5,6 +5,7 @@ pub mod sx1276;
 use std::collections::VecDeque;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ const LORA_HW_MTU: usize = 508;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const DEFAULT_COMMAND_DELAY: Duration = Duration::from_millis(2);
 const DEFAULT_RX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 const FREQ_MIN: u64 = 137_000_000;
 const FREQ_MAX: u64 = 3_000_000_000;
@@ -499,6 +501,89 @@ pub struct ReceivedPacket {
 }
 
 // ---------------------------------------------------------------------------
+// LoRa interface diagnostics
+// ---------------------------------------------------------------------------
+
+/// Live counters for a LoRa interface, shared between the RX poll task, the
+/// TX task and any external inspector (clone = shared, atomics are relaxed).
+#[derive(Debug, Clone, Default)]
+pub struct LoRaInterfaceStats {
+    tx_attempts: Arc<AtomicU64>,
+    tx_ok: Arc<AtomicU64>,
+    tx_failures: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
+    rx_packets: Arc<AtomicU64>,
+    rx_errors: Arc<AtomicU64>,
+    reconnects: Arc<AtomicU64>,
+}
+
+/// Point-in-time copy of [`LoRaInterfaceStats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoRaInterfaceStatsSnapshot {
+    pub tx_attempts: u64,
+    pub tx_ok: u64,
+    pub tx_failures: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errors: u64,
+    pub reconnects: u64,
+}
+
+impl LoRaInterfaceStats {
+    fn record_tx_attempt(&self, bytes: usize) {
+        self.tx_attempts.fetch_add(1, Ordering::Relaxed);
+        self.tx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_tx_ok(&self) {
+        self.tx_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_tx_failure(&self) {
+        self.tx_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rx_packet(&self) {
+        self.rx_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rx_error(&self) {
+        self.rx_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_reconnect(&self) {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> LoRaInterfaceStatsSnapshot {
+        LoRaInterfaceStatsSnapshot {
+            tx_attempts: self.tx_attempts.load(Ordering::Relaxed),
+            tx_ok: self.tx_ok.load(Ordering::Relaxed),
+            tx_failures: self.tx_failures.load(Ordering::Relaxed),
+            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
+            rx_packets: self.rx_packets.load(Ordering::Relaxed),
+            rx_errors: self.rx_errors.load(Ordering::Relaxed),
+            reconnects: self.reconnects.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let s = self.snapshot();
+        format!(
+            "stats: tx_attempts={} tx_ok={} tx_failures={} tx_bytes={} rx_packets={} \
+             rx_errors={} reconnects={}",
+            s.tx_attempts,
+            s.tx_ok,
+            s.tx_failures,
+            s.tx_bytes,
+            s.rx_packets,
+            s.rx_errors,
+            s.reconnects,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LoRa chipset abstraction trait
 // ---------------------------------------------------------------------------
 
@@ -518,6 +603,7 @@ pub trait LoRaChipset: Send {
 
 pub struct LoRaInterface<C: LoRaChipset> {
     config: LoRaConfig,
+    stats: LoRaInterfaceStats,
     _chipset: PhantomData<C>,
 }
 
@@ -525,14 +611,21 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
     pub fn new(config: LoRaConfig) -> Self {
         Self {
             config,
+            stats: LoRaInterfaceStats::default(),
             _chipset: PhantomData,
         }
+    }
+
+    /// Shared diagnostic counters for this interface (usable from any thread).
+    pub fn stats(&self) -> LoRaInterfaceStats {
+        self.stats.clone()
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let iface_stop = context.channel.stop.clone();
         let iface_address = context.channel.address;
         let config = { context.inner.lock().unwrap().config.clone() };
+        let stats = { context.inner.lock().unwrap().stats.clone() };
 
         if let Err(error) = config.validate() {
             log::error!("lora_interface: invalid configuration: {}", error);
@@ -563,7 +656,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 }
             };
 
-            log::info!("lora_interface: LoRa chipset initialised");
+            log::info!("lora_interface: LoRa chipset initialised ({})", stats.summary());
 
             let stop = CancellationToken::new();
             let (rx_packet_tx, mut rx_packet_rx) = mpsc::channel::<ReceivedPacket>(64);
@@ -572,6 +665,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 let cancel = context.cancel.clone();
                 let stop = stop.clone();
                 let rx_channel = rx_channel.clone();
+                let stats = stats.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -580,6 +674,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                             _ = stop.cancelled() => break,
                             Some(pkt) = rx_packet_rx.recv() => {
                                 if pkt.payload.len() > LORA_HW_MTU {
+                                    stats.record_rx_error();
                                     log::warn!(
                                         "lora_interface: dropping oversized packet len={}",
                                         pkt.payload.len()
@@ -588,6 +683,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                 }
                                 match Packet::deserialize(&mut InputBuffer::new(&pkt.payload)) {
                                     Ok(packet) => {
+                                        stats.record_rx_packet();
                                         let _ = rx_channel
                                             .send(RxMessage {
                                                 address: iface_address,
@@ -598,6 +694,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                             .await;
                                     }
                                     Err(_) => {
+                                        stats.record_rx_error();
                                         log::warn!(
                                             "lora_interface: couldn't decode received packet len={}",
                                             pkt.payload.len()
@@ -616,6 +713,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 let stop = stop.clone();
                 let rx_packet_tx = rx_packet_tx.clone();
                 let poll_interval = config.rx_poll_interval;
+                let stats = stats.clone();
 
                 tokio::task::spawn_blocking(move || {
                     while !stop.is_cancelled() && !cancel.is_cancelled() {
@@ -635,6 +733,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                 }
                             }
                             Err(error) => {
+                                stats.record_rx_error();
                                 log::error!(
                                     "lora_interface: IRQ processing error: {}",
                                     error
@@ -653,6 +752,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 let stop = stop.clone();
                 let tx_channel = tx_channel.clone();
                 let config = config.clone();
+                let stats = stats.clone();
 
                 tokio::spawn(async move {
                     let mut packet_queue: VecDeque<Packet> = VecDeque::new();
@@ -664,10 +764,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
 
                         if !packet_queue.is_empty() {
                             let packet = packet_queue.pop_front().unwrap();
-                            if !Self::do_transmit(&chipset, packet, iface_address).await {
-                                stop.cancel();
-                                break;
-                            }
+                            Self::do_transmit(&chipset, packet, iface_address, &stats).await;
                             continue;
                         }
 
@@ -680,10 +777,25 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                     packet_queue.push_back(message.packet);
                                     continue;
                                 }
-                                if !Self::do_transmit(&chipset, message.packet, iface_address).await {
-                                    stop.cancel();
-                                    break;
-                                }
+                                Self::do_transmit(&chipset, message.packet, iface_address, &stats).await;
+                            }
+                        }
+                    }
+                })
+            };
+
+            let stats_log_handle = {
+                let cancel = context.cancel.clone();
+                let stop = stop.clone();
+                let stats = stats.clone();
+
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = stop.cancelled() => break,
+                            _ = tokio::time::sleep(STATS_LOG_INTERVAL) => {
+                                log::info!("lora_interface: {}", stats.summary());
                             }
                         }
                     }
@@ -700,12 +812,20 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 _ = tx_handle => {
                     stop.cancel();
                 }
+                _ = stats_log_handle => {
+                    stop.cancel();
+                }
                 _ = context.cancel.cancelled() => {
                     stop.cancel();
                 }
             }
 
-            log::warn!("lora_interface: disconnected, reconnecting in {}s", RECONNECT_DELAY.as_secs());
+            stats.record_reconnect();
+            log::warn!(
+                "lora_interface: disconnected, reconnecting in {}s ({})",
+                RECONNECT_DELAY.as_secs(),
+                stats.summary(),
+            );
             tokio::time::sleep(RECONNECT_DELAY).await;
         }
 
@@ -730,16 +850,19 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
         chipset: &Arc<std::sync::Mutex<C>>,
         packet: Packet,
         _iface_address: crate::hash::AddressHash,
-    ) -> bool {
+        stats: &LoRaInterfaceStats,
+    ) {
         let mut tx_buffer = [0u8; LORA_HW_MTU];
         let mut output = OutputBuffer::new(&mut tx_buffer);
         if let Err(error) = packet.serialize(&mut output) {
             log::warn!("lora_interface: couldn't serialize outbound packet: {error}");
-            return true;
+            return;
         }
 
         let payload = output.as_slice().to_vec();
         let chipset = chipset.clone();
+
+        stats.record_tx_attempt(payload.len());
 
         let result = tokio::task::spawn_blocking(move || {
             let mut cs = chipset.lock().unwrap();
@@ -747,15 +870,29 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
         })
         .await;
 
+        // A failed TX is not fatal: transmit() already returns the chipset to
+        // a known state (STDBY_RC + IRQ cleared) and the RX poll loop re-arms
+        // RX, so we log + count and keep going rather than tearing the whole
+        // interface down for RECONNECT_DELAY.
         match result {
-            Ok(Ok(())) => true,
+            Ok(Ok(())) => {
+                stats.record_tx_ok();
+            }
             Ok(Err(error)) => {
-                log::error!("lora_interface: transmit error: {}", error);
-                false
+                stats.record_tx_failure();
+                log::error!(
+                    "lora_interface: transmit error: {} (tx_attempts={})",
+                    error,
+                    stats.snapshot().tx_attempts,
+                );
             }
             Err(e) => {
-                log::error!("lora_interface: spawn_blocking join error: {}", e);
-                false
+                stats.record_tx_failure();
+                log::error!(
+                    "lora_interface: spawn_blocking join error: {} (tx_attempts={})",
+                    e,
+                    stats.snapshot().tx_attempts,
+                );
             }
         }
     }
