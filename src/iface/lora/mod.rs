@@ -351,6 +351,7 @@ pub struct LoRaConfig {
     pub iq_inverted: bool,
     pub dio_rf_switch: bool,
     pub tcxo_voltage: Option<f64>,
+    pub tcxo_startup_delay: Duration,
     pub spi_speed: u32,
     pub command_delay: Duration,
     pub rx_poll_interval: Duration,
@@ -385,6 +386,7 @@ impl LoRaConfig {
             iq_inverted: false,
             dio_rf_switch: true,
             tcxo_voltage: None,
+            tcxo_startup_delay: Duration::from_millis(320),
             spi_speed: 4_000_000,
             command_delay: DEFAULT_COMMAND_DELAY,
             rx_poll_interval: DEFAULT_RX_POLL_INTERVAL,
@@ -428,6 +430,11 @@ impl LoRaConfig {
 
     pub fn with_tcxo_voltage(mut self, voltage: f64) -> Self {
         self.tcxo_voltage = Some(voltage);
+        self
+    }
+
+    pub fn with_tcxo_startup_delay(mut self, delay: Duration) -> Self {
+        self.tcxo_startup_delay = delay;
         self
     }
 

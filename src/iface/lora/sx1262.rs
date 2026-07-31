@@ -10,6 +10,7 @@ const CMD_SET_STANDBY: u8 = 0x80;
 const CMD_SET_FS: u8 = 0x81;
 const CMD_SET_TX: u8 = 0x83;
 const CMD_SET_RX: u8 = 0x82;
+const CMD_SET_SLEEP: u8 = 0x84;
 const CMD_SET_PACKET_TYPE: u8 = 0x8A;
 const CMD_GET_IRQ_STATUS: u8 = 0x12;
 const CMD_CLEAR_IRQ_STATUS: u8 = 0x02;
@@ -32,6 +33,12 @@ const CMD_READ_BUFFER: u8 = 0x1E;
 const CMD_WRITE_REGISTER: u8 = 0x0D;
 const CMD_READ_REGISTER: u8 = 0x1D;
 const CMD_CALIBRATE: u8 = 0x89;
+const CMD_GET_DEVICE_ERRORS: u8 = 0x17;
+// NB: datasheet rev 1.2 (DS.SX1261-2.W.APP) Table 11-5 lists ClearDeviceErrors
+// as 0x07 (not 0x18). The rev-1.2 history explicitly notes "Correction of the
+// ClearDeviceError command". 0x18 is silently ignored by this silicon.
+const CMD_CLEAR_DEVICE_ERRORS: u8 = 0x07;
+const CMD_GET_STATUS: u8 = 0xC0;
 
 // ── Register addresses ────────────────────────────────────────────────────
 
@@ -176,6 +183,90 @@ impl SX1262 {
         }
     }
 
+    /// POR-equivalent software reset via SetSleep (0x84, cold start).
+    ///
+    /// The SX1262 has no SPI reset command and the NRST pin may not be wired
+    /// on every board. Without a hardware reset, a warm restart leaves the
+    /// chip in its previous run's state (e.g. continuous RX) and TX is
+    /// silently rejected. Entering SLEEP in cold-start mode and waking the
+    /// device by dropping NSS performs a full POR-like reset into STDBY_RC.
+    fn software_cold_start(&mut self) -> Result<(), LoRaError> {
+        // SetSleep is only accepted in STDBY mode.
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+        std::thread::sleep(Duration::from_millis(5));
+
+        // SleepConfig = 0x00: RTC timeout disabled, cold start (no retention).
+        // Must not be followed by further commands for ~500µs; BUSY stays
+        // asserted for the whole sleep period, so we don't wait on it here.
+        self.spi.xfer(&[CMD_SET_SLEEP, 0x00], &mut [0u8; 2])?;
+        std::thread::sleep(Duration::from_millis(10));
+
+        // The next falling edge on NSS wakes the device. spidev drives CS per
+        // transaction, so this dummy write is the wake-up trigger. The device
+        // then boots in cold start (full reset) into STDBY_RC.
+        self.spi.xfer(&[0x00], &mut [0u8; 1])?;
+        self.wait_ready()?;
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Verify the chip is back in STDBY_RC. Note the GetStatus chip-mode
+        // field (bits 6:4) uses a different encoding than the SetStandby
+        // argument: 0x2 = STBY_RC, 0x3 = STBY_XOSC, 0x5 = RX, 0x6 = TX.
+        let data = self.read_command(CMD_GET_STATUS, 1, &[])?;
+        let status = data.first().copied().unwrap_or(0x00);
+        if (status >> 4) & 0x07 != 0x02 {
+            return Err(LoRaError::Chipset(format!(
+                "software cold-start: chip not in STDBY_RC after wake (status=0x{status:02X})"
+            )));
+        }
+        log::debug!("sx1262: software cold-start OK (status=0x{status:02X})");
+        Ok(())
+    }
+
+    /// Probe whether SetSleep actually puts the chip into SLEEP. Diagnostic
+    /// POR-detector: a genuinely fresh (power-cycled) chip honours SetSleep and
+    /// is unresponsive during the wake transaction (garbage status byte); a
+    /// warm-stuck chip ignores SetSleep and stays responsive (clean status).
+    pub fn probe_sleep(&mut self) -> Result<bool, LoRaError> {
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+        self.spi.xfer(&[CMD_SET_SLEEP, 0x00], &mut [0u8; 2])?;
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut rx = [0u8; 2];
+        self.spi.xfer(&[CMD_GET_STATUS, 0x00], &mut rx)?;
+        std::thread::sleep(Duration::from_millis(10));
+
+        let was_asleep = matches!(rx[1], 0x00 | 0xFF);
+        log::info!(
+            "sx1262: probe_sleep: status during wake xact = 0x{:02X} -> chip was {}",
+            rx[1],
+            if was_asleep { "ASLEEP (fresh POR)" } else { "AWAKE (warm/stuck)" }
+        );
+        Ok(was_asleep)
+    }
+
+    /// Diagnostic POR-detector: reports whether the chip retains a RAM canary
+    /// written by the previous run. A true power cycle resets RAM to default
+    /// (sync-word MSB 0x0740 = 0x14); a warm chip still holds 0xAB.
+    pub fn check_por_canary(&mut self) -> Result<(), LoRaError> {
+        let v = self.read_register(REG_LORA_SYNC_WORD_MSB)?;
+        log::info!(
+            "sx1262: POR canary 0x0740 = 0x{v:02X} -> {}",
+            if v == 0xAB {
+                "WARM (RAM retained, NOT power-cycled)"
+            } else if v == 0x14 {
+                "FRESH (RAM at default, power-cycled)"
+            } else {
+                "UNKNOWN"
+            }
+        );
+        Ok(())
+    }
+
+    /// Diagnostic: arm the POR canary for the next run (write 0xAB to sync MSB).
+    pub fn set_por_canary(&mut self) -> Result<(), LoRaError> {
+        self.write_register(REG_LORA_SYNC_WORD_MSB, &[0xAB, 0x24])
+    }
+
     fn hardware_reset(&mut self) -> Result<(), LoRaError> {
         match &self.reset {
             Some(reset) => {
@@ -205,6 +296,10 @@ impl SX1262 {
         };
         let mut rx = vec![0u8; tx.len()];
         self.spi.xfer(&tx, &mut rx)?;
+        log::trace!(
+            "sx1262: cmd 0x{opcode:02X} resp status=0x{:02X}",
+            rx.first().copied().unwrap_or(0xFF)
+        );
         self.wait_ready()?;
         Ok(())
     }
@@ -367,7 +462,11 @@ impl SX1262 {
         self.write_command(CMD_SET_DIO2_AS_RF_SWITCH_CTRL, &[enabled as u8])
     }
 
-    fn set_dio3_as_tcxo_ctrl(&mut self, voltage: f64) -> Result<(), LoRaError> {
+    fn set_dio3_as_tcxo_ctrl(
+        &mut self,
+        voltage: f64,
+        startup_delay: Duration,
+    ) -> Result<(), LoRaError> {
         // Voltage code lookup matches Python DIO3_OUTPUT_*
         let code = if voltage >= 1.6 && voltage < 1.7 {
             0x00
@@ -386,8 +485,13 @@ impl SX1262 {
         } else {
             0x07
         };
-        // Use 100ms TCXO startup timeout for reliable cold-start
-        let delay: u32 = 0x0CCC;
+        // TCXO startup timeout. Delay(23:0) units are 15.625µs. If the XO is
+        // not stable within this window the chip latches XOSC_START_ERR and
+        // aborts the STBY_XOSC transition. Core1262 modules need a generous
+        // timeout (51.2ms is not enough and TX is then silently rejected).
+        let delay: u32 = (startup_delay.as_millis().clamp(1, 1_000_000) as u32
+            * 1000)
+            / 16;
         self.write_command(
             CMD_SET_DIO3_AS_TCXO_CTRL,
             &[code, (delay >> 16) as u8, (delay >> 8) as u8, delay as u8],
@@ -521,6 +625,77 @@ impl SX1262 {
         log::debug!("sx1262: SPI communication validated (sync word 0x{sync_word:04X})");
         Ok(())
     }
+
+    /// Read the device error register (datasheet 13.6.1, Table 13-85).
+    /// Returns the 16-bit OpError value: bit 5 = XOSC_START_ERR,
+    /// bit 6 = PLL_LOCK_ERR, bit 8 = PA_RAMP_ERR.
+    pub fn get_device_errors(&mut self) -> Result<u16, LoRaError> {
+        let data = self.read_command(CMD_GET_DEVICE_ERRORS, 2, &[])?;
+        if data.len() >= 2 {
+            Ok(((data[0] as u16) << 8) | data[1] as u16)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Clear all latched device errors (datasheet 13.6.2).
+    pub fn clear_device_errors(&mut self) -> Result<(), LoRaError> {
+        self.write_command(CMD_CLEAR_DEVICE_ERRORS, &[0x00, 0x00])
+    }
+
+    /// Explicitly enter STDBY_XOSC so the host can verify the XO actually
+    /// starts (diagnostic helper; status is visible on the next read).
+    pub fn set_standby_xosc(&mut self) -> Result<(), LoRaError> {
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])
+    }
+
+    /// Read the raw status byte (GetStatus, 0xC0). Chip-mode field (bits
+    /// 6:4): 0x2=STBY_RC, 0x3=STBY_XOSC, 0x4=FS, 0x5=RX, 0x6=TX.
+    pub fn get_status(&mut self) -> Result<u8, LoRaError> {
+        let data = self.read_command(CMD_GET_STATUS, 1, &[])?;
+        Ok(data.first().copied().unwrap_or(0x00))
+    }
+
+    /// Wait until the chip reports STBY_XOSC (0x3), i.e. the XO is up and
+    /// stable. The chip holds BUSY (unwired here) during the XO startup
+    /// window and drops every command except GetStatus, so polling the
+    /// status byte is the software BUSY-wait. Returns Ok if STBY_XOSC was
+    /// reached within `timeout`.
+    pub fn wait_for_standby_xosc(&mut self, timeout: Duration) -> Result<bool, LoRaError> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let status = self.get_status()?;
+            if (status >> 4) & 0x07 == 0x03 {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(false)
+    }
+
+    /// Enter STDBY_XOSC and wait for the XO to come up, retrying for a slow
+    /// or marginal TCXO. On success any latched XOSC/PLL startup error is
+    /// cleared so later checks aren't misread. This is the software
+    /// equivalent of waiting for BUSY to release (no BUSY line is wired).
+    pub fn enter_standby_xosc(
+        &mut self,
+        startup_delay: Duration,
+    ) -> Result<(), LoRaError> {
+        let timeout = startup_delay + Duration::from_millis(100);
+        for attempt in 0..4 {
+            self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
+            if self.wait_for_standby_xosc(timeout)? {
+                let _ = self.clear_device_errors();
+                return Ok(());
+            }
+            log::warn!(
+                "sx1262: STDBY_XOSC attempt {attempt} timed out (delay {startup_delay:?}); retrying"
+            );
+        }
+        Err(LoRaError::Chipset(
+            "XO did not reach STBY_XOSC within timeout".into(),
+        ))
+    }
 }
 
 impl LoRaChipset for SX1262 {
@@ -540,7 +715,10 @@ impl LoRaChipset for SX1262 {
     fn init(&mut self, config: &LoRaConfig) -> Result<(), LoRaError> {
         self.command_delay = config.command_delay;
 
+        // Hardware reset if a reset line is wired; software cold-start always,
+        // so the chip reaches a POR-equivalent state even when NRST is absent.
         self.hardware_reset()?;
+        self.software_cold_start()?;
 
         // Enter standby RC mode
         self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
@@ -564,7 +742,7 @@ impl LoRaChipset for SX1262 {
 
         // Configure TCXO if needed
         if let Some(v) = config.tcxo_voltage {
-            self.set_dio3_as_tcxo_ctrl(v)?;
+            self.set_dio3_as_tcxo_ctrl(v, config.tcxo_startup_delay)?;
         }
 
         // Errata workarounds
@@ -578,8 +756,35 @@ impl LoRaChipset for SX1262 {
         self.calibrate_image(config.frequency)?;
 
         // Switch to STDBY_XOSC for a stable XO reference before frequency
-        // synthesis and TX/RX operations.
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
+        // synthesis and TX/RX operations. Without a BUSY line we poll the
+        // status byte (GetStatus is answered even while BUSY) and retry for
+        // a slow/marginal TCXO, so a later TX is not silently rejected.
+        self.enter_standby_xosc(config.tcxo_startup_delay)?;
+
+        // Diagnostic: after the first XOSC standby attempt, report latched
+        // device errors so XO/TCXO/PLL startup failures are visible.
+        match self.get_device_errors() {
+            Ok(err) => {
+                if err != 0 {
+                    let mut bits = Vec::new();
+                    if err & 0x20 != 0 { bits.push("XOSC_START_ERR"); }
+                    if err & 0x40 != 0 { bits.push("PLL_LOCK_ERR"); }
+                    if err & 0x100 != 0 { bits.push("PA_RAMP_ERR"); }
+                    if err & 0x01 != 0 { bits.push("RC64K_CALIB_ERR"); }
+                    if err & 0x02 != 0 { bits.push("RC13M_CALIB_ERR"); }
+                    if err & 0x04 != 0 { bits.push("PLL_CALIB_ERR"); }
+                    if err & 0x08 != 0 { bits.push("ADC_CALIB_ERR"); }
+                    if err & 0x10 != 0 { bits.push("IMG_CALIB_ERR"); }
+                    log::warn!(
+                        "sx1262: device errors after STDBY_XOSC = 0x{err:04X} ({})",
+                        bits.join(", "),
+                    );
+                } else {
+                    log::info!("sx1262: no device errors after STDBY_XOSC (XO started)");
+                }
+            }
+            Err(e) => log::warn!("sx1262: could not read device errors: {}", e),
+        }
 
         // Configure radio parameters
         self.set_rf_frequency(config.frequency)?;
@@ -653,25 +858,41 @@ impl LoRaChipset for SX1262 {
         self.rx_active = false;
 
         // CMD_WRITE_BUFFER and packet params must be issued in STDBY mode,
-        // not while the chip is in RX.  Exit RX first.
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
+        // not while the chip is in RX.  Exit RX first and, for a TCXO, wait
+        // for the XO to come up so the FIFO write isn't dropped while the
+        // chip is still BUSY starting the oscillator.
+        self.enter_standby_xosc(cfg.tcxo_startup_delay)?;
+        log::debug!(
+            "sx1262: tx step status 0x{:02X} (after SetStandby XOSC)",
+            self.get_status().unwrap_or(0)
+        );
 
         // Write payload to TX FIFO at offset 0
         let mut write_args = vec![0x00];
         write_args.extend_from_slice(payload);
         self.write_command(CMD_WRITE_BUFFER, &write_args)?;
+        log::debug!(
+            "sx1262: tx step status 0x{:02X} (after WriteBuffer)",
+            self.get_status().unwrap_or(0)
+        );
 
         // Set packet params with exact payload length
         let header_mode = if cfg.implicit_header { 0x01 } else { 0x00 };
         let crc = if cfg.crc_enabled { 0x01 } else { 0x00 };
         let iq = if cfg.iq_inverted { 0x01 } else { 0x00 };
         self.set_packet_params(cfg.preamble_length, header_mode, payload.len() as u8, crc, iq)?;
+        log::debug!(
+            "sx1262: tx step status 0x{:02X} (after SetPacketParams)",
+            self.get_status().unwrap_or(0)
+        );
 
         // BW500 workaround for TX
         self.fix_lora_bw500(cfg.bandwidth as u32)?;
 
         // Trigger TX with no timeout
         self.write_command(CMD_SET_TX, &[0x00, 0x00, 0x00])?;
+        let st_after_tx = self.get_status().unwrap_or(0x00);
+        log::debug!("sx1262: status right after CMD_SET_TX = 0x{st_after_tx:02X}");
 
         // Poll briefly for TX_DONE without BUSY; the chip may silently
         // reject CMD_SET_TX if the PA config, PLL or frequency is invalid.
@@ -697,9 +918,10 @@ impl LoRaChipset for SX1262 {
             self.start_receive()?;
             log::trace!("sx1262: TX_DONE after {} bytes", payload.len());
         } else {
+            let status = self.get_status().unwrap_or(0x00);
             log::error!(
                 "sx1262: TX failed — no TX_DONE within 500ms \
-                 (chip may have rejected CMD_SET_TX)"
+                 (chip may have rejected CMD_SET_TX) [status=0x{status:02X}]"
             );
             // Return to a known state so the poll loop can recover.
             self.clear_irq_status(0xFFFF)?;
