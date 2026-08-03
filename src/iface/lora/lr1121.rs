@@ -33,6 +33,8 @@ impl FrequencyBand {
 // System configuration
 const CMD_GET_STATUS: u16 = 0x0100;
 const CMD_GET_VERSION: u16 = 0x0101;
+const CMD_GET_ERRORS: u16 = 0x010D;
+const CMD_CLEAR_ERRORS: u16 = 0x010E;
 const CMD_CALIBRATE: u16 = 0x010F;
 const CMD_SET_REG_MODE: u16 = 0x0110;
 const CMD_CALIB_IMAGE: u16 = 0x0111;
@@ -111,6 +113,24 @@ const IRQ_MASK_ALL: u32 = IRQ_TX_DONE
     | IRQ_HEADER_ERR
     | IRQ_ERR
     | IRQ_TIMEOUT;
+
+// ── Device error word (LR1121 UM §2.1.5, Table 2-4) ────────────────────────
+// Bit assignments match the Semtech lr11xx_system.h reference.
+// Bits accumulate since the last ClearErrors (0x010E) call.
+
+const ERR_HFXO_TUNE_FAIL: u16 = 0x0001;
+const ERR_LFXO_TUNE_FAIL: u16 = 0x0002;
+const ERR_PLL_LOCK_FAIL: u16 = 0x0004;
+const ERR_HFXO_START_FAIL: u16 = 0x0008;
+const ERR_LFXO_START_FAIL: u16 = 0x0010;
+const ERR_PA_RAMP_FAIL: u16 = 0x0020;
+const ERR_PA_SELECT_FAIL: u16 = 0x0040;
+const ERR_IMG_CALIB_FAIL: u16 = 0x0080;
+const ERR_HF_XOSC_START_FAIL: u16 = 0x0100;
+const ERR_LF_XOSC_START_FAIL: u16 = 0x0200;
+const ERR_PLL_CALIB_FAIL: u16 = 0x0400;
+const ERR_RC_CALIB_FAIL: u16 = 0x0800;
+const ERR_IMG_CALIB_NOT_RUN: u16 = 0x1000;
 
 // ── LoRa bandwidth codes (LR1121 UM §8.3.1) ───────────────────────────────
 // Sub-GHz: 0x03=62.5k, 0x04=125k, 0x05=250k, 0x06=500k
@@ -509,6 +529,45 @@ impl LR1121 {
         }
     }
 
+    /// Read the 16-bit device error word (LR1121 UM §2.1.5, GetErrors 0x010D).
+    /// Bits accumulate since the last `clear_device_errors` call and cover
+    /// oscillator startup/tune failures, PLL lock/calib failures, PA failures
+    /// and image-calibration failures.
+    pub fn get_device_errors(&mut self) -> Result<u16, LoRaError> {
+        let data = self.read_command(CMD_GET_ERRORS, &[], 2)?;
+        if data.len() >= 2 {
+            Ok(((data[0] as u16) << 8) | data[1] as u16)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Clear the latched device error word (LR1121 UM §2.1.5,
+    /// ClearErrors 0x010E). Always safe to call.
+    pub fn clear_device_errors(&mut self) -> Result<(), LoRaError> {
+        self.write_command(CMD_CLEAR_ERRORS, &[]).map(|_| ())
+    }
+
+    /// Decode the 16-bit error word to a list of symbolic bit names.
+    /// Exposed for diagnostic logging.
+    pub fn decode_device_errors(err: u16) -> Vec<&'static str> {
+        let mut bits = Vec::new();
+        if err & ERR_HFXO_TUNE_FAIL != 0 { bits.push("HFXO_TUNE_FAIL"); }
+        if err & ERR_LFXO_TUNE_FAIL != 0 { bits.push("LFXO_TUNE_FAIL"); }
+        if err & ERR_PLL_LOCK_FAIL != 0 { bits.push("PLL_LOCK_FAIL"); }
+        if err & ERR_HFXO_START_FAIL != 0 { bits.push("HFXO_START_FAIL"); }
+        if err & ERR_LFXO_START_FAIL != 0 { bits.push("LFXO_START_FAIL"); }
+        if err & ERR_PA_RAMP_FAIL != 0 { bits.push("PA_RAMP_FAIL"); }
+        if err & ERR_PA_SELECT_FAIL != 0 { bits.push("PA_SELECT_FAIL"); }
+        if err & ERR_IMG_CALIB_FAIL != 0 { bits.push("IMG_CALIB_FAIL"); }
+        if err & ERR_HF_XOSC_START_FAIL != 0 { bits.push("HF_XOSC_START_FAIL"); }
+        if err & ERR_LF_XOSC_START_FAIL != 0 { bits.push("LF_XOSC_START_FAIL"); }
+        if err & ERR_PLL_CALIB_FAIL != 0 { bits.push("PLL_CALIB_FAIL"); }
+        if err & ERR_RC_CALIB_FAIL != 0 { bits.push("RC_CALIB_FAIL"); }
+        if err & ERR_IMG_CALIB_NOT_RUN != 0 { bits.push("IMG_CALIB_NOT_RUN"); }
+        bits
+    }
+
 }
 
 impl LoRaChipset for LR1121 {
@@ -583,6 +642,9 @@ impl LoRaChipset for LR1121 {
 
         // 7. Clear errors and IRQs
         self.write_command(CMD_CLEAR_IRQ, &[0xFF, 0xFF, 0xFF, 0xFF])?;
+        // Clear any device errors latched during cold-start / calibration so
+        // a later check isn't misreading warm-up failures as live errors.
+        let _ = self.clear_device_errors();
 
         // 8. Set packet type to LoRa
         self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
@@ -613,6 +675,22 @@ impl LoRaChipset for LR1121 {
 
         // Clear any stale IRQ flags (e.g. from failed init steps)
         self.clear_irq_status(0xFFFFFFFF)?;
+
+        // Diagnostic: report latched device errors so TCXO/XOSC/PLL/PA
+        // startup failures are visible.
+        match self.get_device_errors() {
+            Ok(err) if err != 0 => {
+                let bits = Self::decode_device_errors(err);
+                log::warn!(
+                    "lr1121: device errors after init = 0x{err:04X} ({})",
+                    bits.join(", "),
+                );
+            }
+            Ok(_) => {
+                log::info!("lr1121: no device errors after init (XO started)");
+            }
+            Err(e) => log::warn!("lr1121: could not read device errors: {}", e),
+        }
 
         self.config = Some(config.clone());
 

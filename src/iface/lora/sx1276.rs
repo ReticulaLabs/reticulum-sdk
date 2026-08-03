@@ -54,11 +54,21 @@ const MODE_RX_CONTINUOUS: u8 = 0x05;
 
 const PA_BOOST: u8 = 0x80;
 
-// ── IRQ flags ──────────────────────────────────────────────────────────────
+// ── IRQ flags (REG_IRQ_FLAGS 0x12, LoRa mode) ─────────────────────────────
 
 const IRQ_TX_DONE: u8 = 0x08;
 const IRQ_RX_DONE: u8 = 0x40;
 const IRQ_CRC_ERR: u8 = 0x20;
+// Full LoRa IRQ bit assignments (datasheet §6.4 / Table 18):
+//   0x80 = RxTimeout,   0x40 = RxDone,
+//   0x20 = PayloadCrcError, 0x10 = ValidHeader,
+//   0x08 = TxDone,      0x04 = CAD done,
+//   0x02 = FHSS change channel, 0x01 = CAD detected
+const IRQ_RX_TIMEOUT: u8 = 0x80;
+const IRQ_VALID_HEADER: u8 = 0x10;
+const IRQ_CAD_DONE: u8 = 0x04;
+const IRQ_FHSS_CHANGE: u8 = 0x02;
+const IRQ_CAD_DETECTED: u8 = 0x01;
 
 // ── OCP ────────────────────────────────────────────────────────────────────
 // 0x2B = OcpOn=1, OcpTrim=0x0B → ~100 mA – matches RadioHead default.
@@ -386,6 +396,36 @@ impl SX1276 {
         self.read_register(REG_IRQ_FLAGS)
     }
 
+    /// Read the device "error" status word (SX1276 has no dedicated
+    /// device-error register like SX1262/LR1121, so this returns the
+    /// REG_IRQ_FLAGS byte zero-extended to u16). Bits:
+    /// bit 7 (0x80) = RxTimeout, 6 (0x40) = RxDone,
+    /// 5 (0x20) = PayloadCrcError, 4 (0x10) = ValidHeader,
+    /// 3 (0x08) = TxDone, 2 (0x04) = CAD done,
+    /// 1 (0x02) = FHSS change channel, 0 (0x01) = CAD detected.
+    /// Use `decode_device_errors` for symbolic names.
+    pub fn get_device_errors(&mut self) -> Result<u16, LoRaError> {
+        let flags = self.read_irq_flags()?;
+        Ok(flags as u16)
+    }
+
+    /// Clear all latched IRQ flags (REG_IRQ_FLAGS write-1-to-clear).
+    pub fn clear_device_errors(&mut self) -> Result<(), LoRaError> {
+        self.write_register(REG_IRQ_FLAGS, 0xFF)
+    }
+
+    /// Decode the IRQ-flags word to a list of symbolic bit names.
+    pub fn decode_device_errors(err: u16) -> Vec<&'static str> {
+        let mut bits = Vec::new();
+        if err & (IRQ_RX_TIMEOUT as u16) != 0 { bits.push("RX_TIMEOUT"); }
+        if err & (IRQ_CRC_ERR as u16) != 0 { bits.push("CRC_ERR"); }
+        if err & (IRQ_VALID_HEADER as u16) != 0 { bits.push("VALID_HEADER"); }
+        if err & (IRQ_CAD_DONE as u16) != 0 { bits.push("CAD_DONE"); }
+        if err & (IRQ_FHSS_CHANGE as u16) != 0 { bits.push("FHSS_CHANGE"); }
+        if err & (IRQ_CAD_DETECTED as u16) != 0 { bits.push("CAD_DETECTED"); }
+        bits
+    }
+
     // ── RSSI helpers ───────────────────────────────────────────────────────
 
     fn rssi_offset(&self) -> i16 {
@@ -497,7 +537,28 @@ impl LoRaChipset for SX1276 {
         self.set_op_mode(MODE_STDBY)?;
         std::thread::sleep(Duration::from_millis(2));
 
+        // Clear any stale IRQ flags latched during init so subsequent
+        // `get_device_errors` calls aren't misreading setup-phase events.
+        let _ = self.clear_device_errors();
+
         self.config = Some(config.clone());
+
+        // Diagnostic: report latched IRQ flags after init. RX_TIMEOUT,
+        // CRC_ERR and CAD_DETECTED are the only bits that indicate a real
+        // fault; the others (RxDone, ValidHeader, TxDone) are expected.
+        match self.get_device_errors() {
+            Ok(err) if err != 0 => {
+                let bits = Self::decode_device_errors(err);
+                log::info!(
+                    "sx1276: device status after init = 0x{err:04X} ({})",
+                    bits.join(", "),
+                );
+            }
+            Ok(_) => {
+                log::info!("sx1276: no IRQ flags after init (clean)");
+            }
+            Err(e) => log::warn!("sx1276: could not read device status: {}", e),
+        }
 
         log::info!(
             "sx1276: configured freq={} Hz bw={} kHz sf={} cr={} power={} dBm",
