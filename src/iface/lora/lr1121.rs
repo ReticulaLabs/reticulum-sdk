@@ -28,7 +28,8 @@ impl FrequencyBand {
     }
 }
 
-// ── 16-bit command opcodes (LR1121 User Manual §14) ───────────────────────
+// ── 16-bit command opcodes (Semtech LR11xx driver, lr11xx_system.h
+//    and lr11xx_radio.h / lr11xx_regmem.h) ────────────────────────────────
 
 // System configuration
 const CMD_GET_STATUS: u16 = 0x0100;
@@ -41,7 +42,9 @@ const CMD_CALIB_IMAGE: u16 = 0x0111;
 const CMD_SET_DIO_AS_RF_SWITCH: u16 = 0x0112;
 const CMD_SET_DIO_IRQ_PARAMS: u16 = 0x0113;
 const CMD_CLEAR_IRQ: u16 = 0x0114;
+const CMD_CFG_LFCLK: u16 = 0x0116;
 const CMD_SET_TXCO_MODE: u16 = 0x0117;
+const CMD_SET_SLEEP: u16 = 0x011B;
 const CMD_SET_STANDBY: u16 = 0x011C;
 
 // Radio configuration / status
@@ -69,14 +72,25 @@ const RFSW3_HIGH: u8 = 0b01000; // DIO8
 const CMD_WRITE_BUFFER_8: u16 = 0x0109;
 const CMD_READ_BUFFER_8: u16 = 0x010A;
 
-// Register/memory access
+// Register/memory access (LR11xx regmem)
+// 0x0105: WRITE_REGMEM32
+// 0x0106: READ_REGMEM32
+// 0x010C: WRITE_REGMEM32_MASK
+const CMD_WRITE_REGMEM32: u16 = 0x0105;
+const CMD_READ_REGMEM32: u16 = 0x0106;
 const CMD_WRITE_REGMEM32_MASK: u16 = 0x010C;
-
-// LF clock config
-const CMD_CFG_LFCLK: u16 = 0x0116;
 
 // RX boosted mode
 const CMD_SET_RX_BOOSTED: u16 = 0x0227;
+
+// ── POR canary address ─────────────────────────────────────────────────────
+// Use an address in the GFSK workaround register area that the LR11xx
+// regmem driver accepts but no active code touches. Survives warm sleep
+// (SetSleep with retention) but is cleared on cold sleep (POR-equivalent),
+// so a value other than our canary on the next probe run indicates that
+// the chip was power-cycled.
+const REG_POR_CANARY: u32 = 0x00F2_FFFC;
+const POR_CANARY_VALUE: u32 = 0x0000_AB24;
 
 // ── Packet types (LR1121 UM §8.1.1) ──────────────────────────────────────
 // 0x00 = None, 0x01 = (G)FSK, 0x02 = LoRa, 0x03 = Sigfox, 0x04 = LR-FHSS
@@ -367,6 +381,194 @@ impl LR1121 {
         Ok(data.first().copied().unwrap_or(0x00))
     }
 
+    /// Explicitly enter STDBY_XOSC so the host can verify the XO actually
+    /// starts (diagnostic helper; status is visible on the next read).
+    pub fn set_standby_xosc(&mut self) -> Result<(), LoRaError> {
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC]).map(|_| ())
+    }
+
+    /// Wait until the chip reports STBY_XOSC (0x3), i.e. the XO is up and
+    /// stable. The chip holds BUSY during the XO startup window, but the
+    /// LR11xx also answers GetStatus (a NOP read) while BUSY, so polling the
+    /// status byte is the software BUSY-wait. Returns Ok(true) if STBY_XOSC
+    /// was reached within `timeout`.
+    pub fn wait_for_standby_xosc(&mut self, timeout: Duration) -> Result<bool, LoRaError> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let status = self.get_status()?;
+            if (status >> 4) & 0x07 == 0x03 {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(false)
+    }
+
+    /// Enter STDBY_XOSC and wait for the XO to come up, retrying for a slow
+    /// or marginal TCXO. On success any latched XOSC/PLL startup error is
+    /// cleared so later checks aren't misread. Without a BUSY line we poll
+    /// the status byte; this is the software equivalent of waiting for
+    /// BUSY to release.
+    pub fn enter_standby_xosc(
+        &mut self,
+        startup_delay: Duration,
+    ) -> Result<(), LoRaError> {
+        let timeout = startup_delay + Duration::from_millis(100);
+        for attempt in 0..4 {
+            self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC]).map(|_| ())?;
+            if self.wait_for_standby_xosc(timeout)? {
+                let _ = self.clear_device_errors();
+                return Ok(());
+            }
+            log::warn!(
+                "lr1121: STDBY_XOSC attempt {attempt} timed out (delay {startup_delay:?}); retrying"
+            );
+        }
+        Err(LoRaError::Chipset(
+            "XO did not reach STBY_XOSC within timeout".into(),
+        ))
+    }
+
+    /// Probe whether SetSleep actually puts the chip into SLEEP. A genuinely
+    /// fresh (power-cycled) chip honours SetSleep and is unresponsive during
+    /// the wake transaction; a warm-stuck chip ignores SetSleep and stays
+    /// responsive. Returns true if the chip was asleep at the time of the
+    /// wake read.
+    pub fn probe_sleep(&mut self) -> Result<bool, LoRaError> {
+        // SetSleep is only accepted from STDBY. Move to STDBY_RC first so a
+        // warm-stuck chip that is still in TX or RX is in a defined mode
+        // before we ask it to sleep.
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC]).map(|_| ())?;
+        std::thread::sleep(Duration::from_millis(5));
+
+        // SetSleep args: bit 0 = warm_start, bit 1 = rtc_wakeup. We use
+        // 0x00 (cold start) for a clean POR-equivalent state, and pass
+        // sleep_time = 0 because we don't need RTC wake — NSS falling edge
+        // is what will wake the chip.
+        let args = [0x00, 0x00, 0x00, 0x00, 0x00];
+        self.write_command(CMD_SET_SLEEP, &args)?;
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Blind NSS-low NOP read: the LR11xx returns stat1+stat2+irq on
+        // any NSS-low transaction that isn't a command (see
+        // lr11xx_system_get_status). NSS falling edge is the wake-up
+        // trigger for SetSleep cold-start, so if the chip was actually
+        // asleep the MISO line is still floating during the first byte
+        // of the response and we read garbage. If SetSleep was ignored
+        // (warm/stuck chip) the chip is fully responsive and returns a
+        // real status byte. We deliberately do NOT call wait_ready()
+        // here — the 50ms wait in `command_delay` would let the chip
+        // finish waking up and defeat the test.
+        let mut rx = [0u8; 6];
+        self.spi.xfer(&[0u8; 6], &mut rx)?;
+        std::thread::sleep(Duration::from_millis(10));
+
+        let was_asleep = rx.iter().all(|&b| b == 0x00 || b == 0xFF);
+        log::info!(
+            "lr1121: probe_sleep: status bytes = {:02X?} -> chip was {}",
+            rx,
+            if was_asleep { "ASLEEP (fresh POR)" } else { "AWAKE (warm/stuck)" }
+        );
+        Ok(was_asleep)
+    }
+
+    /// Read a single 32-bit register/memory word (WriteRegmem32 / ReadRegmem32,
+    /// LR11xx regmem driver §3.1-3.2). Returns the raw 32-bit value.
+    pub fn read_register(&mut self, addr: u32) -> Result<u32, LoRaError> {
+        // ReadRegmem32: opcode(2) + address(4) + length(1) → response is
+        // length*4 bytes. Our read_command helper prepends a Stat1 byte
+        // (status from the *previous* command), so pass length=1 and let
+        // read_command pull off the leading byte.
+        let args = [
+            (addr >> 24) as u8,
+            (addr >> 16) as u8,
+            (addr >> 8) as u8,
+            addr as u8,
+            0x01, // length: one 32-bit word
+        ];
+        let data = self.read_command(CMD_READ_REGMEM32, &args, 4)?;
+        if data.len() < 4 {
+            return Err(LoRaError::Chipset(format!(
+                "lr1121: read_register(0x{addr:08X}) short response ({} bytes)",
+                data.len()
+            )));
+        }
+        Ok((data[0] as u32) << 24
+            | (data[1] as u32) << 16
+            | (data[2] as u32) << 8
+            | data[3] as u32)
+    }
+
+    /// Write a single 32-bit register/memory word (WriteRegmem32,
+    /// LR11xx regmem driver §3.1).
+    pub fn write_register(&mut self, addr: u32, value: u32) -> Result<(), LoRaError> {
+        // WriteRegmem32: opcode(2) + address(4) + data(N*4). The opcode
+        // length is fixed; the data payload goes in args.
+        let mut args = vec![
+            (addr >> 24) as u8,
+            (addr >> 16) as u8,
+            (addr >> 8) as u8,
+            addr as u8,
+        ];
+        args.extend_from_slice(&value.to_be_bytes());
+        self.write_command(CMD_WRITE_REGMEM32, &args).map(|_| ())
+    }
+
+    /// Diagnostic POR-detector: reports whether the chip retains a canary
+    /// written by the previous run at `REG_POR_CANARY`. A true power cycle
+    /// resets regmem to 0; a warm chip still holds `POR_CANARY_VALUE`.
+    pub fn check_por_canary(&mut self) -> Result<(), LoRaError> {
+        let v = self.read_register(REG_POR_CANARY)?;
+        log::info!(
+            "lr1121: POR canary 0x{:08X} = 0x{v:08X} -> {}",
+            REG_POR_CANARY,
+            if v == POR_CANARY_VALUE {
+                "WARM (regmem retained, NOT power-cycled)"
+            } else if v == 0x0000_0000 {
+                "FRESH (regmem at default, power-cycled)"
+            } else {
+                "UNKNOWN"
+            }
+        );
+        Ok(())
+    }
+
+    /// Diagnostic: arm the POR canary for the next run (write
+    /// `POR_CANARY_VALUE` to `REG_POR_CANARY`).
+    pub fn set_por_canary(&mut self) -> Result<(), LoRaError> {
+        self.write_register(REG_POR_CANARY, POR_CANARY_VALUE)
+    }
+
+    /// Quick SPI ping: read the chip version register and verify the
+    /// response is a plausible value (not all-zeros, all-ones, or other
+    /// floating-bus garbage). This catches wiring problems before we
+    /// start trying to drive the radio.
+    pub fn ping(&mut self) -> Result<(), LoRaError> {
+        let data = self.read_command(CMD_GET_VERSION, &[], 4)?;
+        if data.len() < 4 {
+            return Err(LoRaError::Chipset(
+                "lr1121: SPI ping failed (no response)".into(),
+            ));
+        }
+        let v = (data[0] as u32) << 24
+            | (data[1] as u32) << 16
+            | (data[2] as u32) << 8
+            | data[3] as u32;
+        if v == 0x0000_0000 || v == 0xFFFF_FFFF {
+            return Err(LoRaError::Chipset(format!(
+                "lr1121: SPI ping returned 0x{v:08X} (bus floating or chip not connected)"
+            )));
+        }
+        // hardware_id (data[0]) is 0x04 for LR1110/LR1121. Other Semtech
+        // parts use 0x01/0x02, but anything in 0x00-0x0F is plausible.
+        let hw = data[0];
+        log::debug!(
+            "lr1121: SPI ping OK (version=0x{v:08X}, hw=0x{hw:02X}, fw=0x{:02X}{:02X})",
+            data[2], data[3]
+        );
+        Ok(())
+    }
+
     fn set_rf_frequency(&mut self, freq_hz: u64) -> Result<(), LoRaError> {
         // Frequency in Hz directly (matches Semtech lr11xx_radio_set_rf_freq)
         let args = [
@@ -608,6 +810,12 @@ impl LoRaChipset for LR1121 {
         log::trace!("lr1121: post-reset, starting init sequence");
         self.prev_status = None;
 
+        // Quick SPI ping: confirm the chip is alive on the bus before we
+        // start driving configuration commands. Catches wiring problems
+        // (CS/MISO/MOSI/SCK swapped, missing ground, wrong mode) before
+        // we blame the driver for a silent TX failure.
+        self.ping()?;
+
         // Core1121-HF init sequence based on WaveShare demo.
         // The sealed module contains a 3.0V TCXO.
 
@@ -625,7 +833,15 @@ impl LoRaChipset for LR1121 {
             else if tcxo_v < 3.0 { 0x05 }
             else if tcxo_v < 3.3 { 0x06 }
             else { 0x07 };
-        let delay: u32 = 300; // 300 × 30.52 µs ≈ 9.2 ms, matches demo
+        // TCXO startup timeout is 24 bits in 30.52µs steps. Honour the
+        // caller's `tcxo_startup_delay` (clamped to a sane window); the
+        // WaveShare default of 9.2ms corresponds to ~300 steps.
+        let delay: u32 = (config
+            .tcxo_startup_delay
+            .as_micros()
+            .saturating_div(30)
+            .min(0xFF_FFFF) as u32)
+            .max(1);
         self.write_command(CMD_SET_TXCO_MODE, &[
             code,
             (delay >> 16) as u8,
@@ -634,9 +850,11 @@ impl LoRaChipset for LR1121 {
         ])?;
         std::thread::sleep(Duration::from_millis(15));
 
-        // 3. Switch to XOSC mode — TCXO is configured and should start
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
-        std::thread::sleep(Duration::from_millis(10));
+        // 3. Switch to XOSC mode. The TCXO is configured; poll the status
+        //    byte (GetStatus is answered even while BUSY is asserted) and
+        //    retry for a slow/marginal TCXO so a later TX is not silently
+        //    rejected with PLL/XOSC_START_ERR.
+        self.enter_standby_xosc(config.tcxo_startup_delay)?;
 
         // 4. Configure LF clock (internal RC 32kHz)
         self.write_command(CMD_CFG_LFCLK, &[0x00])?;
@@ -644,21 +862,21 @@ impl LoRaChipset for LR1121 {
         // 5. Calibrate image for target sub-GHz band
         self.calibrate_image(config.frequency)?;
 
-        // 5. Set regulator mode (DC-DC)
+        // 6. Set regulator mode (DC-DC)
         self.write_command(CMD_SET_REG_MODE, &[REG_MODE_DCDC])?;
 
-        // 6. Full calibration with TCXO stable
+        // 7. Full calibration with TCXO stable
         self.write_command(CMD_CALIBRATE, &[0x3F])?;
         std::thread::sleep(Duration::from_millis(15));
         self.wait_ready()?;
 
-        // 7. Clear errors and IRQs
+        // 8. Clear errors and IRQs
         self.write_command(CMD_CLEAR_IRQ, &[0xFF, 0xFF, 0xFF, 0xFF])?;
         // Clear any device errors latched during cold-start / calibration so
         // a later check isn't misreading warm-up failures as live errors.
         let _ = self.clear_device_errors();
 
-        // 8. Set packet type to LoRa
+        // 9. Set packet type to LoRa
         self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
 
         // Set PA config based on power and frequency band
