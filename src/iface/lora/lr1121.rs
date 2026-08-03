@@ -334,7 +334,11 @@ impl LR1121 {
         Ok(read_rx[1..].to_vec())
     }
 
-    fn get_irq_status(&mut self) -> Result<u32, LoRaError> {
+    /// Read the 32-bit IRQ status word (LR1121 UM §4.1, GetIrqStatus 0x0100).
+    /// Bits: bit 2=TX_DONE, 3=RX_DONE, 4=PREAMBLE_DETECTED,
+    /// 5=SYNC_WORD_VALID, 6=HEADER_ERR, 7=ERR, 8=CAD_DONE,
+    /// 9=CAD_DETECTED, 10=TIMEOUT.
+    pub fn get_irq_status(&mut self) -> Result<u32, LoRaError> {
         self.wait_ready()?;
         let tx = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut rx = vec![0u8; 6];
@@ -353,6 +357,14 @@ impl LR1121 {
         self.prev_status = Some((0x0100, stat1));
         self.wait_ready()?;
         Ok((rx[2] as u32) << 24 | (rx[3] as u32) << 16 | (rx[4] as u32) << 8 | rx[5] as u32)
+    }
+
+    /// Read the raw status byte (GetStatus, 0x0100). Same layout as SX1262:
+    /// chip-mode field (bits 6:4): 0x2=STBY_RC, 0x3=STBY_XOSC, 0x4=FS,
+    /// 0x5=RX, 0x6=TX. Command-status field (bits 3:1).
+    pub fn get_status(&mut self) -> Result<u8, LoRaError> {
+        let data = self.read_command(CMD_GET_STATUS, &[], 1)?;
+        Ok(data.first().copied().unwrap_or(0x00))
     }
 
     fn set_rf_frequency(&mut self, freq_hz: u64) -> Result<(), LoRaError> {

@@ -396,6 +396,15 @@ impl SX1276 {
         self.read_register(REG_IRQ_FLAGS)
     }
 
+    /// Read the IRQ status byte (REG_IRQ_FLAGS 0x12, LoRa mode).
+    /// Bits: 7=RxTimeout, 6=RxDone, 5=PayloadCrcError, 4=ValidHeader,
+    /// 3=TxDone, 2=CAD done, 1=FHSS change channel, 0=CAD detected.
+    /// The natural width is 8 bits (the chip has no wider IRQ word).
+    /// For the zero-extended u16 form, see `get_device_errors`.
+    pub fn get_irq_status(&mut self) -> Result<u8, LoRaError> {
+        self.read_irq_flags()
+    }
+
     /// Read the device "error" status word (SX1276 has no dedicated
     /// device-error register like SX1262/LR1121, so this returns the
     /// REG_IRQ_FLAGS byte zero-extended to u16). Bits:
@@ -424,6 +433,28 @@ impl SX1276 {
         if err & (IRQ_FHSS_CHANGE as u16) != 0 { bits.push("FHSS_CHANGE"); }
         if err & (IRQ_CAD_DETECTED as u16) != 0 { bits.push("CAD_DETECTED"); }
         bits
+    }
+
+    /// Read the chip status byte, normalized to the same layout as
+    /// SX1262/LR1121: chip-mode field (bits 6:4): 0x2=STBY, 0x4=FS,
+    /// 0x5=RX, 0x6=TX. Bits 3:1 (command status on SX1262) are
+    /// reported as 0 on SX1276 — the chip is register-driven, not
+    /// command-driven. Reads REG_OP_MODE and maps the raw mode bits
+    /// (REG_OP_MODE[2:0]) onto the standardized chip-mode field.
+    pub fn get_status(&mut self) -> Result<u8, LoRaError> {
+        let op_mode = self.read_register(REG_OP_MODE)?;
+        let mode = op_mode & 0x07;
+        let chip_mode: u8 = match mode {
+            MODE_SLEEP => 0x00,             // SLEEP (no SX1262 equivalent)
+            MODE_STDBY => 0x02,             // STDBY -> STBY_RC
+            0x02 => 0x04,                   // FSTX -> FS
+            MODE_TX => 0x06,                // TX
+            0x04 => 0x04,                   // FSRX -> FS
+            MODE_RX_CONTINUOUS => 0x05,     // RX continuous
+            0x06 => 0x05,                   // RX single
+            _ => 0x05,                      // CAD / unknown -> RX-like
+        };
+        Ok(chip_mode << 4)
     }
 
     // ── RSSI helpers ───────────────────────────────────────────────────────
