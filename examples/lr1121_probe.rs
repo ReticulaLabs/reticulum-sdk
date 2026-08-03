@@ -3,8 +3,20 @@ use std::time::{Duration, Instant};
 use reticulum_sdk::iface::lora::lr1121::LR1121;
 use reticulum_sdk::iface::lora::{GpioPins, LoRaConfig, LoRaChipset, SpiBus};
 
+// LR11xx chip-mode values (encoded in stat2 bits 3:1). These are
+// different from the SX1262 — don't cross-port status checks.
+#[allow(dead_code)] // STBY_RC/FS retained for future probes / docs
+const MODE_STBY_RC: u8 = 0x1;
+const MODE_STBY_XOSC: u8 = 0x2;
+#[allow(dead_code)]
+const MODE_FS: u8 = 0x3;
+
 fn env_flag(name: &str) -> bool {
     std::env::var(name).map(|v| v == "1" || v == "true").unwrap_or(false)
+}
+
+fn chip_mode(stat2: u8) -> u8 {
+    (stat2 & 0x0F) >> 1
 }
 
 fn poll_for_status(
@@ -17,7 +29,7 @@ fn poll_for_status(
     while Instant::now() < deadline {
         let s = chipset.get_status().unwrap_or(0x00);
         last = s;
-        if (s >> 4) & 0x07 == mode_bits {
+        if chip_mode(s) == mode_bits {
             return Some(s);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -59,7 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.rx_poll_interval = Duration::from_millis(50);
 
     let mut chipset = LR1121::new(spi, gpio);
-    chipset.check_por_canary()?;
     if !no_sleep {
         let _ = chipset.probe_sleep();
     } else {
@@ -72,17 +83,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // PHASE 1: RAW SetStandby(XOSC) on the fresh chip with DIO3/TCXO
-    // UNTOUCHED. On a crystal module this should reach STBY_XOSC (0x32);
+    // UNTOUCHED. On a crystal module this should reach STBY_XOSC;
     // on a TCXO module DIO3 is off so it must fail.
     log::info!("probe: PHASE 1 — raw SetStandby(XOSC), DIO3 untouched");
     chipset.set_standby_xosc()?;
-    match poll_for_status(&mut chipset, 0x3, Duration::from_secs(5)) {
-        Some(s) if (s >> 4) & 0x07 == 0x3 => {
-            log::info!("probe: PHASE 1 OK — reached STBY_XOSC (0x{s:02X}) with no TCXO config -> module has a plain XTAL");
+    match poll_for_status(&mut chipset, MODE_STBY_XOSC, Duration::from_secs(5)) {
+        Some(s) if chip_mode(s) == MODE_STBY_XOSC => {
+            log::info!("probe: PHASE 1 OK — reached STBY_XOSC (stat2=0x{s:02X}) with no TCXO config -> module has a plain XTAL");
         }
         Some(s) => {
             log::info!(
-                "probe: PHASE 1 — stuck at status 0x{s:02X} (never STBY_XOSC); errors = 0x{:04X}",
+                "probe: PHASE 1 — stuck at stat2=0x{s:02X} (mode={:X}, never STBY_XOSC); errors = 0x{:04X}",
+                chip_mode(s),
                 chipset.get_device_errors()?
             );
         }
@@ -92,14 +104,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PHASE 2: retry XOSC for a slow/marginal TCXO (each retry 5s).
     for i in 0..retries {
         chipset.set_standby_xosc()?;
-        match poll_for_status(&mut chipset, 0x3, Duration::from_secs(5)) {
-            Some(s) if (s >> 4) & 0x07 == 0x3 => {
-                log::info!("probe: PHASE 2 retry {i}: reached STBY_XOSC (0x{s:02X})");
+        match poll_for_status(&mut chipset, MODE_STBY_XOSC, Duration::from_secs(5)) {
+            Some(s) if chip_mode(s) == MODE_STBY_XOSC => {
+                log::info!("probe: PHASE 2 retry {i}: reached STBY_XOSC (stat2=0x{s:02X})");
                 break;
             }
             Some(s) => {
                 log::info!(
-                    "probe: PHASE 2 retry {i}: stuck at 0x{s:02X}; errors = 0x{:04X}",
+                    "probe: PHASE 2 retry {i}: stuck at stat2=0x{s:02X} (mode={:X}); errors = 0x{:04X}",
+                    chip_mode(s),
                     chipset.get_device_errors()?
                 );
             }
@@ -119,13 +132,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chipset.get_device_errors()?
     );
     chipset.set_standby_xosc()?;
-    match poll_for_status(&mut chipset, 0x3, Duration::from_secs(5)) {
-        Some(s) if (s >> 4) & 0x07 == 0x3 => {
-            log::info!("probe: after init reached STBY_XOSC (0x{s:02X})");
+    match poll_for_status(&mut chipset, MODE_STBY_XOSC, Duration::from_secs(5)) {
+        Some(s) if chip_mode(s) == MODE_STBY_XOSC => {
+            log::info!("probe: after init reached STBY_XOSC (stat2=0x{s:02X})");
         }
         Some(s) => {
             log::info!(
-                "probe: after init stuck at 0x{s:02X}; errors = 0x{:04X}",
+                "probe: after init stuck at stat2=0x{s:02X} (mode={:X}); errors = 0x{:04X}",
+                chip_mode(s),
                 chipset.get_device_errors()?
             );
         }
@@ -137,11 +151,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(()) => log::info!("probe: TX OK"),
         Err(e) => log::error!("probe: TX FAILED: {}", e),
     }
-
-    // Arm the canary so the NEXT run can verify whether a power cycle
-    // actually reset the chip's RAM.
-    chipset.set_por_canary()?;
-    log::info!("probe: POR canary armed (0x0740 = 0xAB24)");
 
     Ok(())
 }
