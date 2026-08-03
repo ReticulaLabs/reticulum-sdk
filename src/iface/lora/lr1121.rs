@@ -1,8 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{
-    GpioLine, GpioPins, LoRaChipset, LoRaConfig, LoRaError, ReceivedPacket, SpiBus,
-};
+use super::{GpioLine, GpioPins, LoRaChipset, LoRaConfig, LoRaError, ReceivedPacket, SpiBus};
 
 // ── Frequency bands (LR1121-specific) ─────────────────────────────────────
 
@@ -83,15 +81,6 @@ const CMD_WRITE_REGMEM32_MASK: u16 = 0x010C;
 // RX boosted mode
 const CMD_SET_RX_BOOSTED: u16 = 0x0227;
 
-// ── POR canary address ─────────────────────────────────────────────────────
-// Use an address in the GFSK workaround register area that the LR11xx
-// regmem driver accepts but no active code touches. Survives warm sleep
-// (SetSleep with retention) but is cleared on cold sleep (POR-equivalent),
-// so a value other than our canary on the next probe run indicates that
-// the chip was power-cycled.
-const REG_POR_CANARY: u32 = 0x00F2_FFFC;
-const POR_CANARY_VALUE: u32 = 0x0000_AB24;
-
 // ── Packet types (LR1121 UM §8.1.1) ──────────────────────────────────────
 // 0x00 = None, 0x01 = (G)FSK, 0x02 = LoRa, 0x03 = Sigfox, 0x04 = LR-FHSS
 
@@ -101,6 +90,21 @@ const PACKET_TYPE_LORA: u8 = 0x02;
 
 const STANDBY_RC: u8 = 0x00;
 const STANDBY_XOSC: u8 = 0x01;
+
+// ── Chip modes (lr11xx_system.h) ───────────────────────────────────────────
+// The LR11xx encodes the current chip mode in stat2_byte bits 3:1. Values
+// are 0x1..=0x5 (FSM=0x0 is reserved / unused on the public interface).
+// These differ from the SX1262, which puts the chip mode in stat1 bits 6:4
+// with values 0x2..=0x6.
+#[allow(dead_code)] // STBY_RC/FS/RX/TX retained for future callers / docs
+const CHIP_MODE_STBY_RC: u8 = 0x1;
+const CHIP_MODE_STBY_XOSC: u8 = 0x2;
+#[allow(dead_code)]
+const CHIP_MODE_FS: u8 = 0x3;
+#[allow(dead_code)]
+const CHIP_MODE_RX: u8 = 0x4;
+#[allow(dead_code)]
+const CHIP_MODE_TX: u8 = 0x5;
 
 // ── Regulator mode (LR1121 UM §5.3.1) ─────────────────────────────────────
 
@@ -128,23 +132,20 @@ const IRQ_MASK_ALL: u32 = IRQ_TX_DONE
     | IRQ_ERR
     | IRQ_TIMEOUT;
 
-// ── Device error word (LR1121 UM §2.1.5, Table 2-4) ────────────────────────
-// Bit assignments match the Semtech lr11xx_system.h reference.
-// Bits accumulate since the last ClearErrors (0x010E) call.
+// ── Device error word (LR1121 UM §3.6.1, Table 3-5) ────────────────────────
+// Bit assignments are unique to the LR11xx family (they differ from the
+// SX1262/SX1276 OpError layout). Bits accumulate since the last
+// ClearErrors (0x010E) call.
 
-const ERR_HFXO_TUNE_FAIL: u16 = 0x0001;
-const ERR_LFXO_TUNE_FAIL: u16 = 0x0002;
-const ERR_PLL_LOCK_FAIL: u16 = 0x0004;
-const ERR_HFXO_START_FAIL: u16 = 0x0008;
-const ERR_LFXO_START_FAIL: u16 = 0x0010;
-const ERR_PA_RAMP_FAIL: u16 = 0x0020;
-const ERR_PA_SELECT_FAIL: u16 = 0x0040;
-const ERR_IMG_CALIB_FAIL: u16 = 0x0080;
-const ERR_HF_XOSC_START_FAIL: u16 = 0x0100;
-const ERR_LF_XOSC_START_FAIL: u16 = 0x0200;
-const ERR_PLL_CALIB_FAIL: u16 = 0x0400;
-const ERR_RC_CALIB_FAIL: u16 = 0x0800;
-const ERR_IMG_CALIB_NOT_RUN: u16 = 0x1000;
+const ERR_LF_RC_CALIB: u16 = 0x0001;
+const ERR_HF_RC_CALIB: u16 = 0x0002;
+const ERR_ADC_CALIB: u16 = 0x0004;
+const ERR_PLL_CALIB: u16 = 0x0008;
+const ERR_IMG_CALIB: u16 = 0x0010;
+const ERR_HF_XOSC_START: u16 = 0x0020;
+const ERR_LF_XOSC_START: u16 = 0x0040;
+const ERR_PLL_LOCK: u16 = 0x0080;
+const ERR_RX_ADC_OFFSET: u16 = 0x0100;
 
 // ── LoRa bandwidth codes (LR1121 UM §8.3.1) ───────────────────────────────
 // Sub-GHz: 0x03=62.5k, 0x04=125k, 0x05=250k, 0x06=500k
@@ -238,6 +239,21 @@ pub struct LR1121 {
 }
 
 impl LR1121 {
+    /// Log the command status carried in a Stat1 byte (bits 3:1, values
+    /// follow RadioLib/`lr11xx_system.h` semantics: 0=CMD_FAIL, 1=P_ERR,
+    /// 2=CMD_OK, 3=CMD_DATA, 6/7=TX/RX_DONE; everything else is success).
+    fn log_cmd_status(&self, opcode: u16, stat1: u8) {
+        match (stat1 >> 1) & 0x07 {
+            0 => log::warn!("lr1121: command 0x{opcode:04X} CMD_FAIL"),
+            1 => log::warn!("lr1121: command 0x{opcode:04X} CMD_P_ERR"),
+            2 => log::trace!("lr1121: command 0x{opcode:04X} CMD_OK"),
+            3 => log::trace!("lr1121: command 0x{opcode:04X} CMD_DATA"),
+            6 => log::trace!("lr1121: command 0x{opcode:04X} CMD_TX_DONE"),
+            7 => log::trace!("lr1121: command 0x{opcode:04X} CMD_RX_DONE"),
+            _ => {}
+        }
+    }
+
     fn wait_ready(&self) -> Result<(), LoRaError> {
         match &self.busy {
             Some(busy) => {
@@ -296,15 +312,7 @@ impl LR1121 {
         let stat1 = rx.first().copied().unwrap_or(0);
         log::trace!("lr1121: tx={:02X?} rx={:02X?} stat1=0x{stat1:02X}", tx, rx);
 
-        if let Some((prev_opcode, prev_stat1)) = self.prev_status.take() {
-            let prev_cmd_status = (prev_stat1 >> 1) & 0x07;
-            match prev_cmd_status {
-                5 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_ERR_RC_53MHZ"),
-                6 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_TX_DONE"),
-                7 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_RX_DONE"),
-                _ => {}
-            }
-        }
+        self.log_cmd_status(opcode, stat1);
         self.prev_status = Some((opcode, stat1));
 
         let irq = if rx.len() >= 6 {
@@ -325,15 +333,7 @@ impl LR1121 {
         self.spi.xfer(&tx, &mut rx)?;
         let stat1 = rx.first().copied().unwrap_or(0);
         log::trace!("lr1121: readcmd tx={:02X?} rx={:02X?} stat1=0x{stat1:02X}", tx, rx);
-        if let Some((prev_opcode, prev_stat1)) = self.prev_status.take() {
-            let prev_cmd_status = (prev_stat1 >> 1) & 0x07;
-            match prev_cmd_status {
-                5 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_ERR_RC_53MHZ"),
-                6 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_TX_DONE"),
-                7 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_RX_DONE"),
-                _ => {}
-            }
-        }
+        self.log_cmd_status(opcode, stat1);
         self.prev_status = Some((opcode, stat1));
         self.wait_ready()?;
 
@@ -353,32 +353,68 @@ impl LR1121 {
     /// 5=SYNC_WORD_VALID, 6=HEADER_ERR, 7=ERR, 8=CAD_DONE,
     /// 9=CAD_DETECTED, 10=TIMEOUT.
     pub fn get_irq_status(&mut self) -> Result<u32, LoRaError> {
+        // Wait for the previous command to finish (if any) before sampling
+        // status; otherwise stat1 we read will reflect that command rather
+        // than the current state.
         self.wait_ready()?;
-        let tx = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let mut rx = vec![0u8; 6];
-        self.spi.xfer(&tx, &mut rx)?;
-        let stat1 = rx.first().copied().unwrap_or(0);
-        log::trace!("lr1121: get_irq rx={:02X?} stat1=0x{stat1:02X}", rx);
+
+        // LR11xx returns stat1+stat2+irq[4] on any NSS-low transaction. A
+        // direct NOP read (zero bytes on MOSI) is simpler than sending
+        // CMD_GET_STATUS with trailing NOPs and avoids any chance of the
+        // chip entering BUSY mid-transaction.
+        let rx = self.read_status_pair()?;
+        let stat1 = rx[0];
+        let stat2 = rx[1];
+        log::trace!(
+            "lr1121: get_irq rx={:02X?} stat1=0x{stat1:02X} stat2=0x{stat2:02X}",
+            rx
+        );
+
         if let Some((prev_opcode, prev_stat1)) = self.prev_status.take() {
-            let prev_cmd_status = (prev_stat1 >> 1) & 0x07;
-            match prev_cmd_status {
-                5 => log::warn!("lr1121: command 0x{prev_opcode:04X} CMD_ERR_RC_53MHZ"),
-                6 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_TX_DONE"),
-                7 => log::trace!("lr1121: command 0x{prev_opcode:04X} CMD_RX_DONE"),
-                _ => {}
-            }
+            self.log_cmd_status(prev_opcode, prev_stat1);
         }
-        self.prev_status = Some((0x0100, stat1));
-        self.wait_ready()?;
+        self.prev_status = Some((CMD_GET_STATUS, stat1));
         Ok((rx[2] as u32) << 24 | (rx[3] as u32) << 16 | (rx[4] as u32) << 8 | rx[5] as u32)
     }
 
-    /// Read the raw status byte (GetStatus, 0x0100). Same layout as SX1262:
-    /// chip-mode field (bits 6:4): 0x2=STBY_RC, 0x3=STBY_XOSC, 0x4=FS,
-    /// 0x5=RX, 0x6=TX. Command-status field (bits 3:1).
+    /// Read both LR11xx status bytes (GetStatus 0x0100, or equivalently a
+    /// direct NSS-low NOP read). The chip always returns 6 bytes on any
+    /// NSS-low transaction: stat1, stat2, irq[4].
+    ///
+    /// LR11xx stat1 layout: bit 0 = interrupt pending, bits 3:1 = last
+    /// command's status. LR11xx stat2 layout: bit 0 = running from flash,
+    /// bits 3:1 = chip mode, bits 7:4 = reset status.
+    fn read_status_pair(&mut self) -> Result<[u8; 6], LoRaError> {
+        // The LR11xx returns stat1+stat2+irq[4] on any NSS-low transaction
+        // (see lr11xx_system_get_status in the Semtech driver). We do a
+        // direct 6-byte NSS-low NOP read so we don't have to deal with the
+        // chip entering BUSY for a "real" command, and we don't have to
+        // wait for the response-carrying second half of read_command.
+        let mut rx = [0u8; 6];
+        self.spi.xfer(&[0u8; 6], &mut rx)?;
+        Ok(rx)
+    }
+
+    /// Read the raw stat2 byte (LR11xx system status). This is the byte
+    /// that carries the chip mode: bits 3:1 hold one of `CHIP_MODE_*`
+    /// (0x1=STBY_RC, 0x2=STBY_XOSC, 0x3=FS, 0x4=RX, 0x5=TX). Bit 0 is
+    /// "running from flash" and bits 7:4 are the reset reason.
+    ///
+    /// Note: this layout is *different* from the SX1262, which puts the
+    /// chip mode in stat1 bits 6:4 with values 0x2..=0x6. Don't
+    /// cross-port SX1262 status checks without re-checking the layout.
     pub fn get_status(&mut self) -> Result<u8, LoRaError> {
-        let data = self.read_command(CMD_GET_STATUS, &[], 1)?;
-        Ok(data.first().copied().unwrap_or(0x00))
+        let rx = self.read_status_pair()?;
+        // rx[0] = stat1, rx[1] = stat2
+        Ok(rx[1])
+    }
+
+    /// Read just the chip-mode field from stat2. Returns one of
+    /// `CHIP_MODE_*` (0x1..=0x5). `Ok(0x0)` is reserved (FSM) and a
+    /// dead-bus / not-yet-responding value.
+    pub fn get_chip_mode(&mut self) -> Result<u8, LoRaError> {
+        let stat2 = self.get_status()?;
+        Ok((stat2 & 0x0F) >> 1)
     }
 
     /// Explicitly enter STDBY_XOSC so the host can verify the XO actually
@@ -387,16 +423,14 @@ impl LR1121 {
         self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC]).map(|_| ())
     }
 
-    /// Wait until the chip reports STBY_XOSC (0x3), i.e. the XO is up and
-    /// stable. The chip holds BUSY during the XO startup window, but the
-    /// LR11xx also answers GetStatus (a NOP read) while BUSY, so polling the
-    /// status byte is the software BUSY-wait. Returns Ok(true) if STBY_XOSC
-    /// was reached within `timeout`.
+    /// Wait until the chip reports STBY_XOSC. The chip holds BUSY during
+    /// the XO startup window but still answers NSS-low status reads, so
+    /// polling the stat2 chip-mode field is the software BUSY-wait.
+    /// Returns Ok(true) if STBY_XOSC was reached within `timeout`.
     pub fn wait_for_standby_xosc(&mut self, timeout: Duration) -> Result<bool, LoRaError> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            let status = self.get_status()?;
-            if (status >> 4) & 0x07 == 0x03 {
+            if self.get_chip_mode()? == CHIP_MODE_STBY_XOSC {
                 return Ok(true);
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -512,31 +546,6 @@ impl LR1121 {
         ];
         args.extend_from_slice(&value.to_be_bytes());
         self.write_command(CMD_WRITE_REGMEM32, &args).map(|_| ())
-    }
-
-    /// Diagnostic POR-detector: reports whether the chip retains a canary
-    /// written by the previous run at `REG_POR_CANARY`. A true power cycle
-    /// resets regmem to 0; a warm chip still holds `POR_CANARY_VALUE`.
-    pub fn check_por_canary(&mut self) -> Result<(), LoRaError> {
-        let v = self.read_register(REG_POR_CANARY)?;
-        log::info!(
-            "lr1121: POR canary 0x{:08X} = 0x{v:08X} -> {}",
-            REG_POR_CANARY,
-            if v == POR_CANARY_VALUE {
-                "WARM (regmem retained, NOT power-cycled)"
-            } else if v == 0x0000_0000 {
-                "FRESH (regmem at default, power-cycled)"
-            } else {
-                "UNKNOWN"
-            }
-        );
-        Ok(())
-    }
-
-    /// Diagnostic: arm the POR canary for the next run (write
-    /// `POR_CANARY_VALUE` to `REG_POR_CANARY`).
-    pub fn set_por_canary(&mut self) -> Result<(), LoRaError> {
-        self.write_register(REG_POR_CANARY, POR_CANARY_VALUE)
     }
 
     /// Quick SPI ping: read the chip version register and verify the
@@ -763,22 +772,19 @@ impl LR1121 {
     }
 
     /// Decode the 16-bit error word to a list of symbolic bit names.
+    /// Bit meanings follow LR1121 UM Table 3-5.
     /// Exposed for diagnostic logging.
     pub fn decode_device_errors(err: u16) -> Vec<&'static str> {
         let mut bits = Vec::new();
-        if err & ERR_HFXO_TUNE_FAIL != 0 { bits.push("HFXO_TUNE_FAIL"); }
-        if err & ERR_LFXO_TUNE_FAIL != 0 { bits.push("LFXO_TUNE_FAIL"); }
-        if err & ERR_PLL_LOCK_FAIL != 0 { bits.push("PLL_LOCK_FAIL"); }
-        if err & ERR_HFXO_START_FAIL != 0 { bits.push("HFXO_START_FAIL"); }
-        if err & ERR_LFXO_START_FAIL != 0 { bits.push("LFXO_START_FAIL"); }
-        if err & ERR_PA_RAMP_FAIL != 0 { bits.push("PA_RAMP_FAIL"); }
-        if err & ERR_PA_SELECT_FAIL != 0 { bits.push("PA_SELECT_FAIL"); }
-        if err & ERR_IMG_CALIB_FAIL != 0 { bits.push("IMG_CALIB_FAIL"); }
-        if err & ERR_HF_XOSC_START_FAIL != 0 { bits.push("HF_XOSC_START_FAIL"); }
-        if err & ERR_LF_XOSC_START_FAIL != 0 { bits.push("LF_XOSC_START_FAIL"); }
-        if err & ERR_PLL_CALIB_FAIL != 0 { bits.push("PLL_CALIB_FAIL"); }
-        if err & ERR_RC_CALIB_FAIL != 0 { bits.push("RC_CALIB_FAIL"); }
-        if err & ERR_IMG_CALIB_NOT_RUN != 0 { bits.push("IMG_CALIB_NOT_RUN"); }
+        if err & ERR_LF_RC_CALIB != 0 { bits.push("LF_RC_CALIB_ERR"); }
+        if err & ERR_HF_RC_CALIB != 0 { bits.push("HF_RC_CALIB_ERR"); }
+        if err & ERR_ADC_CALIB != 0 { bits.push("ADC_CALIB_ERR"); }
+        if err & ERR_PLL_CALIB != 0 { bits.push("PLL_CALIB_ERR"); }
+        if err & ERR_IMG_CALIB != 0 { bits.push("IMG_CALIB_ERR"); }
+        if err & ERR_HF_XOSC_START != 0 { bits.push("HF_XOSC_START_ERR"); }
+        if err & ERR_LF_XOSC_START != 0 { bits.push("LF_XOSC_START_ERR"); }
+        if err & ERR_PLL_LOCK != 0 { bits.push("PLL_LOCK_ERR"); }
+        if err & ERR_RX_ADC_OFFSET != 0 { bits.push("RX_ADC_OFFSET_ERR"); }
         bits
     }
 
