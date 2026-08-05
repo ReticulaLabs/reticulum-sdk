@@ -551,8 +551,9 @@ impl SX1262 {
         }
     }
 
-    fn set_regulator_mode(&mut self) -> Result<(), LoRaError> {
-        self.write_command(CMD_SET_REGULATOR_MODE, &[REGULATOR_DCDC])
+    fn set_regulator_mode(&mut self, dcdc: bool) -> Result<(), LoRaError> {
+        let mode = if dcdc { REGULATOR_DCDC } else { 0x00 };
+        self.write_command(CMD_SET_REGULATOR_MODE, &[mode])
     }
 
     // ── SX1262 Errata workarounds (from LoRaRF-Python) ─────────────────
@@ -745,8 +746,8 @@ impl LoRaChipset for SX1262 {
         // Set packet type to LoRa
         self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
 
-        // Set regulator mode (DC-DC)
-        self.set_regulator_mode()?;
+        // Set regulator mode (LDO or DC-DC per config)
+        self.set_regulator_mode(config.dcdc)?;
 
         // Configure DIO2 as RF switch if needed
         self.set_dio2_as_rf_switch(config.dio_rf_switch)?;

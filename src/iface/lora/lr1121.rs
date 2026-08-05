@@ -463,6 +463,47 @@ impl LR1121 {
         ))
     }
 
+    /// POR-equivalent software reset via SetSleep cold start.
+    ///
+    /// The LR1121 has no SPI reset command and the NRST pin may not be wired
+    /// on every board. Without a hardware reset, a warm restart leaves the
+    /// chip in its previous run's state (e.g. a latched HF_XOSC_START_ERR)
+    /// and re-initialization can silently fail. Entering SLEEP in cold-start
+    /// mode and waking the device by dropping NSS performs a full restart
+    /// into STBY_RC (LR1121 UM §2.1.9; ResetStatus afterwards reads "Wakeup
+    /// NSS toggling"). The sleep/wake cycle is verified by `probe_sleep`.
+    pub fn software_cold_start(&mut self) -> Result<(), LoRaError> {
+        // SetSleep is only accepted from STDBY.
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+        std::thread::sleep(Duration::from_millis(5));
+
+        // SleepConfig = 0x00: RTC wakeup disabled, cold start (no retention).
+        // sleep_time = 0: NSS falling edge is the wake-up trigger. BUSY stays
+        // asserted for the whole sleep period, so we don't wait on it here.
+        let args = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        self.spi.xfer(
+            &[(CMD_SET_SLEEP >> 8) as u8, CMD_SET_SLEEP as u8, args[0], args[1], args[2], args[3], args[4], args[5]],
+            &mut [0u8; 8],
+        )?;
+        std::thread::sleep(Duration::from_millis(50));
+
+        // NSS falling edge wakes the device; the dummy read is the trigger.
+        // After waking it boots cold into STBY_RC.
+        self.spi.xfer(&[0x00, 0x00], &mut [0u8; 2])?;
+        self.wait_ready()?;
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Verify the chip is back in STBY_RC.
+        let mode = self.get_chip_mode()?;
+        if mode != CHIP_MODE_STBY_RC {
+            return Err(LoRaError::Chipset(format!(
+                "software cold-start: chip not in STBY_RC after wake (mode={mode})"
+            )));
+        }
+        log::debug!("lr1121: software cold-start OK (mode={mode})");
+        Ok(())
+    }
+
     /// Probe whether SetSleep actually puts the chip into SLEEP. A genuinely
     /// fresh (power-cycled) chip honours SetSleep and is unresponsive during
     /// the wake transaction; a warm-stuck chip ignores SetSleep and stays
@@ -811,6 +852,7 @@ impl LoRaChipset for LR1121 {
         self.band = FrequencyBand::from_freq(config.frequency);
 
         self.hardware_reset()?;
+        self.software_cold_start()?;
         self.wait_ready()?;
         std::thread::sleep(Duration::from_millis(10));
         log::trace!("lr1121: post-reset, starting init sequence");
@@ -822,13 +864,42 @@ impl LoRaChipset for LR1121 {
         // we blame the driver for a silent TX failure.
         self.ping()?;
 
-        // Core1121-HF init sequence based on WaveShare demo.
-        // The sealed module contains a 3.0V TCXO.
+        // Stash the config up-front so the radio stays usable (e.g. for a
+        // diagnostic TX) even if a later init step below is tolerated.
+        self.config = Some(config.clone());
+
+        // Core1121-HF init sequence based on the Semtech LR11xx reference
+        // init and RadioLib's LR11x0::modSetup: standby RC -> set regulator
+        // -> set TCXO -> clear errors -> calibrate all -> and only then
+        // switch to XOSC. POR with a TCXO connected skips all start-up
+        // calibrations, so Calibrate must be re-issued after SetTcxoMode
+        // and before any XOSC use, otherwise the first SetStandby(XOSC)
+        // fails with HF_XOSC_START_ERR.
 
         // 1. Standby RC (the only mode available before TCXO is running)
         self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
 
-        // 2. Configure TCXO — Core1121-HF uses 3.0V (code 0x06).
+        // 1b. Set the LoRa packet type early so the whole transmit path is
+        //     valid even if a later init step (XO startup) fails and init
+        //     aborts — keeps the post-failure TX diagnostics meaningful.
+        self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
+
+        // 2. Calibrate the image for the target sub-GHz band. Done BEFORE the
+        //    TCXO is enabled, matching the Semtech/WaveShare reference init
+        //    (lr1121_config.c: SetStandby -> CalibrateImage -> SetRegMode ->
+        //    ... -> SetTcxoMode -> CfgLfClk -> ClearErrors -> Calibrate).
+        //    Image calibration on a TCXO module fails if run after the TCXO
+        //    is configured but the reference clock is not yet up, and a
+        //    latched IMG_CALIB error would otherwise poison XOSC startup.
+        self.calibrate_image(config.frequency)?;
+
+        // 3. Set regulator mode. Datasheet default is LDO (0x00); the DC-DC
+        //    converter (0x01) needs a 15µH inductor and is only exercised in
+        //    STDBY_XOSC/FS/RX/TX, so on boards without a working DC-DC rail
+        //    the first XOSC start fails. RadioLib also defaults to LDO.
+        self.write_command(CMD_SET_REG_MODE, &[if config.dcdc { REG_MODE_DCDC } else { 0x00 }])?;
+
+        // 4. Configure TCXO — Core1121-HF uses 3.0V (code 0x06).
         //    Follow the user's voltage if set, otherwise default to 3.0V.
         let tcxo_v = config.tcxo_voltage.unwrap_or(3.0);
         let code = if tcxo_v >= 1.6 && tcxo_v < 1.7 { 0x00 }
@@ -856,34 +927,54 @@ impl LoRaChipset for LR1121 {
         ])?;
         std::thread::sleep(Duration::from_millis(15));
 
-        // 3. Switch to XOSC mode. The TCXO is configured; poll the status
+        // 5. Configure the low-frequency clock. The Core1121-HF module has a
+        //    32.768 kHz crystal on DIO10/32k_N and DIO11/32k_P, so use the
+        //    crystal source and wait for it to be ready (byte = 0x01 XTAL |
+        //    0x04 wait, per the vendor reference CfgLfClk(XTAL, true)).
+        self.write_command(CMD_CFG_LFCLK, &[0x05])?;
+
+        // 6. Clear any device errors latched during cold-start or the TCXO
+        //    bring-up so calibration starts from a clean state.
+        let _ = self.clear_device_errors();
+
+        // 7. Full calibration of all blocks. The device returns to Standby
+        //    RC when done. This re-launches the calibrations that POR
+        //    skipped because a TCXO (not an XO) is fitted. Re-assert STBY_RC
+        //    first (matching the functional SX1262 calibrate() in
+        //    sx1262.rs): the chip may still be settling the VTCXO/TCXO path
+        //    after SetTcxoMode, and calibration is only guaranteed valid from
+        //    a clean STDBY_RC.
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+        self.write_command(CMD_CALIBRATE, &[0x3F])?;
+        std::thread::sleep(Duration::from_millis(15));
+        self.wait_ready()?;
+
+        // 7b. Diagnostic: report which calibration blocks failed (or
+        //     succeeded). If IMG_CALIB_ERR is set here, the XO was not
+        //     running even during calibration, i.e. the TCXO is not
+        //     oscillating despite SetTcxoMode.
+        match self.get_device_errors() {
+            Ok(err) if err != 0 => {
+                let bits = Self::decode_device_errors(err);
+                log::warn!(
+                    "lr1121: device errors after calibrate = 0x{err:04X} ({})",
+                    bits.join(", "),
+                );
+            }
+            Ok(_) => log::info!("lr1121: no device errors after calibrate"),
+            Err(e) => log::warn!("lr1121: could not read device errors after calibrate: {e}"),
+        }
+
+        // 8. Switch to XOSC mode. The TCXO is configured and all blocks are
+        //    calibrated, so the XO must come up cleanly; poll the status
         //    byte (GetStatus is answered even while BUSY is asserted) and
         //    retry for a slow/marginal TCXO so a later TX is not silently
         //    rejected with PLL/XOSC_START_ERR.
         self.enter_standby_xosc(config.tcxo_startup_delay)?;
 
-        // 4. Configure LF clock (internal RC 32kHz)
-        self.write_command(CMD_CFG_LFCLK, &[0x00])?;
-
-        // 5. Calibrate image for target sub-GHz band
-        self.calibrate_image(config.frequency)?;
-
-        // 6. Set regulator mode (DC-DC)
-        self.write_command(CMD_SET_REG_MODE, &[REG_MODE_DCDC])?;
-
-        // 7. Full calibration with TCXO stable
-        self.write_command(CMD_CALIBRATE, &[0x3F])?;
-        std::thread::sleep(Duration::from_millis(15));
-        self.wait_ready()?;
-
-        // 8. Clear errors and IRQs
+        // 9. Clear IRQs and any errors latched during the above.
         self.write_command(CMD_CLEAR_IRQ, &[0xFF, 0xFF, 0xFF, 0xFF])?;
-        // Clear any device errors latched during cold-start / calibration so
-        // a later check isn't misreading warm-up failures as live errors.
         let _ = self.clear_device_errors();
-
-        // 9. Set packet type to LoRa
-        self.write_command(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA])?;
 
         // Set PA config based on power and frequency band
         self.set_pa_config(config.tx_power, self.band)?;
@@ -927,8 +1018,6 @@ impl LoRaChipset for LR1121 {
             }
             Err(e) => log::warn!("lr1121: could not read device errors: {}", e),
         }
-
-        self.config = Some(config.clone());
 
         log::info!(
             "lr1121: configured band={:?} freq={} Hz bw={} kHz sf={} cr={} power={} dBm tcxo={}v",
