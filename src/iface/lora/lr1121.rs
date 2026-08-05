@@ -81,6 +81,44 @@ const CMD_WRITE_REGMEM32_MASK: u16 = 0x010C;
 // RX boosted mode
 const CMD_SET_RX_BOOSTED: u16 = 0x0227;
 
+// ── Bootloader opcodes (Semtech SWTL001 / lr11xx_bootloader.c) ─────────────
+// These opcodes (0x8000..=0x800D) are only valid when the chip is running
+// in bootloader mode. GetVersion (0x0101) and GetStatus (0x0100) are
+// shared with the system command set and work in both modes.
+//
+// Note: there are TWO Reboot commands in the LR11xx command set with
+// the same `0x03` / `0x00` stay-in-bootloader argument but different
+// opcodes that work in different modes. The system-mode Reboot
+// (0x0118) is what the system firmware uses to reboot the chip and is
+// the only way to enter bootloader from system mode via SPI. The
+// bootloader-mode Reboot (0x8005) is the bootloader's own reboot, only
+// valid when the chip is already in bootloader mode.
+
+const CMD_SYSTEM_REBOOT: u16 = 0x0118;
+const CMD_BL_ERASE_FLASH: u16 = 0x8000;
+const CMD_BL_WRITE_FLASH_ENCRYPTED: u16 = 0x8003;
+const CMD_BL_GET_HASH: u16 = 0x8004;
+const CMD_BL_REBOOT: u16 = 0x8005;
+const CMD_BL_GET_PIN: u16 = 0x800B;
+const CMD_BL_READ_CHIP_EUI: u16 = 0x800C;
+const CMD_BL_READ_JOIN_EUI: u16 = 0x800D;
+
+/// Bootloader flash write chunk size: 64 u32 words = 256 bytes per
+/// WriteFlashEncrypted command. The final chunk may be shorter.
+const BL_FLASH_CHUNK_WORDS: usize = 64;
+
+/// Bootloader version returned by GetVersion (0x0101) when the chip is
+/// running in bootloader mode. Same wire format as the system version:
+/// 4 bytes packed as [hw, type, fw_major, fw_minor]. Per
+/// `lr11xx_bootloader_types.h`, `type` encodes 0x00=LR1110, 0x02=LR1120,
+/// 0x03=LR1121 and `fw` is a big-endian 16-bit major.minor version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlVersion {
+    pub hw: u8,
+    pub typ: u8,
+    pub fw: u16,
+}
+
 // ── Packet types (LR1121 UM §8.1.1) ──────────────────────────────────────
 // 0x00 = None, 0x01 = (G)FSK, 0x02 = LoRa, 0x03 = Sigfox, 0x04 = LR-FHSS
 
@@ -277,6 +315,38 @@ impl LR1121 {
         }
     }
 
+    /// Decode the command-status field of the most recent write
+    /// command and turn failures into an `Err(...)`. Used by the
+    /// bootloader write/erase paths to surface `CMD_FAIL` /
+    /// `CMD_P_ERR` responses — `write_command` itself only logs
+    /// those (it has to, because some read paths rely on the
+    /// non-fatal path), but for write commands a failure means the
+    /// chip rejected the operation and callers want to know.
+    fn check_prev_status(&self, opcode: u16, label: &str) -> Result<(), LoRaError> {
+        let stat1 = match self.prev_status {
+            Some((op, s)) if op == opcode => s,
+            _ => return Ok(()),
+        };
+        match (stat1 >> 1) & 0x07 {
+            0 => Err(LoRaError::Chipset(format!(
+                "lr1121: {label} failed: CMD_FAIL (stat1=0x{stat1:02X}). \
+                 The chip rejected the command — most often because it is \
+                 not in bootloader mode, or because a previous command is \
+                 still being processed (BUSY line not connected, no \
+                 inter-chunk delay)."
+            ))),
+            1 => Err(LoRaError::Chipset(format!(
+                "lr1121: {label} failed: CMD_P_ERR (stat1=0x{stat1:02X}). \
+                 The chip rejected a parameter (offset, length, or arg) — \
+                 check that the offset is in range, the chunk size is \
+                 1..=64 words, and the chip is in bootloader mode."
+            ))),
+            // 2=CMD_OK, 3=CMD_DATA, 6/7=TX_DONE/RX_DONE — all valid successes.
+            _ => Ok(()),
+        }
+    }
+
+
     fn wait_ready(&self) -> Result<(), LoRaError> {
         match &self.busy {
             Some(busy) => {
@@ -294,9 +364,25 @@ impl LR1121 {
             }
             None => {
                 // Without a BUSY pin we must use a safe minimum delay.
-                // 50 ms covers the longest operations (TCXO startup ~10ms,
-                // calibration ~15ms, etc.).
-                std::thread::sleep(std::cmp::max(self.command_delay, Duration::from_millis(50)));
+                // 200 ms covers the worst case for a 64-word (256-byte)
+                // WriteFlashEncrypted chunk: the LR11xx programs 32-byte
+                // internal pages at up to ~30 ms each, so 8 pages + command-
+                // processing overhead is the upper bound. write_command
+                // calls wait_ready twice per chunk (before and after the
+                // SPI transfer), so 2 × 200 ms ≈ 400 ms per chunk.
+                // Override with the LR1121_NO_BUSY_SLEEP_MS env var
+                // (in milliseconds) if your hardware is faster or your
+                // chunks are smaller. The proper fix is to wire BUSY to
+                // a host GPIO and let the poll loop above return as soon
+                // as the chip is actually ready.
+                let ms = std::env::var("LR1121_NO_BUSY_SLEEP_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(200);
+                std::thread::sleep(std::cmp::max(
+                    self.command_delay,
+                    Duration::from_millis(ms),
+                ));
                 Ok(())
             }
         }
@@ -974,6 +1060,265 @@ impl LR1121 {
         if err & ERR_PLL_LOCK != 0 { bits.push("PLL_LOCK_ERR"); }
         if err & ERR_RX_ADC_OFFSET != 0 { bits.push("RX_ADC_OFFSET_ERR"); }
         bits
+    }
+
+    // ── Bootloader commands (LR11xx bootloader 0x8000..=0x800D) ────────────
+    //
+    // These commands are only accepted by the chip when it is running in
+    // bootloader mode. To reach that mode, send a `Reboot(0x8005)` with
+    // `stay_in_bootloader=true` (arg 0x03) and wait for the chip to come
+    // back up — the same physical NSS/BUSY/MISO wiring is used, but the
+    // command set exposed is the bootloader set rather than the radio/
+    // system one. GetVersion (0x0101) and GetStatus (0x0100) are shared
+    // with the system command set and work in both modes.
+    //
+    // Typical update flow (see SWTL001 `lr11xx_bootloader_update.c`):
+    //   1. bl_reboot(true) — chip enters bootloader
+    //   2. bl_get_version() — confirm bootloader is alive and at a
+    //      compatible version
+    //   3. bl_erase_flash() — wipe the existing flash
+    //   4. bl_write_flash_encrypted_full(image) — stream the new image
+    //      in 64-word chunks
+    //   5. bl_reboot(false) — leave bootloader and execute the new FW
+
+    /// Read the bootloader version (GetVersion 0x0101). Same opcode as
+    /// the system version command; the response format is identical.
+    pub fn bl_get_version(&mut self) -> Result<BlVersion, LoRaError> {
+        let data = self.read_command(CMD_GET_VERSION, &[], 4)?;
+        if data.len() < 4 {
+            return Err(LoRaError::Chipset(
+                "bl: GetVersion returned no data".into(),
+            ));
+        }
+        Ok(BlVersion {
+            hw: data[0],
+            typ: data[1],
+            fw: ((data[2] as u16) << 8) | data[3] as u16,
+        })
+    }
+
+    /// Reboot the chip from system mode (Reboot 0x0118). If
+    /// `stay_in_bootloader` is true the chip boots into the bootloader
+    /// (which exposes the firmware-update opcodes) instead of executing
+    /// the application firmware. This is the **only** SPI command that
+    /// can move the chip from system mode into bootloader mode. The
+    /// argument byte is `0x03` for stay-in-bootloader, `0x00` to run
+    /// the application firmware after the reboot.
+    ///
+    /// Note: this is the system-mode Reboot, distinct from
+    /// `bl_reboot` (0x8005) which is the bootloader's own reboot. Both
+    /// use the same `0x03`/`0x00` argument, but each is only accepted
+    /// in its own mode.
+    pub fn system_reboot(&mut self, stay_in_bootloader: bool) -> Result<(), LoRaError> {
+        let arg = if stay_in_bootloader { 0x03 } else { 0x00 };
+        self.write_command(CMD_SYSTEM_REBOOT, &[arg]).map(|_| ())
+    }
+
+    /// Reboot the chip from bootloader mode (Reboot 0x8005). If
+    /// `stay_in_bootloader` is true the chip stays in the bootloader
+    /// after the reboot; otherwise it runs the application firmware.
+    ///
+    /// This is the bootloader-mode Reboot, only valid when the chip is
+    /// already running the bootloader. To **enter** bootloader from
+    /// system mode use `system_reboot` (0x0118) instead.
+    pub fn bl_reboot(&mut self, stay_in_bootloader: bool) -> Result<(), LoRaError> {
+        let arg = if stay_in_bootloader { 0x03 } else { 0x00 };
+        self.write_command(CMD_BL_REBOOT, &[arg]).map(|_| ())
+    }
+
+    /// Reboot the chip using the opcode appropriate to the current
+    /// mode. The chip's mode is read from `stat2` bit 0
+    /// (`is_running_from_flash`): if the application firmware is
+    /// executing, this issues the system Reboot (0x0118); if the
+    /// bootloader is executing, this issues the bootloader's Reboot
+    /// (0x8005). Both opcodes share the same `0x03`/`0x00` argument
+    /// but each is only accepted in its own mode, so issuing the
+    /// wrong one results in a `CMD_P_ERR` (visible as a `WARN` log
+    /// from the SDK and a failed command). Use this method from
+    /// contexts where you don't want to track the mode yourself
+    /// (e.g. generic firmware-update tooling); use `system_reboot`
+    /// or `bl_reboot` directly when you already know which mode the
+    /// chip is in.
+    pub fn reboot(&mut self, stay_in_bootloader: bool) -> Result<(), LoRaError> {
+        let stat2 = self.get_status()?;
+        let running_from_flash = (stat2 & 0x01) != 0;
+        log::trace!(
+            "lr1121: reboot(stay_in_bootloader={stay_in_bootloader}) \
+             in {} mode (stat2=0x{stat2:02X})",
+            if running_from_flash { "system" } else { "bootloader" }
+        );
+        if running_from_flash {
+            self.system_reboot(stay_in_bootloader)
+        } else {
+            self.bl_reboot(stay_in_bootloader)
+        }
+    }
+
+    /// Erase the entire flash (EraseFlash 0x8000). Must be called
+    /// before any WriteFlashEncrypted; the chip returns CMD_FAIL if a
+    /// write is attempted on a non-erased region.
+    pub fn bl_erase_flash(&mut self) -> Result<(), LoRaError> {
+        self.write_command(CMD_BL_ERASE_FLASH, &[])?;
+        self.check_prev_status(CMD_BL_ERASE_FLASH, "EraseFlash")?;
+        // EraseFlash erases the *entire* flash and can take several
+        // seconds. The `write_command` helper only waits the standard
+        // ~200 ms (the no-BUSY fallback), which is way too short for a
+        // full chip erase and would let subsequent `WriteFlashEncrypted`
+        // commands start before the erase actually finishes. Sleep an
+        // additional 10 s here when BUSY isn't wired (the same 10 s
+        // would be a no-op with BUSY since the poll loop in
+        // `wait_ready` would just return immediately). The proper
+        // solution is still to wire BUSY; this is the no-BUSY fallback.
+        if self.busy.is_none() {
+            std::thread::sleep(Duration::from_secs(10));
+        }
+        Ok(())
+    }
+
+    /// Write a single chunk of encrypted flash data
+    /// (WriteFlashEncrypted 0x8003). `data` must contain 1..=`BL_FLASH_CHUNK_WORDS`
+    /// (64) `u32` words. The offset is in bytes from the start of flash
+    /// and must be 256-byte aligned for every chunk except possibly the
+    /// last one.
+    pub fn bl_write_flash_encrypted(
+        &mut self,
+        offset: u32,
+        data: &[u32],
+    ) -> Result<(), LoRaError> {
+        if data.is_empty() || data.len() > BL_FLASH_CHUNK_WORDS {
+            return Err(LoRaError::Chipset(format!(
+                "bl: WriteFlashEncrypted chunk must be 1..={} words, got {}",
+                BL_FLASH_CHUNK_WORDS,
+                data.len()
+            )));
+        }
+        let mut args = Vec::with_capacity(4 + data.len() * 4);
+        args.extend_from_slice(&offset.to_be_bytes());
+        for &word in data {
+            args.extend_from_slice(&word.to_be_bytes());
+        }
+        self.write_command(CMD_BL_WRITE_FLASH_ENCRYPTED, &args)?;
+        self.check_prev_status(
+            CMD_BL_WRITE_FLASH_ENCRYPTED,
+            &format!("WriteFlashEncrypted at offset 0x{offset:08X}"),
+        )
+    }
+
+    /// Write a complete encrypted firmware image to flash, chunking
+    /// internally into 64-word (256-byte) WriteFlashEncrypted commands.
+    /// `data` length in words may be any positive multiple of 1.
+    pub fn bl_write_flash_encrypted_full(
+        &mut self,
+        offset: u32,
+        data: &[u32],
+    ) -> Result<(), LoRaError> {
+        let mut remaining = data;
+        let mut local_offset = offset;
+        while !remaining.is_empty() {
+            let chunk = remaining.len().min(BL_FLASH_CHUNK_WORDS);
+            self.bl_write_flash_encrypted(local_offset, &remaining[..chunk])?;
+            remaining = &remaining[chunk..];
+            local_offset += (chunk as u32) * 4;
+        }
+        Ok(())
+    }
+
+    /// Read the calculated 16-byte SHA-256 (or chip-specific) hash of
+    /// the current flash content (GetHash 0x8004). Used to verify that
+    /// a freshly-written image matches the reference image on the host
+    /// before the bootloader hands control over to it.
+    pub fn bl_get_hash(&mut self) -> Result<[u8; 16], LoRaError> {
+        let data = self.read_command(CMD_BL_GET_HASH, &[], 16)?;
+        if data.len() < 16 {
+            return Err(LoRaError::Chipset(
+                "bl: GetHash short response".into(),
+            ));
+        }
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&data[..16]);
+        // The read_command helper treats the first byte of the
+        // response as stat1 and strips it; check it here too so a
+        // CMD_FAIL / CMD_P_ERR reply doesn't get returned as a
+        // "hash" of garbage bytes. Without this check, callers
+        // (notably `bl_is_in_bootloader`) can incorrectly conclude
+        // that the chip is in bootloader mode when the read actually
+        // failed.
+        if let Some((_, stat1)) = self.prev_status {
+            match (stat1 >> 1) & 0x07 {
+                0 => return Err(LoRaError::Chipset(format!(
+                    "bl: GetHash failed: CMD_FAIL (stat1=0x{stat1:02X})"
+                ))),
+                1 => return Err(LoRaError::Chipset(format!(
+                    "bl: GetHash failed: CMD_P_ERR (stat1=0x{stat1:02X})"
+                ))),
+                _ => {}
+            }
+        }
+        Ok(hash)
+    }
+
+    /// Probe whether the chip is currently running in bootloader mode.
+    ///
+    /// The bootloader's command set (opcodes 0x8000..=0x800D) is not
+    /// recognized by the system firmware, so issuing a bootloader-only
+    /// command and checking the response is a reliable probe. This
+    /// method issues `GetHash` (0x8004) and treats the chip as being
+    /// in bootloader mode if the response looks like a real 16-byte
+    /// hash. In system mode the chip rejects the command, the SPI bus
+    /// is not driven during the response phase, and the host reads
+    /// either all-zeros or all-FF — both distinguishable from a real
+    /// flash-content hash. Returns `false` on any I/O error so callers
+    /// can use this as a single pre-flight check.
+    pub fn bl_is_in_bootloader(&mut self) -> bool {
+        match self.bl_get_hash() {
+            Ok(hash) => {
+                let all_zero = hash.iter().all(|&b| b == 0x00);
+                let all_ff = hash.iter().all(|&b| b == 0xFF);
+                !(all_zero || all_ff)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Read the 4-byte device PIN (GetPin 0x800B). Returned as a fixed
+    /// `[u8; 4]`; the encoding is chip-specific and host code is expected
+    /// to format it as needed.
+    pub fn bl_read_pin(&mut self) -> Result<[u8; 4], LoRaError> {
+        let data = self.read_command(CMD_BL_GET_PIN, &[], 4)?;
+        if data.len() < 4 {
+            return Err(LoRaError::Chipset(
+                "bl: GetPin short response".into(),
+            ));
+        }
+        let mut pin = [0u8; 4];
+        pin.copy_from_slice(&data[..4]);
+        Ok(pin)
+    }
+
+    /// Read the 8-byte chip EUI (ReadChipEui 0x800C).
+    pub fn bl_read_chip_eui(&mut self) -> Result<[u8; 8], LoRaError> {
+        let data = self.read_command(CMD_BL_READ_CHIP_EUI, &[], 8)?;
+        if data.len() < 8 {
+            return Err(LoRaError::Chipset(
+                "bl: ReadChipEui short response".into(),
+            ));
+        }
+        let mut eui = [0u8; 8];
+        eui.copy_from_slice(&data[..8]);
+        Ok(eui)
+    }
+
+    /// Read the 8-byte join EUI (ReadJoinEui 0x800D).
+    pub fn bl_read_join_eui(&mut self) -> Result<[u8; 8], LoRaError> {
+        let data = self.read_command(CMD_BL_READ_JOIN_EUI, &[], 8)?;
+        if data.len() < 8 {
+            return Err(LoRaError::Chipset(
+                "bl: ReadJoinEui short response".into(),
+            ));
+        }
+        let mut eui = [0u8; 8];
+        eui.copy_from_slice(&data[..8]);
+        Ok(eui)
     }
 
 }
