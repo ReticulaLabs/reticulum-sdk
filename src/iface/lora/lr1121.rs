@@ -463,6 +463,39 @@ impl LR1121 {
         ))
     }
 
+    /// Ensure the chip is awake in STBY_RC without ever putting it to sleep.
+    /// NSS falling edges wake a sleeping chip and trigger a cold restart into
+    /// STBY_RC (LR1121 UM §2.1.9); on an already-awake chip they are harmless
+    /// no-ops. Polls with repeated edges up to a bounded budget.
+    ///
+    /// This is what `init` uses instead of `software_cold_start`: putting the
+    /// chip into Powerdown and waking it via NSS is unreliable on boards whose
+    /// TCXO is marginal (a stalled post-wake restart strands the chip in SLEEP
+    /// and only a physical NRESET recovers it), and a warm restart plus the
+    /// normal init sequence's `clear_device_errors` achieves the same clean
+    /// slate without that risk.
+    fn wake_to_standby_rc(&mut self) -> Result<(), LoRaError> {
+        // If the chip is awake this moves it to STBY_RC instantly; if it is
+        // asleep the command's NSS falling edge is the wake trigger (the
+        // command itself is ignored until the restart completes).
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC]).map(|_| ())?;
+        std::thread::sleep(Duration::from_millis(10));
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        while Instant::now() < deadline {
+            if let Ok(mode) = self.get_chip_mode() {
+                if mode == CHIP_MODE_STBY_RC {
+                    log::debug!("lr1121: awake in STBY_RC");
+                    return Ok(());
+                }
+            }
+            self.spi.xfer(&[0x00, 0x00], &mut [0u8; 2])?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(LoRaError::Chipset(
+            "lr1121: chip did not reach STBY_RC; NRESET required".into(),
+        ))
+    }
+
     /// POR-equivalent software reset via SetSleep cold start.
     ///
     /// The LR1121 has no SPI reset command and the NRST pin may not be wired
@@ -472,36 +505,76 @@ impl LR1121 {
     /// mode and waking the device by dropping NSS performs a full restart
     /// into STBY_RC (LR1121 UM §2.1.9; ResetStatus afterwards reads "Wakeup
     /// NSS toggling"). The sleep/wake cycle is verified by `probe_sleep`.
+    ///
+    /// NOTE: `init` does NOT call this. A failed wake leaves the chip in
+    /// Powerdown (all-0xFF reads, ~0 µA draw) that only a physical NRESET can
+    /// recover, and the wake is unreliable on boards with a marginal TCXO. Use
+    /// `wake_to_standby_rc` for normal operation and reserve this for explicit
+    /// sleep testing (e.g. `probe_sleep`) where the NRESET risk is accepted.
     pub fn software_cold_start(&mut self) -> Result<(), LoRaError> {
-        // SetSleep is only accepted from STDBY.
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
-        std::thread::sleep(Duration::from_millis(5));
+        // Retry the whole sleep/wake cycle a few times. The post-wake cold
+        // restart is ~30ms typical (LR11xx UM §2.1.9) but can stall far
+        // longer on a marginal board (e.g. a TCXO that never starts leaves
+        // the boot in limbo), so each cycle polls with repeated NSS wake
+        // edges up to a bounded budget, and a fresh cycle re-arms the wake
+        // with a brand-new SetStandby -> SetSleep -> NSS edge sequence.
+        for attempt in 0..3 {
+            // SetSleep is only accepted from STDBY.
+            self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
+            std::thread::sleep(Duration::from_millis(5));
 
-        // SleepConfig = 0x00: RTC wakeup disabled, cold start (no retention).
-        // sleep_time = 0: NSS falling edge is the wake-up trigger. BUSY stays
-        // asserted for the whole sleep period, so we don't wait on it here.
-        let args = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        self.spi.xfer(
-            &[(CMD_SET_SLEEP >> 8) as u8, CMD_SET_SLEEP as u8, args[0], args[1], args[2], args[3], args[4], args[5]],
-            &mut [0u8; 8],
-        )?;
-        std::thread::sleep(Duration::from_millis(50));
+            // SleepConfig = 0x00: RTC wakeup disabled, cold start (no
+            // retention). sleep_time = 0: NSS falling edge is the wake-up
+            // trigger. BUSY stays asserted for the whole sleep period, so we
+            // don't wait on it here.
+            let args = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            self.spi.xfer(
+                &[(CMD_SET_SLEEP >> 8) as u8, CMD_SET_SLEEP as u8, args[0], args[1], args[2], args[3], args[4], args[5]],
+                &mut [0u8; 8],
+            )?;
+            std::thread::sleep(Duration::from_millis(50));
 
-        // NSS falling edge wakes the device; the dummy read is the trigger.
-        // After waking it boots cold into STBY_RC.
-        self.spi.xfer(&[0x00, 0x00], &mut [0u8; 2])?;
-        self.wait_ready()?;
-        std::thread::sleep(Duration::from_millis(10));
+            // NSS falling edge wakes the device; each dummy read is a wake
+            // trigger. After waking it boots cold into STBY_RC.
+            let deadline = Instant::now() + Duration::from_millis(3000);
+            while Instant::now() < deadline {
+                self.spi.xfer(&[0x00, 0x00], &mut [0u8; 2])?;
+                std::thread::sleep(Duration::from_millis(20));
+                if let Ok(mode) = self.get_chip_mode() {
+                    if mode == CHIP_MODE_STBY_RC {
+                        log::debug!(
+                            "lr1121: software cold-start OK (mode={mode}, attempt={attempt})"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            log::warn!("lr1121: software cold-start wake attempt {attempt} timed out");
+        }
 
-        // Verify the chip is back in STBY_RC.
-        let mode = self.get_chip_mode()?;
-        if mode != CHIP_MODE_STBY_RC {
+        // The wake never completed. Never leave the chip in SLEEP if we can
+        // avoid it: fall back to a hardware reset when a reset line is wired
+        // (clean POR-equivalent boot into STBY_RC). Otherwise the chip stays
+        // in Powerdown and needs a physical NRESET to come back.
+        if self.reset.is_some() {
+            log::warn!("lr1121: NSS wake timed out, falling back to hardware reset");
+            self.hardware_reset()?;
+            self.wait_ready()?;
+            std::thread::sleep(Duration::from_millis(10));
+            let mode = self.get_chip_mode()?;
+            if mode == CHIP_MODE_STBY_RC {
+                log::debug!("lr1121: hardware reset OK (mode={mode})");
+                return Ok(());
+            }
             return Err(LoRaError::Chipset(format!(
-                "software cold-start: chip not in STBY_RC after wake (mode={mode})"
+                "software cold-start: chip not in STBY_RC after hardware reset (mode={mode})"
             )));
         }
-        log::debug!("lr1121: software cold-start OK (mode={mode})");
-        Ok(())
+
+        Err(LoRaError::Chipset(
+            "software cold-start: chip did not wake into STBY_RC after SetSleep; NRESET required"
+                .into(),
+        ))
     }
 
     /// Probe whether SetSleep actually puts the chip into SLEEP. A genuinely
@@ -852,7 +925,12 @@ impl LoRaChipset for LR1121 {
         self.band = FrequencyBand::from_freq(config.frequency);
 
         self.hardware_reset()?;
-        self.software_cold_start()?;
+        // Warm restart only: never SetSleep the chip here. A failed NSS-wake
+        // from Powerdown strands it in SLEEP (all-0xFF, only physical NRESET
+        // recovers), and the wake is unreliable on boards with a marginal
+        // TCXO. `wake_to_standby_rc` just forces the chip to STBY_RC and the
+        // sequence below clears any latched errors.
+        self.wake_to_standby_rc()?;
         self.wait_ready()?;
         std::thread::sleep(Duration::from_millis(10));
         log::trace!("lr1121: post-reset, starting init sequence");
