@@ -163,6 +163,29 @@ fn lora_bandwidth_code_subghz(bw_hz: u32) -> u8 {
     }
 }
 
+/// Map a TCXO supply voltage (volts) to the 4-bit LR11xx code. Codes
+/// follow `lr11xx_system_tcxo_supply_voltage_t`: 1.6V=0x00, 1.7V=0x01,
+/// 1.8V=0x02, 2.2V=0x03, 2.4V=0x04, 2.7V=0x05, 3.0V=0x06, 3.3V=0x07.
+fn tcxo_voltage_code(voltage_v: f64) -> u8 {
+    if voltage_v >= 1.6 && voltage_v < 1.7 {
+        0x00
+    } else if voltage_v < 1.8 {
+        0x01
+    } else if voltage_v < 2.2 {
+        0x02
+    } else if voltage_v < 2.4 {
+        0x03
+    } else if voltage_v < 2.7 {
+        0x04
+    } else if voltage_v < 3.0 {
+        0x05
+    } else if voltage_v < 3.3 {
+        0x06
+    } else {
+        0x07
+    }
+}
+
 fn lora_bandwidth_code_2p4g(bw_hz: u32) -> u8 {
     match bw_hz {
         x if x <= 206_000 => 0x0D, // 203.125 kHz
@@ -692,6 +715,57 @@ impl LR1121 {
         Ok(())
     }
 
+    /// Read the chip identity via GetVersion (0x0101). Returns the packed
+    /// 4 bytes: [hw_revision, type, fw_major, fw_minor]. Use this to
+    /// confirm which LR11xx die is fitted (e.g. LR1110 vs LR1120/LR1121),
+    /// since the SPI protocol differs subtly between variants.
+    pub fn get_chip_version(&mut self) -> Result<u32, LoRaError> {
+        let data = self.read_command(CMD_GET_VERSION, &[], 4)?;
+        if data.len() < 4 {
+            return Err(LoRaError::Chipset(
+                "lr1121: GetVersion returned no data".into(),
+            ));
+        }
+        Ok((data[0] as u32) << 24
+            | (data[1] as u32) << 16
+            | (data[2] as u32) << 8
+            | data[3] as u32)
+    }
+
+    /// Configure the TCXO (SetTcxoMode, 0x0117): DIO3 sources the TCXO
+    /// supply at `voltage_v` while the firmware starts the 32 MHz reference.
+    /// `startup_delay` is the timeout the firmware waits for the TCXO to
+    /// oscillate, in 30.52µs steps (WaveShare default ~9.2ms = 300 steps).
+    ///
+    /// This is a public knob for diagnostics: a working TCXO module only
+    /// starts its reference clock when this command has been accepted
+    /// (DIO3 becomes live at the selected voltage). If the XO gate still
+    /// fails after this, measure DIO3 with a multimeter — 0V here means the
+    /// TCXO was never powered (software/harness), ~3.0V means the clock
+    /// path itself is the problem.
+    pub fn set_tcxo_mode(&mut self, voltage_v: f64, startup_delay: Duration) -> Result<(), LoRaError> {
+        let code = tcxo_voltage_code(voltage_v);
+        // TCXO startup timeout is 24 bits in 30.52µs steps. Honour the
+        // caller's delay (clamped to a sane window); the WaveShare default
+        // of 9.2ms corresponds to ~300 steps.
+        let delay: u32 = (startup_delay
+            .as_micros()
+            .saturating_div(30)
+            .min(0xFF_FFFF) as u32)
+            .max(1);
+        self.write_command(CMD_SET_TXCO_MODE, &[
+            code,
+            (delay >> 16) as u8,
+            (delay >> 8) as u8,
+            delay as u8,
+        ])?;
+        std::thread::sleep(Duration::from_millis(15));
+        log::info!(
+            "lr1121: SetTcxoMode accepted (v={voltage_v}V code=0x{code:02X}, timeout={startup_delay:?} = {delay} steps) — DIO3 should now be sourcing ~{voltage_v}V"
+        );
+        Ok(())
+    }
+
     fn set_rf_frequency(&mut self, freq_hz: u64) -> Result<(), LoRaError> {
         // Frequency in Hz directly (matches Semtech lr11xx_radio_set_rf_freq)
         let args = [
@@ -979,31 +1053,10 @@ impl LoRaChipset for LR1121 {
 
         // 4. Configure TCXO — Core1121-HF uses 3.0V (code 0x06).
         //    Follow the user's voltage if set, otherwise default to 3.0V.
-        let tcxo_v = config.tcxo_voltage.unwrap_or(3.0);
-        let code = if tcxo_v >= 1.6 && tcxo_v < 1.7 { 0x00 }
-            else if tcxo_v < 1.8 { 0x01 }
-            else if tcxo_v < 2.2 { 0x02 }
-            else if tcxo_v < 2.4 { 0x03 }
-            else if tcxo_v < 2.7 { 0x04 }
-            else if tcxo_v < 3.0 { 0x05 }
-            else if tcxo_v < 3.3 { 0x06 }
-            else { 0x07 };
-        // TCXO startup timeout is 24 bits in 30.52µs steps. Honour the
-        // caller's `tcxo_startup_delay` (clamped to a sane window); the
-        // WaveShare default of 9.2ms corresponds to ~300 steps.
-        let delay: u32 = (config
-            .tcxo_startup_delay
-            .as_micros()
-            .saturating_div(30)
-            .min(0xFF_FFFF) as u32)
-            .max(1);
-        self.write_command(CMD_SET_TXCO_MODE, &[
-            code,
-            (delay >> 16) as u8,
-            (delay >> 8) as u8,
-            delay as u8,
-        ])?;
-        std::thread::sleep(Duration::from_millis(15));
+        self.set_tcxo_mode(
+            config.tcxo_voltage.unwrap_or(3.0),
+            config.tcxo_startup_delay,
+        )?;
 
         // 5. Configure the low-frequency clock. The Core1121-HF module has a
         //    32.768 kHz crystal on DIO10/32k_N and DIO11/32k_P, so use the
