@@ -162,9 +162,38 @@ pub struct SX1262 {
 
 impl SX1262 {
     fn wait_ready(&self) -> Result<(), LoRaError> {
+        // Default wait covers a normal radio command (~10ms typical). Use
+        // `wait_ready_with_max_busy` for long-running operations like
+        // SetStandby(XOSC) (BUSY held for the configured TCXO startup delay,
+        // hundreds of ms by default) and Calibrate(0x7F) (~400ms), which the
+        // plain `command_delay` fallback does not cover.
+        self.wait_ready_with_max_busy(Duration::from_millis(200))
+    }
+
+    /// Wait for the chip to be ready to accept the next command, bounded by
+    /// `max_busy`. `max_busy` is the expected worst-case time the chip will
+    /// spend in BUSY for the previous (or about-to-issue) command:
+    ///
+    ///   * Normal radio command: ~10 ms typical, ~50 ms worst case.
+    ///   * Calibrate(0x7F, all blocks): up to ~400 ms.
+    ///   * CalibrateImage: up to ~320 ms (also gated by the DIO3 TCXO ramp).
+    ///   * SetStandby(XOSC): up to the configured `tcxo_startup_delay`
+    ///     (default 320 ms, can be several seconds). The 32 MHz reference
+    ///     is only declared stable after this window; if it's not
+    ///     oscillating the chip latches XOSC_START_ERR.
+    ///
+    /// With a wired BUSY pin the poll loop returns as soon as the chip
+    /// de-asserts BUSY, so the deadline is just a safety bound. Without a
+    /// BUSY pin we must sleep a safe minimum: the caller's `max_busy`
+    /// (floored at 200 ms) so a command sent while the chip is still BUSY
+    /// is not silently dropped — the common cause of "SetTx dropped after
+    /// SetStandby(XOSC)" on boards without a wired BUSY line. The
+    /// SX1262_NO_BUSY_SLEEP_MS env var hard-overrides for users who know
+    /// their hardware is faster (or slower).
+    fn wait_ready_with_max_busy(&self, max_busy: Duration) -> Result<(), LoRaError> {
         match &self.busy {
             Some(busy) => {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + max_busy;
                 while Instant::now() < deadline {
                     let val = busy
                         .get_value()
@@ -177,10 +206,36 @@ impl SX1262 {
                 Err(LoRaError::Timeout)
             }
             None => {
-                std::thread::sleep(self.command_delay);
+                let ms = std::env::var("SX1262_NO_BUSY_SLEEP_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or_else(|| max_busy.as_millis().max(200) as u64);
+                std::thread::sleep(std::cmp::max(
+                    self.command_delay,
+                    Duration::from_millis(ms),
+                ));
                 Ok(())
             }
         }
+    }
+
+    /// Max busy time the chip can spend on `SetStandby(XOSC)` — the
+    /// configured `tcxo_startup_delay` plus a 100 ms margin to absorb
+    /// SPI/IO jitter. Falls back to 420 ms if no config is loaded (e.g.
+    /// before `init()`), which is enough for the default 320 ms TCXO
+    /// startup with margin.
+    fn xosc_max_busy(&self) -> Duration {
+        self.config
+            .as_ref()
+            .map(|c| c.tcxo_startup_delay + Duration::from_millis(100))
+            .unwrap_or(Duration::from_millis(420))
+    }
+
+    /// Max busy time for `Calibrate(0x7F)` / `CalibrateImage`, whose BUSY
+    /// window is gated by the DIO3 TCXO ramp (~320 ms) on top of the
+    /// per-block calibration time.
+    fn calibrate_max_busy(&self) -> Duration {
+        Duration::from_millis(600)
     }
 
     /// POR-equivalent software reset via SetSleep (0x84, cold start).
@@ -267,7 +322,10 @@ impl SX1262 {
         self.write_register(REG_LORA_SYNC_WORD_MSB, &[0xAB, 0x24])
     }
 
-    fn hardware_reset(&mut self) -> Result<(), LoRaError> {
+    /// Hardware reset via the NRESET pin (no-op if reset is not wired).
+    /// Public so callers can put the chip into a known state without
+    /// running the full `init` sequence.
+    pub fn hardware_reset(&mut self) -> Result<(), LoRaError> {
         match &self.reset {
             Some(reset) => {
                 reset.set_value(true)
@@ -288,7 +346,18 @@ impl SX1262 {
     }
 
     fn write_command(&mut self, opcode: u8, args: &[u8]) -> Result<(), LoRaError> {
-        self.wait_ready()?;
+        self.write_command_with_max_busy(opcode, args, Duration::from_millis(200))
+    }
+
+    /// Write command with an explicit BUSY budget. See
+    /// `wait_ready_with_max_busy` for guidance on choosing `max_busy`.
+    fn write_command_with_max_busy(
+        &mut self,
+        opcode: u8,
+        args: &[u8],
+        max_busy: Duration,
+    ) -> Result<(), LoRaError> {
+        self.wait_ready_with_max_busy(max_busy)?;
         let tx = {
             let mut buf = vec![opcode];
             buf.extend_from_slice(args);
@@ -300,7 +369,7 @@ impl SX1262 {
             "sx1262: cmd 0x{opcode:02X} resp status=0x{:02X}",
             rx.first().copied().unwrap_or(0xFF)
         );
-        self.wait_ready()?;
+        self.wait_ready_with_max_busy(max_busy)?;
         Ok(())
     }
 
@@ -502,8 +571,14 @@ impl SX1262 {
         // Put in STDBY_RC before calibration (XO must be stopped)
         self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
 
-        // Calibrate RC64k, RC13M, PLL, ADC and image
-        self.write_command(CMD_CALIBRATE, &[MASK_CALIBRATE_ALL])?;
+        // Calibrate RC64k, RC13M, PLL, ADC and image. Holds BUSY for the
+        // whole window (gated by the DIO3 TCXO ramp when configured), so
+        // it needs the full calibrate budget even with a wired BUSY line.
+        self.write_command_with_max_busy(
+            CMD_CALIBRATE,
+            &[MASK_CALIBRATE_ALL],
+            self.calibrate_max_busy(),
+        )?;
 
         std::thread::sleep(Duration::from_millis(5));
         self.wait_ready()?;
@@ -512,8 +587,13 @@ impl SX1262 {
 
     fn calibrate_image(&mut self, freq_hz: u64) -> Result<(), LoRaError> {
         let (f1, f2) = calibrate_image_bands(freq_hz);
-        // SX1262 CalibrateImage takes 2 bytes: frequency band start and end
-        self.write_command(CMD_CALIBRATE_IMAGE, &[f1, f2])
+        // SX1262 CalibrateImage takes 2 bytes: frequency band start and end.
+        // Also gated by the TCXO ramp on some boards, so use the full budget.
+        self.write_command_with_max_busy(
+            CMD_CALIBRATE_IMAGE,
+            &[f1, f2],
+            self.calibrate_max_busy(),
+        )
     }
 
     fn clear_irq_status(&mut self, mask: u16) -> Result<(), LoRaError> {
@@ -657,8 +737,12 @@ impl SX1262 {
 
     /// Explicitly enter STDBY_XOSC so the host can verify the XO actually
     /// starts (diagnostic helper; status is visible on the next read).
+    /// Uses the configured `tcxo_startup_delay` as the BUSY budget so the
+    /// chip has time to attempt the XOSC startup before we report a status
+    /// (otherwise the post-wait returns while BUSY is still asserted and
+    /// the next command is silently dropped).
     pub fn set_standby_xosc(&mut self) -> Result<(), LoRaError> {
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])
+        self.write_command_with_max_busy(CMD_SET_STANDBY, &[STANDBY_XOSC], self.xosc_max_busy())
     }
 
     /// Read the raw status byte (GetStatus, 0xC0). Chip-mode field (bits
@@ -694,8 +778,13 @@ impl SX1262 {
         startup_delay: Duration,
     ) -> Result<(), LoRaError> {
         let timeout = startup_delay + Duration::from_millis(100);
+        let max_busy = startup_delay + Duration::from_millis(100);
         for attempt in 0..4 {
-            self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
+            self.write_command_with_max_busy(
+                CMD_SET_STANDBY,
+                &[STANDBY_XOSC],
+                max_busy,
+            )?;
             if self.wait_for_standby_xosc(timeout)? {
                 let _ = self.clear_device_errors();
                 return Ok(());
