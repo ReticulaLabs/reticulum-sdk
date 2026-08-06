@@ -682,10 +682,14 @@ impl SX1262 {
         self.write_register(REG_TX_CLAMP_CONFIG, &[val | 0x1E])
     }
 
-    /// Errata 2.7: IQ polarity must be configured through register 0x0736
+    /// Datasheet §15.4 ("Optimizing the Inverted IQ Operation"): bit 2 of
+    /// register 0x0736 must be set to "1" when using standard IQ polarity and
+    /// "0" when using inverted IQ polarity, and SetPacketParams silently
+    /// resets it. Without re-applying it after every SetPacketParams, RX
+    /// demodulation fails silently while TX still works.
     fn fix_inverted_iq(&mut self, invert: bool) -> Result<(), LoRaError> {
         let val = self.read_register(REG_IQ_POLARITY_SETUP)?;
-        let new_val = if invert { val | 0x04 } else { val & 0xFB };
+        let new_val = if invert { val & 0xFB } else { val | 0x04 };
         self.write_register(REG_IQ_POLARITY_SETUP, &[new_val])
     }
 
