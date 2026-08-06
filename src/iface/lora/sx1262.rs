@@ -203,6 +203,7 @@ impl SX1262 {
                     }
                     std::thread::sleep(Duration::from_micros(500));
                 }
+                log::warn!("sx1262: BUSY still asserted after {max_busy:?}");
                 Err(LoRaError::Timeout)
             }
             None => {
@@ -236,6 +237,43 @@ impl SX1262 {
     /// per-block calibration time.
     fn calibrate_max_busy(&self) -> Duration {
         Duration::from_millis(600)
+    }
+
+    /// Estimate the worst-case on-air time (seconds) for a `payload_len`
+    /// byte packet under the current link config, using the standard LoRa
+    /// packet time formula. Used to size the TX window budget: the chip
+    /// does not assert BUSY during the RF transmission itself (BUSY is
+    /// low for the whole TX, measured ~78 ms for a 28-byte packet at
+    /// SF8/BW250), so TX completion must be confirmed via the TX_DONE IRQ
+    /// within a window that covers the full packet airtime.
+    fn estimate_airtime(&self, payload_len: usize) -> f64 {
+        let Some(cfg) = &self.config else {
+            return 0.0;
+        };
+        let bw_hz = cfg.bandwidth.max(1.0);
+        let sf = cfg.spreading_factor.clamp(7, 12) as u64;
+        let cr = cfg.coding_rate.max(4) as f64;
+        let crc = if cfg.crc_enabled { 1.0 } else { 0.0 };
+        let ih = if cfg.implicit_header { 1.0 } else { 0.0 };
+        // Low-data-rate optimization applies when the symbol time would
+        // exceed ~16 ms (SF11/SF12 at 125 kHz).
+        let de = if sf >= 11 && bw_hz <= 125_000.0 { 1.0 } else { 0.0 };
+        let symbol_time = ((1u64 << sf) as f64) / bw_hz;
+        let n_preamble = cfg.preamble_length as f64 + 4.25;
+        let numerator = 8.0 * payload_len as f64 - 4.0 * sf as f64 + 28.0 + 16.0 * crc - 20.0 * ih;
+        let denominator = 4.0 * (sf as f64 - 2.0 * de);
+        let n_payload = 8.0 + (numerator / denominator).ceil().max(0.0) * cr;
+        (n_preamble + n_payload) * symbol_time
+    }
+
+    /// Max window for CMD_SET_TX completion: estimated on-air time plus a
+    /// 2 s margin, floored at 1 s. Used by the no-BUSY sleep path so the
+    /// post-SetTx wait covers the whole packet (a long SF12/BW125 packet
+    /// can exceed the 500 ms TX_DONE poll deadline on its own), and as a
+    /// generous upper bound for the wired-BUSY poll.
+    fn tx_max_busy(&self, payload_len: usize) -> Duration {
+        Duration::from_millis((self.estimate_airtime(payload_len) * 1000.0) as u64 + 2000)
+            .max(Duration::from_secs(1))
     }
 
     /// POR-equivalent software reset via SetSleep (0x84, cold start).
@@ -990,13 +1028,25 @@ impl LoRaChipset for SX1262 {
         // BW500 workaround for TX
         self.fix_lora_bw500(cfg.bandwidth as u32)?;
 
-        // Trigger TX with no timeout
-        self.write_command(CMD_SET_TX, &[0x00, 0x00, 0x00])?;
+        // Trigger TX with no timeout. BUSY is low during the RF
+        // transmission itself (verified by capture), so this wait only needs
+        // to cover SetTx command processing and the PLL/XO ramp; the
+        // `tx_budget` wait additionally absorbs the full airtime on the
+        // no-BUSY sleep path so the TX_DONE poll below never starts while
+        // the packet is still on air. The pre-wait uses the short default
+        // since the chip is in standby here.
+        let tx_budget = self.tx_max_busy(payload.len());
+        self.wait_ready()?;
+        self.spi
+            .xfer(&[CMD_SET_TX, 0x00, 0x00, 0x00], &mut [0u8; 4])?;
+        self.wait_ready_with_max_busy(tx_budget)?;
         let st_after_tx = self.get_status().unwrap_or(0x00);
-        log::debug!("sx1262: status right after CMD_SET_TX = 0x{st_after_tx:02X}");
+        log::debug!("sx1262: status after CMD_SET_TX = 0x{st_after_tx:02X}");
 
-        // Poll briefly for TX_DONE without BUSY; the chip may silently
-        // reject CMD_SET_TX if the PA config, PLL or frequency is invalid.
+        // Confirm TX_DONE. By now the chip has left the TX window (BUSY
+        // released or the airtime sleep elapsed), so the IRQ read is not
+        // dropped; the bounded retry loop is a safety net against the chip
+        // silently rejecting CMD_SET_TX (bad PA config, PLL or frequency).
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut tx_ok = false;
         while Instant::now() < deadline {
@@ -1054,8 +1104,16 @@ impl LoRaChipset for SX1262 {
         // RX timeout workaround
         self.fix_rx_timeout()?;
 
-        // Enter continuous RX
-        self.write_command(CMD_SET_RX, &[0xFF, 0xFF, 0xFF])?;
+        // Enter continuous RX. RX entry from STBY_RC re-starts the 32 MHz
+        // XO, and the chip holds BUSY for the full configured TCXO startup
+        // window (measured ~311 ms on this hardware vs the 320 ms delay).
+        // The short 200 ms default `wait_ready` budget times out here, so
+        // use the XOSC budget.
+        self.write_command_with_max_busy(
+            CMD_SET_RX,
+            &[0xFF, 0xFF, 0xFF],
+            self.xosc_max_busy(),
+        )?;
 
         self.rx_active = true;
         self.tx_active = false;
