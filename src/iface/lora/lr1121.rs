@@ -348,9 +348,38 @@ impl LR1121 {
 
 
     fn wait_ready(&self) -> Result<(), LoRaError> {
+        // Default wait covers a normal radio command (~10ms typical) plus
+        // the WriteFlashEncrypted per-chunk budget (see below). Use
+        // `wait_ready_with_max_busy` for long-running operations like the
+        // XOSC startup, where the chip can hold BUSY for the configured
+        // TCXO startup delay (hundreds of ms by default, up to seconds).
+        self.wait_ready_with_max_busy(Duration::from_millis(200))
+    }
+
+    /// Wait for the chip to be ready to accept the next command, bounded by
+    /// `max_busy`. `max_busy` is the expected worst-case time the chip will
+    /// spend in BUSY for the previous (or about-to-issue) command:
+    ///
+    ///   * Normal radio command: ~10 ms typical, ~50 ms worst case.
+    ///   * Calibrate(0x3F): ~10–30 ms.
+    ///   * SetStandby(XOSC): up to the configured `tcxo_startup_delay`
+    ///     (default 320 ms, can be several seconds). The 32 MHz reference
+    ///     is only declared stable after this window; if it's not
+    ///     oscillating the chip latches HF_XOSC_START_ERR.
+    ///   * WriteFlashEncrypted: 30 ms per 32-byte internal page (handled
+    ///     separately by the bootloader path).
+    ///
+    /// The default 200 ms covers normal commands plus a WriteFlashEncrypted
+    /// chunk (~2 × 200 ms ≈ 400 ms per chunk). For `SetStandby(XOSC)` the
+    /// caller MUST pass the configured TCXO startup delay — otherwise the
+    /// next command is sent while the chip is still BUSY and is silently
+    /// dropped (MISO returns garbage, command appears to fail with
+    /// CMD_FAIL). This is the common cause of "SetTx dropped after
+    /// SetStandby(XOSC)" on boards without a wired BUSY line.
+    fn wait_ready_with_max_busy(&self, max_busy: Duration) -> Result<(), LoRaError> {
         match &self.busy {
             Some(busy) => {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + max_busy;
                 while Instant::now() < deadline {
                     let val = busy
                         .get_value()
@@ -364,21 +393,26 @@ impl LR1121 {
             }
             None => {
                 // Without a BUSY pin we must use a safe minimum delay.
-                // 200 ms covers the worst case for a 64-word (256-byte)
-                // WriteFlashEncrypted chunk: the LR11xx programs 32-byte
-                // internal pages at up to ~30 ms each, so 8 pages + command-
-                // processing overhead is the upper bound. write_command
-                // calls wait_ready twice per chunk (before and after the
-                // SPI transfer), so 2 × 200 ms ≈ 400 ms per chunk.
-                // Override with the LR1121_NO_BUSY_SLEEP_MS env var
-                // (in milliseconds) if your hardware is faster or your
-                // chunks are smaller. The proper fix is to wire BUSY to
-                // a host GPIO and let the poll loop above return as soon
-                // as the chip is actually ready.
+                // The 200 ms default covers the worst case for a 64-word
+                // (256-byte) WriteFlashEncrypted chunk: the LR11xx programs
+                // 32-byte internal pages at up to ~30 ms each, so 8 pages +
+                // command-processing overhead is the upper bound.
+                // write_command calls wait_ready twice per chunk (before
+                // and after the SPI transfer), so 2 × 200 ms ≈ 400 ms per
+                // chunk.
+                //
+                // For longer operations (notably SetStandby(XOSC) whose
+                // BUSY window is the configured tcxo_startup_delay) the
+                // caller's `max_busy` overrides this floor. The
+                // LR1121_NO_BUSY_SLEEP_MS env var still hard-overrides for
+                // users who know their hardware is faster (or slower).
+                // The proper fix is to wire BUSY to a host GPIO and let
+                // the poll loop above return as soon as the chip is
+                // actually ready.
                 let ms = std::env::var("LR1121_NO_BUSY_SLEEP_MS")
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(200);
+                    .unwrap_or_else(|| max_busy.as_millis().max(200) as u64);
                 std::thread::sleep(std::cmp::max(
                     self.command_delay,
                     Duration::from_millis(ms),
@@ -388,7 +422,23 @@ impl LR1121 {
         }
     }
 
-    fn hardware_reset(&mut self) -> Result<(), LoRaError> {
+    /// Max busy time the chip can spend on `SetStandby(XOSC)` — the
+    /// configured `tcxo_startup_delay` plus a 100 ms margin to absorb
+    /// SPI/IO jitter. Falls back to 420 ms if no config is loaded (e.g.
+    /// before `init()`), which is enough for the default 320 ms TCXO
+    /// startup with margin.
+    fn xosc_max_busy(&self) -> Duration {
+        self.config
+            .as_ref()
+            .map(|c| c.tcxo_startup_delay + Duration::from_millis(100))
+            .unwrap_or(Duration::from_millis(420))
+    }
+
+    /// Hardware reset via the NRESET pin (no-op if reset is not wired).
+    /// Public so callers can put the chip into a known state without
+    /// running the full `init` sequence (which would try to start the
+    /// XOSC and fail with HF_XOSC_START_ERR on a broken TCXO).
+    pub fn hardware_reset(&mut self) -> Result<(), LoRaError> {
         match &self.reset {
             Some(reset) => {
                 reset.set_value(true)
@@ -410,13 +460,33 @@ impl LR1121 {
 
     /// Write command: send 16-bit opcode + args.
     /// Returns the 32-bit IrqStatus embedded in the response.
+    ///
+    /// Uses the default 200 ms BUSY wait, which is the worst case for a
+    /// normal radio command or a 64-word WriteFlashEncrypted chunk. For
+    /// long-running operations — specifically `SetStandby(XOSC)` whose
+    /// BUSY window is the configured `tcxo_startup_delay` — callers
+    /// must use `write_command_with_max_busy` with the XOSC budget,
+    /// otherwise the post-wait returns while the chip is still BUSY and
+    /// the next command is silently dropped.
     fn write_command(&mut self, opcode: u16, args: &[u8]) -> Result<u32, LoRaError> {
-        self.wait_ready()?;
+        self.write_command_with_max_busy(opcode, args, Duration::from_millis(200))
+    }
+
+    /// Write command with an explicit BUSY budget. See
+    /// `wait_ready_with_max_busy` for guidance on choosing `max_busy`.
+    /// Returns the 32-bit IrqStatus embedded in the response.
+    fn write_command_with_max_busy(
+        &mut self,
+        opcode: u16,
+        args: &[u8],
+        max_busy: Duration,
+    ) -> Result<u32, LoRaError> {
+        self.wait_ready_with_max_busy(max_busy)?;
         let mut tx = vec![(opcode >> 8) as u8, (opcode & 0xFF) as u8];
         tx.extend_from_slice(args);
         let mut rx = vec![0u8; tx.len()];
         self.spi.xfer(&tx, &mut rx)?;
-        self.wait_ready()?;
+        self.wait_ready_with_max_busy(max_busy)?;
 
         let stat1 = rx.first().copied().unwrap_or(0);
         log::trace!("lr1121: tx={:02X?} rx={:02X?} stat1=0x{stat1:02X}", tx, rx);
@@ -528,8 +598,13 @@ impl LR1121 {
 
     /// Explicitly enter STDBY_XOSC so the host can verify the XO actually
     /// starts (diagnostic helper; status is visible on the next read).
+    /// Uses the configured `tcxo_startup_delay` as the BUSY budget so the
+    /// chip has time to attempt the XOSC startup before we report a
+    /// status (otherwise the post-wait returns while BUSY is still
+    /// asserted and the next read sees garbage).
     pub fn set_standby_xosc(&mut self) -> Result<(), LoRaError> {
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC]).map(|_| ())
+        self.write_command_with_max_busy(CMD_SET_STANDBY, &[STANDBY_XOSC], self.xosc_max_busy())
+            .map(|_| ())
     }
 
     /// Wait until the chip reports STBY_XOSC. The chip holds BUSY during
@@ -557,8 +632,14 @@ impl LR1121 {
         startup_delay: Duration,
     ) -> Result<(), LoRaError> {
         let timeout = startup_delay + Duration::from_millis(100);
+        let max_busy = startup_delay + Duration::from_millis(100);
         for attempt in 0..4 {
-            self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC]).map(|_| ())?;
+            self.write_command_with_max_busy(
+                CMD_SET_STANDBY,
+                &[STANDBY_XOSC],
+                max_busy,
+            )
+            .map(|_| ())?;
             if self.wait_for_standby_xosc(timeout)? {
                 let _ = self.clear_device_errors();
                 return Ok(());
@@ -1530,8 +1611,15 @@ impl LoRaChipset for LR1121 {
         // Apply high ACP workaround for compliant TX spectrum
         self.apply_high_acp_workaround()?;
 
-        // Ensure stable XOSC reference, then TX.
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
+        // Ensure stable XOSC reference, then TX. The SetStandby(XOSC)
+        // post-wait must cover the configured tcxo_startup_delay — the
+        // chip can hold BUSY for the full window, and SetTx that follows
+        // is dropped if it's issued before BUSY clears.
+        self.write_command_with_max_busy(
+            CMD_SET_STANDBY,
+            &[STANDBY_XOSC],
+            self.xosc_max_busy(),
+        )?;
         self.write_command(CMD_SET_TX, &[0x00, 0x00, 0x00])?;
 
         log::trace!("lr1121: transmitted {} bytes on {:?}", payload.len(), self.band);
@@ -1556,8 +1644,16 @@ impl LoRaChipset for LR1121 {
         // Enable RX boosted mode for improved sensitivity
         self.write_command(CMD_SET_RX_BOOSTED, &[0x01])?;
 
-        // Ensure stable XOSC reference, then enter continuous RX
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_XOSC])?;
+        // Ensure stable XOSC reference, then enter continuous RX. The
+        // SetStandby(XOSC) post-wait must cover the configured
+        // tcxo_startup_delay — the chip can hold BUSY for the full
+        // window, and SetRx that follows is dropped if it's issued
+        // before BUSY clears.
+        self.write_command_with_max_busy(
+            CMD_SET_STANDBY,
+            &[STANDBY_XOSC],
+            self.xosc_max_busy(),
+        )?;
         self.write_command(CMD_SET_RX, &[0xFF, 0xFF, 0xFF])?;
 
         self.rx_active = true;

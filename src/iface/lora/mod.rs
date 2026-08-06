@@ -127,128 +127,77 @@ impl SpiBus {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal GPIO abstraction using the Linux GPIO character-device v1 ioctl API
+// Minimal GPIO abstraction using the Linux GPIO character-device v2 ioctl API
+// (v1 is deprecated; v2 is the universal modern API and is what drivers
+// like mcp2221_gpio expose).
+// ---------------------------------------------------------------------------
+// GPIO abstraction backed by the `gpio-cdev` crate. The crate wraps the
+// Linux GPIO character device API and picks v1 or v2 automatically per
+// driver; this is the only safe way to talk to /dev/gpiochipN when the
+// driver is v2-only (e.g. mcp2221_gpio, which is what /dev/gpiochip2 is
+// on the Saleae Logic 2 host).
 // ---------------------------------------------------------------------------
 mod gpio {
-    use std::fs::{File, OpenOptions};
-    use std::io::{self, ErrorKind};
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::io;
 
-    const GPIOHANDLE_GET_LINE_IOCTL: u64 = 0xC228B440;
-    const GPIOHANDLE_GET_LINE_VALUES_IOCTL: u64 = 0xC080B441;
-    const GPIOHANDLE_SET_LINE_VALUES_IOCTL: u64 = 0xC080B442;
+    use gpio_cdev::{Chip, Line, LineHandle, LineRequestFlags};
 
-    #[repr(C)]
-    struct GpioHandleRequest {
-        lineoffsets: [u32; 64],
-        flags: u32,
-        default_values: [u32; 64],
-        consumer_label: [u8; 32],
-        fd: i32,
-    }
-
-    #[repr(C)]
-    struct GpioHandleData {
-        values: [u16; 64],
-    }
-
+    /// Wrapper around a single requested GPIO line. Holds a `LineHandle`
+    /// from the `gpio-cdev` crate, which owns the file descriptor and
+    /// the underlying chip reference (so the chip stays open as long
+    /// as the handle is alive).
     pub struct GpioLine {
-        fd: File,
-        offset: u32,
+        handle: LineHandle,
+        // Keep the source `Line` alive for the lifetime of the handle.
+        // (The handle already borrows the chip via Arc, but keeping
+        // a `Line` here documents the binding and makes the type
+        // self-contained.)
+        _line: Line,
     }
 
     impl GpioLine {
         pub fn new_output(chip_path: &str, line: u32) -> io::Result<Self> {
-            Self::request_line(chip_path, line, 2)
+            Self::request_line(chip_path, line, LineRequestFlags::OUTPUT, 0)
         }
 
         pub fn new_input(chip_path: &str, line: u32) -> io::Result<Self> {
-            Self::request_line(chip_path, line, 1)
+            Self::request_line(chip_path, line, LineRequestFlags::INPUT, 0)
         }
 
-        fn request_line(chip_path: &str, line: u32, flags: u32) -> io::Result<Self> {
-            let chip = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-                .open(chip_path)?;
-
-            let mut label = [0u8; 32];
-            let label_bytes = b"rs-reticulum";
-            label[..label_bytes.len()].copy_from_slice(label_bytes);
-
-            let mut req = GpioHandleRequest {
-                lineoffsets: [0; 64],
-                flags,
-                default_values: [0; 64],
-                consumer_label: label,
-                fd: 0,
-            };
-            req.lineoffsets[0] = line;
-
-            let ret = unsafe {
-                libc::ioctl(
-                    chip.as_raw_fd(),
-                    GPIOHANDLE_GET_LINE_IOCTL as _,
-                    &mut req,
-                )
-            };
-
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            if req.fd < 0 {
-                return Err(io::Error::new(
-                    ErrorKind::Other,
-                    "GPIO: invalid handle fd returned",
-                ));
-            }
-
-            let handle_fd = unsafe { File::from_raw_fd(req.fd) };
-
+        fn request_line(
+            chip_path: &str,
+            line: u32,
+            flags: LineRequestFlags,
+            default: u8,
+        ) -> io::Result<Self> {
+            let mut chip = Chip::new(chip_path).map_err(io::Error::other)?;
+            let line_obj = chip.get_line(line).map_err(io::Error::other)?;
+            // .request() takes (flags, default, consumer). For INPUT
+            // the default is ignored; for OUTPUT it's the initial
+            // level. Use 0 (inactive) as a safe default.
+            let handle = line_obj
+                .request(flags, default, "rs-reticulum")
+                .map_err(io::Error::other)?;
             Ok(GpioLine {
-                fd: handle_fd,
-                offset: 0,
+                handle,
+                _line: line_obj,
             })
         }
 
         pub fn set_value(&self, value: bool) -> io::Result<()> {
-            let mut data = GpioHandleData { values: [0; 64] };
-            data.values[self.offset as usize] = if value { 1 } else { 0 };
-            let ret = unsafe {
-                libc::ioctl(
-                    self.fd.as_raw_fd(),
-                    GPIOHANDLE_SET_LINE_VALUES_IOCTL as _,
-                    &data,
-                )
-            };
-            if ret < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+            self.handle
+                .set_value(value as u8)
+                .map_err(io::Error::other)
         }
 
         pub fn get_value(&self) -> io::Result<bool> {
-            let mut data = GpioHandleData { values: [0; 64] };
-            let ret = unsafe {
-                libc::ioctl(
-                    self.fd.as_raw_fd(),
-                    GPIOHANDLE_GET_LINE_VALUES_IOCTL as _,
-                    &mut data,
-                )
-            };
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(data.values[self.offset as usize] != 0)
+            self.handle.get_value().map(|v| v != 0).map_err(io::Error::other)
         }
     }
 }
 
 use gpio::GpioLine;
+
 
 pub struct GpioPins {
     pub busy: Option<GpioLine>,
