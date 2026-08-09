@@ -1331,11 +1331,24 @@ impl Transport {
         request_id: AddressHash,
         data: Value,
     ) -> Result<(), RnsError> {
+        self.link_response_raw(link_id, request_id.as_slice(), data).await
+    }
+
+    /// Send a response over a link using raw request-id bytes as-is.
+    ///
+    /// Interoperates with the Python reference, which correlates responses
+    /// against the request id it derives from the request.
+    pub async fn link_response_raw(
+        &self,
+        link_id: LinkId,
+        request_id: &[u8],
+        data: Value,
+    ) -> Result<(), RnsError> {
         let link = self
             .find_link(&link_id)
             .await
             .ok_or(RnsError::InvalidArgument)?;
-        let packet = link.lock().await.response_packet(request_id, data)?;
+        let packet = link.lock().await.response_packet_raw(request_id, data)?;
         self.send_packet(packet).await;
         Ok(())
     }

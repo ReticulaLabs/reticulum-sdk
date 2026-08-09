@@ -109,7 +109,10 @@ pub struct ResourceAdvertisement {
     pub flags: u8,
     pub segment_index: usize,
     pub total_segments: usize,
-    pub request_id: Option<Hash>,
+    /// ID of the associated request, as raw bytes. The Python reference uses
+    /// a 16-byte truncated hash here; the exact bytes must be preserved so
+    /// that peers can correlate the resource with its pending request.
+    pub request_id: Option<Vec<u8>>,
 }
 
 impl ResourceAdvertisement {
@@ -151,7 +154,7 @@ impl ResourceAdvertisement {
             flags,
             segment_index: resource.segment_index,
             total_segments: resource.total_segments,
-            request_id: resource.request_id,
+            request_id: resource.request_id.clone(),
         }
     }
 
@@ -188,7 +191,8 @@ impl ResourceAdvertisement {
         dict.push((
             Value::from("q"),
             self.request_id
-                .map(|h| Value::Binary(h.to_bytes().to_vec()))
+                .as_ref()
+                .map(|id| Value::Binary(id.clone()))
                 .unwrap_or(Value::Nil),
         ));
 
@@ -255,10 +259,7 @@ impl ResourceAdvertisement {
                 "q" => {
                     if let Some(bytes) = val.as_slice() {
                         if !bytes.is_empty() {
-                            let mut h = [0u8; HASH_SIZE];
-                            let n = core::cmp::min(bytes.len(), HASH_SIZE);
-                            h[..n].copy_from_slice(&bytes[..n]);
-                            adv.request_id = Some(Hash::new(h));
+                            adv.request_id = Some(bytes.to_vec());
                         }
                     }
                 }
@@ -358,7 +359,7 @@ pub struct Resource {
     last_part_sent: Option<std::time::Instant>,
 
     // Request linking
-    pub request_id: Option<Hash>,
+    pub request_id: Option<Vec<u8>>,
     pub is_response: bool,
 
     // Dedup
@@ -375,7 +376,7 @@ impl Resource {
         data: &[u8],
         link_mdu: usize,
         encrypt: impl FnOnce(&[u8], &mut Vec<u8>) -> Result<usize, RnsError>,
-        request_id: Option<Hash>,
+        request_id: Option<Vec<u8>>,
         is_response: bool,
     ) -> Result<Self, RnsError> {
         let original_plaintext = data.to_vec();
@@ -561,7 +562,7 @@ impl Resource {
         adv: &ResourceAdvertisement,
         link_mdu: usize,
         rtt: Duration,
-        request_id: Option<Hash>,
+        request_id: Option<Vec<u8>>,
     ) -> Result<Self, RnsError> {
         let sdu = link_mdu;
         let total_parts = adv.num_parts;
@@ -1035,6 +1036,9 @@ impl Resource {
     pub fn hash(&self) -> &Hash {
         &self.hash
     }
+    pub fn request_id(&self) -> Option<&[u8]> {
+        self.request_id.as_deref()
+    }
     pub fn original_hash(&self) -> &Hash {
         &self.original_hash
     }
@@ -1053,6 +1057,9 @@ impl Resource {
     pub fn total_parts(&self) -> usize {
         self.total_parts
     }
+    pub fn sent_parts(&self) -> usize {
+        self.sent_parts
+    }
     pub fn received_count(&self) -> usize {
         self.received_count
     }
@@ -1067,6 +1074,12 @@ impl Resource {
     }
     pub fn is_compressed(&self) -> bool {
         self.compressed
+    }
+    pub fn has_metadata(&self) -> bool {
+        self.has_metadata
+    }
+    pub fn set_has_metadata(&mut self, has_metadata: bool) {
+        self.has_metadata = has_metadata;
     }
     pub fn random_hash_bytes(&self) -> &[u8; RANDOM_HASH_SIZE] {
         &self.random_hash
