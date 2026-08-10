@@ -981,7 +981,7 @@ impl Resource {
             let mut part_index = self.receiver_min_consecutive_height;
             for i in search_start..search_end {
                 if i < self.parts.len() && &self.parts[i].map_hash[..] == last_map_hash {
-                    part_index = i;
+                    part_index = i + 1;
                     break;
                 }
             }
@@ -1065,6 +1065,9 @@ impl Resource {
     }
     pub fn window(&self) -> usize {
         self.window
+    }
+    pub fn outstanding_parts(&self) -> usize {
+        self.outstanding_parts
     }
     pub fn eifr(&self) -> Option<f64> {
         self.eifr

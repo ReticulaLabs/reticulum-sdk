@@ -73,7 +73,7 @@ impl UdpInterface {
 
             log::info!("udp_interface bound to <{}>", bind_addr);
 
-            const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 3;
+            const BUFFER_SIZE: usize = DEFAULT_HW_MTU + crate::packet::RETICULUM_MAX_HEADER_SIZE;
 
             // Start receive task
             let rx_task = {
