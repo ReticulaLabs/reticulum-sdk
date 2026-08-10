@@ -37,24 +37,7 @@ impl<const N: usize> StaticBuffer<N> {
         self.len
     }
 
-    pub fn chain_write(&mut self, data: &[u8]) -> Result<&mut Self, RnsError> {
-        self.write(data)?;
-        Ok(self)
-    }
-
-    pub fn safe_write(&mut self, data: &[u8]) -> usize {
-        let data_size = data.len();
-
-        let max_size = core::cmp::min(data_size, N - self.len);
-
-        self.write(&data[..max_size]).unwrap_or(0)
-    }
-
-    pub fn chain_safe_write(&mut self, data: &[u8]) -> &mut Self {
-        self.safe_write(data);
-        self
-    }
-
+    /// Write `data` to the buffer, erroring if it does not fit.
     pub fn write(&mut self, data: &[u8]) -> Result<usize, RnsError> {
         let data_size = data.len();
 
@@ -73,16 +56,14 @@ impl<const N: usize> StaticBuffer<N> {
         Ok(data_size)
     }
 
-    pub fn rotate_left(&mut self, mid: usize) -> Result<usize, RnsError> {
-        if mid > self.len {
-            return Err(RnsError::InvalidArgument);
-        }
+    /// Write as much of `data` as fits, returning the number of bytes
+    /// written. Unlike `write`, this never errors.
+    pub fn safe_write(&mut self, data: &[u8]) -> usize {
+        let data_size = data.len();
 
-        self.len = self.len - mid;
+        let max_size = core::cmp::min(data_size, N - self.len);
 
-        self.buffer.rotate_left(mid);
-
-        Ok(self.len)
+        self.write(&data[..max_size]).unwrap_or(0)
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -90,25 +71,6 @@ impl<const N: usize> StaticBuffer<N> {
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buffer[..self.len]
-    }
-
-    pub fn accuire_buf(&mut self, len: usize) -> &mut [u8] {
-        self.len = len;
-        &mut self.buffer[..self.len]
-    }
-
-    pub fn try_accuire_buf(&mut self, len: usize) -> Result<&mut [u8], RnsError> {
-        if len > self.buffer.len() {
-            return Err(RnsError::OutOfMemory);
-        }
-
-        self.len = len;
-        Ok(&mut self.buffer[..self.len])
-    }
-
-    pub fn accuire_buf_max(&mut self) -> &mut [u8] {
-        self.len = self.buffer.len();
         &mut self.buffer[..self.len]
     }
 }

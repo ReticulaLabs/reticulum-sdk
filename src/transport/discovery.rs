@@ -255,9 +255,9 @@ impl DiscoveryInterfaceConfig {
         )?;
 
         let mut payload = PacketDataBuffer::new();
-        payload.write(&[0u8])?;
-        payload.write(&packed)?;
-        payload.write(&stamp)?;
+        payload.write(&[0u8]);
+        payload.write(&packed);
+        payload.write(&stamp);
         Ok(payload)
     }
 }
@@ -834,9 +834,9 @@ mod tests {
         .unwrap();
 
         let mut app_data = PacketDataBuffer::new();
-        app_data.write(&[0u8]).unwrap();
-        app_data.write(&packed).unwrap();
-        app_data.write(&stamp).unwrap();
+        app_data.write(&[0u8]);
+        app_data.write(&packed);
+        app_data.write(&stamp);
         app_data
     }
 
@@ -853,9 +853,9 @@ mod tests {
         let stamp = stamp_with_exact_difficulty(&workblock, difficulty);
 
         let mut app_data = PacketDataBuffer::new();
-        app_data.write(&[0u8]).unwrap();
-        app_data.write(&packed).unwrap();
-        app_data.write(&stamp).unwrap();
+        app_data.write(&[0u8]);
+        app_data.write(&packed);
+        app_data.write(&stamp);
         app_data
     }
 

@@ -186,13 +186,13 @@ impl DestinationAnnounce {
         // Keeping signed data on stack is only option for now.
         // Verification function doesn't support prehashed message.
         let signed_data = PacketDataBuffer::new()
-            .chain_write(destination.as_slice())?
-            .chain_write(public_key.as_bytes())?
-            .chain_write(verifying_key.as_bytes())?
-            .chain_write(name_hash)?
-            .chain_write(rand_hash)?
-            .chain_write(ratchet)?
-            .chain_write(app_data)?
+            .chain_write(destination.as_slice())
+            .chain_write(public_key.as_bytes())
+            .chain_write(verifying_key.as_bytes())
+            .chain_write(name_hash)
+            .chain_write(rand_hash)
+            .chain_write(ratchet)
+            .chain_write(app_data)
             .finalize();
 
         let signature = Signature::from_slice(signature).map_err(|_| RnsError::CryptoError)?;
@@ -242,18 +242,18 @@ impl Destination<PrivateIdentity, Input, Single> {
         let verifying_key = self.identity.as_identity().verifying_key_bytes();
 
         packet_data
-            .chain_safe_write(self.desc.address_hash.as_slice())
-            .chain_safe_write(pub_key)
-            .chain_safe_write(verifying_key)
-            .chain_safe_write(self.desc.name.as_name_hash_slice())
-            .chain_safe_write(rand_hash);
+            .chain_write(self.desc.address_hash.as_slice())
+            .chain_write(pub_key)
+            .chain_write(verifying_key)
+            .chain_write(self.desc.name.as_name_hash_slice())
+            .chain_write(rand_hash);
 
         if let Some(ratchet_key) = self.desc.ratchet_public_key {
-            packet_data.chain_safe_write(&ratchet_key);
+            packet_data.chain_write(&ratchet_key);
         }
 
         if let Some(data) = app_data {
-            packet_data.write(data)?;
+            packet_data.write(data);
         }
 
         let signature = self.identity.sign(packet_data.as_slice());
@@ -261,19 +261,19 @@ impl Destination<PrivateIdentity, Input, Single> {
         packet_data.reset();
 
         packet_data
-            .chain_safe_write(pub_key)
-            .chain_safe_write(verifying_key)
-            .chain_safe_write(self.desc.name.as_name_hash_slice())
-            .chain_safe_write(rand_hash);
+            .chain_write(pub_key)
+            .chain_write(verifying_key)
+            .chain_write(self.desc.name.as_name_hash_slice())
+            .chain_write(rand_hash);
 
         if let Some(ratchet_key) = self.desc.ratchet_public_key {
-            packet_data.chain_safe_write(&ratchet_key);
+            packet_data.chain_write(&ratchet_key);
         }
 
-        packet_data.chain_safe_write(&signature.to_bytes());
+        packet_data.chain_write(&signature.to_bytes());
 
         if let Some(data) = app_data {
-            packet_data.write(data)?;
+            packet_data.write(data);
         }
 
         Ok(packet_data)
@@ -459,8 +459,8 @@ impl Destination<PrivateIdentity, Input, Single> {
         let signature = self.identity.sign(packet_hash.as_slice());
 
         let mut packet_data = PacketDataBuffer::new();
-        packet_data.safe_write(packet_hash.as_slice());
-        packet_data.safe_write(&signature.to_bytes());
+        packet_data.write(packet_hash.as_slice());
+        packet_data.write(&signature.to_bytes());
 
         Packet {
             header: Header {
@@ -537,7 +537,7 @@ impl Destination<Identity, Output, Single> {
                     &PublicKey::from(ratchet_public_key),
                     data,
                     Some(self.identity.as_address_hash_slice()),
-                    packet_data.accuire_buf(
+                    packet_data.acquire_buf(
                         data.len()
                             + RETICULUM_EC_PUBLIC_KEY_SIZE
                             + RETICULUM_TOKEN_OVERHEAD
@@ -549,7 +549,7 @@ impl Destination<Identity, Output, Single> {
                     &mut rng,
                     data,
                     Some(self.identity.as_address_hash_slice()),
-                    packet_data.accuire_buf(
+                    packet_data.acquire_buf(
                         data.len()
                             + RETICULUM_EC_PUBLIC_KEY_SIZE
                             + RETICULUM_TOKEN_OVERHEAD
@@ -821,13 +821,13 @@ mod tests {
 
         let mut signed_data = PacketDataBuffer::new();
         signed_data
-            .chain_safe_write(destination.desc.address_hash.as_slice())
-            .chain_safe_write(pub_key)
-            .chain_safe_write(verifying_key)
-            .chain_safe_write(destination.desc.name.as_name_hash_slice())
-            .chain_safe_write(&rand_hash)
-            .chain_safe_write(&ratchet)
-            .chain_safe_write(app_data);
+            .chain_write(destination.desc.address_hash.as_slice())
+            .chain_write(pub_key)
+            .chain_write(verifying_key)
+            .chain_write(destination.desc.name.as_name_hash_slice())
+            .chain_write(&rand_hash)
+            .chain_write(&ratchet)
+            .chain_write(app_data);
 
         let signature = destination.identity.sign(signed_data.as_slice());
 
@@ -836,13 +836,13 @@ mod tests {
             .expect("valid announce packet");
         let mut packet_data = PacketDataBuffer::new();
         packet_data
-            .chain_safe_write(pub_key)
-            .chain_safe_write(verifying_key)
-            .chain_safe_write(destination.desc.name.as_name_hash_slice())
-            .chain_safe_write(&rand_hash)
-            .chain_safe_write(&ratchet)
-            .chain_safe_write(&signature.to_bytes())
-            .chain_safe_write(app_data);
+            .chain_write(pub_key)
+            .chain_write(verifying_key)
+            .chain_write(destination.desc.name.as_name_hash_slice())
+            .chain_write(&rand_hash)
+            .chain_write(&ratchet)
+            .chain_write(&signature.to_bytes())
+            .chain_write(app_data);
 
         announce.header.context_flag = ContextFlag::Set;
         announce.data = packet_data;
@@ -869,23 +869,23 @@ mod tests {
 
         let mut signed_data = PacketDataBuffer::new();
         signed_data
-            .chain_safe_write(destination.desc.address_hash.as_slice())
-            .chain_safe_write(pub_key)
-            .chain_safe_write(verifying_key)
-            .chain_safe_write(destination.desc.name.as_name_hash_slice())
-            .chain_safe_write(&rand_hash)
-            .chain_safe_write(&ratchet);
+            .chain_write(destination.desc.address_hash.as_slice())
+            .chain_write(pub_key)
+            .chain_write(verifying_key)
+            .chain_write(destination.desc.name.as_name_hash_slice())
+            .chain_write(&rand_hash)
+            .chain_write(&ratchet);
 
         let signature = destination.identity.sign(signed_data.as_slice());
 
         let mut packet_data = PacketDataBuffer::new();
         packet_data
-            .chain_safe_write(pub_key)
-            .chain_safe_write(verifying_key)
-            .chain_safe_write(destination.desc.name.as_name_hash_slice())
-            .chain_safe_write(&rand_hash)
-            .chain_safe_write(&ratchet)
-            .chain_safe_write(&signature.to_bytes());
+            .chain_write(pub_key)
+            .chain_write(verifying_key)
+            .chain_write(destination.desc.name.as_name_hash_slice())
+            .chain_write(&rand_hash)
+            .chain_write(&ratchet)
+            .chain_write(&signature.to_bytes());
 
         let mut announce = destination
             .announce_with_rand_hash(rand_hash, None)

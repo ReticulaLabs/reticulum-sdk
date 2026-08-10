@@ -20,9 +20,6 @@ pub const RETICULUM_EC_PUBLIC_KEY_SIZE: usize = 32usize;
 pub const ENCRYPTED_PACKET_MDU: usize =
     encrypted_payload_mdu(RETICULUM_MAX_HEADER_SIZE, RETICULUM_EC_PUBLIC_KEY_SIZE);
 pub const LINK_PACKET_MDU: usize = encrypted_payload_mdu(RETICULUM_HEADER_MINSIZE, 0);
-// Default scratch capacity for locally-created packet payloads. Received packet
-// payloads are dynamically sized to match the decoded frame.
-pub const DEFAULT_PACKET_DATA_BUFFER_SIZE: usize = 2048usize;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
 const fn encrypted_payload_mdu(header_size: usize, cleartext_overhead: usize) -> usize {
@@ -313,30 +310,6 @@ impl PacketDataBuffer {
         self.buffer.len()
     }
 
-    pub fn chain_write(&mut self, data: &[u8]) -> Result<&mut Self, crate::error::RnsError> {
-        self.write(data)?;
-        Ok(self)
-    }
-
-    pub fn finalize(&self) -> Self {
-        self.clone()
-    }
-
-    pub fn safe_write(&mut self, data: &[u8]) -> usize {
-        Arc::make_mut(&mut self.buffer).extend_from_slice(data);
-        data.len()
-    }
-
-    pub fn chain_safe_write(&mut self, data: &[u8]) -> &mut Self {
-        self.safe_write(data);
-        self
-    }
-
-    pub fn write(&mut self, data: &[u8]) -> Result<usize, crate::error::RnsError> {
-        Arc::make_mut(&mut self.buffer).extend_from_slice(data);
-        Ok(data.len())
-    }
-
     pub fn as_slice(&self) -> &[u8] {
         &self.buffer
     }
@@ -345,22 +318,30 @@ impl PacketDataBuffer {
         Arc::make_mut(&mut self.buffer).as_mut_slice()
     }
 
-    pub fn accuire_buf(&mut self, len: usize) -> &mut [u8] {
+    /// Append `data` to the buffer. The underlying storage grows on demand,
+    /// so this cannot fail. Returns the number of bytes written.
+    pub fn write(&mut self, data: &[u8]) -> usize {
+        Arc::make_mut(&mut self.buffer).extend_from_slice(data);
+        data.len()
+    }
+
+    /// Append `data` and return `self` for chaining.
+    pub fn chain_write(&mut self, data: &[u8]) -> &mut Self {
+        self.write(data);
+        self
+    }
+
+    /// Resize the buffer to `len` zeroed bytes and return it as a mutable
+    /// slice (for use as an output buffer). The storage grows on demand, so
+    /// this cannot fail.
+    pub fn acquire_buf(&mut self, len: usize) -> &mut [u8] {
         let buf = Arc::make_mut(&mut self.buffer);
         buf.resize(len, 0);
         buf.as_mut_slice()
     }
 
-    pub fn try_accuire_buf(&mut self, len: usize) -> Result<&mut [u8], crate::error::RnsError> {
-        let buf = Arc::make_mut(&mut self.buffer);
-        buf.resize(len, 0);
-        Ok(buf.as_mut_slice())
-    }
-
-    pub fn accuire_buf_max(&mut self) -> &mut [u8] {
-        let buf = Arc::make_mut(&mut self.buffer);
-        buf.resize(DEFAULT_PACKET_DATA_BUFFER_SIZE, 0);
-        buf.as_mut_slice()
+    pub fn finalize(&self) -> Self {
+        self.clone()
     }
 }
 

@@ -3310,7 +3310,7 @@ async fn handle_data(
                 let destination = destination.lock().await;
                 match destination.decrypt(
                     packet.data.as_slice(),
-                    plain_data.accuire_buf(packet.data.len()),
+                    plain_data.acquire_buf(packet.data.len()),
                 ) {
                     Ok(data) => {
                         if destination.prove_packets() {

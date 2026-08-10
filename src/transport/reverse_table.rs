@@ -104,7 +104,7 @@ mod tests {
         let next_hop_iface = AddressHash::new_from_slice(b"next-hop-iface");
 
         let mut original_data = PacketDataBuffer::new();
-        original_data.safe_write(b"payload");
+        original_data.write(b"payload");
 
         let original = Packet {
             header: Header {
@@ -123,7 +123,7 @@ mod tests {
         reverse_table.add(&original, previous_hop_iface, next_hop_iface);
 
         let mut proof_data = PacketDataBuffer::new();
-        proof_data.safe_write(b"proof");
+        proof_data.write(b"proof");
         let proof = Packet {
             header: Header {
                 destination_type: DestinationType::Single,
@@ -157,7 +157,7 @@ mod tests {
         let attacker_iface = AddressHash::new_from_slice(b"attacker-iface");
 
         let mut original_data = PacketDataBuffer::new();
-        original_data.safe_write(b"payload");
+        original_data.write(b"payload");
 
         let original = Packet {
             header: Header {
@@ -176,7 +176,7 @@ mod tests {
         reverse_table.add(&original, previous_hop_iface, next_hop_iface);
 
         let mut proof_data = PacketDataBuffer::new();
-        proof_data.safe_write(b"proof");
+        proof_data.write(b"proof");
         let proof = Packet {
             header: Header {
                 destination_type: DestinationType::Single,
@@ -205,7 +205,7 @@ mod tests {
         let next_hop_iface = AddressHash::new_from_slice(b"next-hop-iface");
 
         let mut original_data = PacketDataBuffer::new();
-        original_data.safe_write(b"payload");
+        original_data.write(b"payload");
 
         let original = Packet {
             header: Header {
@@ -224,7 +224,7 @@ mod tests {
         reverse_table.add(&original, previous_hop_iface, next_hop_iface);
 
         let mut proof_data = PacketDataBuffer::new();
-        proof_data.safe_write(b"proof");
+        proof_data.write(b"proof");
         let proof = Packet {
             header: Header {
                 destination_type: DestinationType::Single,
@@ -255,7 +255,7 @@ mod tests {
         let next_hop_iface = AddressHash::new_from_slice(b"next-hop-iface");
 
         let mut original_data = PacketDataBuffer::new();
-        original_data.safe_write(b"payload");
+        original_data.write(b"payload");
 
         let original = Packet {
             header: Header {
@@ -276,7 +276,7 @@ mod tests {
         // Proof with ifac_flag=Authenticated but no ifac data.
         // send_backwards() must reset the flag to Open.
         let mut proof_data = PacketDataBuffer::new();
-        proof_data.safe_write(b"proof");
+        proof_data.write(b"proof");
         let proof = Packet {
             header: Header {
                 ifac_flag: IfacFlag::Authenticated,

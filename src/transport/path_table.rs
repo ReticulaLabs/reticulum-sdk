@@ -720,7 +720,7 @@ mod tests {
     ) -> Packet {
         let mut data = PacketDataBuffer::new();
         data.resize(super::ANNOUNCE_RANDOM_BLOB_OFFSET);
-        data.safe_write(&blob);
+        data.write(&blob);
 
         Packet {
             header: Header {

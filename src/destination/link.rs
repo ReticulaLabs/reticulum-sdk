@@ -381,9 +381,9 @@ impl Link {
         let mut packet_data = PacketDataBuffer::new();
         let signalling = link_signalling_bytes(mtu);
 
-        packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
-        packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
-        packet_data.safe_write(&signalling);
+        packet_data.write(self.priv_identity.as_identity().public_key.as_bytes());
+        packet_data.write(self.priv_identity.as_identity().verifying_key.as_bytes());
+        packet_data.write(&signalling);
 
         let packet = Packet {
             header: Header {
@@ -423,17 +423,17 @@ impl Link {
         let mut packet_data = PacketDataBuffer::new();
         let signalling = link_signalling_bytes(self.mtu);
 
-        packet_data.safe_write(self.id.as_slice());
-        packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
-        packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
-        packet_data.safe_write(&signalling);
+        packet_data.write(self.id.as_slice());
+        packet_data.write(self.priv_identity.as_identity().public_key.as_bytes());
+        packet_data.write(self.priv_identity.as_identity().verifying_key.as_bytes());
+        packet_data.write(&signalling);
 
         let signature = self.priv_identity.sign(packet_data.as_slice());
 
         packet_data.reset();
-        packet_data.safe_write(&signature.to_bytes()[..]);
-        packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
-        packet_data.safe_write(&signalling);
+        packet_data.write(&signature.to_bytes()[..]);
+        packet_data.write(self.priv_identity.as_identity().public_key.as_bytes());
+        packet_data.write(&signalling);
 
         let packet = Packet {
             header: Header {
@@ -831,7 +831,7 @@ impl Link {
             let cipher_text = self.encrypt(
                 data,
                 packet_data
-                    .accuire_buf(data.len() + RETICULUM_TOKEN_OVERHEAD + RETICULUM_AES_BLOCK_SIZE),
+                    .acquire_buf(data.len() + RETICULUM_TOKEN_OVERHEAD + RETICULUM_AES_BLOCK_SIZE),
             )?;
             cipher_text.len()
         };
@@ -971,7 +971,7 @@ impl Link {
         log::trace!("link({}): create keep alive {}", self.id, data);
 
         let mut packet_data = PacketDataBuffer::new();
-        packet_data.safe_write(&[data]);
+        packet_data.write(&[data]);
 
         Packet {
             header: Header {
@@ -997,8 +997,8 @@ impl Link {
         let signature = self.priv_identity.sign(hash.as_slice());
 
         let mut packet_data = PacketDataBuffer::new();
-        packet_data.safe_write(hash.as_slice());
-        packet_data.safe_write(&signature.to_bytes()[..]);
+        packet_data.write(hash.as_slice());
+        packet_data.write(&signature.to_bytes()[..]);
 
         Packet {
             header: Header {
@@ -1073,7 +1073,7 @@ impl Link {
             let token = self
                 .encrypt(
                     buf.as_slice(),
-                    packet_data.accuire_buf(
+                    packet_data.acquire_buf(
                         buf.len() + RETICULUM_TOKEN_OVERHEAD + RETICULUM_AES_BLOCK_SIZE,
                     ),
                 )
@@ -1498,7 +1498,7 @@ mod tests {
         let (event_tx, _) = tokio::sync::broadcast::channel(1);
         let mut out_link = Link::new(destination.desc, event_tx.clone());
         let mut request = out_link.request(None);
-        request.data.safe_write(&[0x00]);
+        request.data.write(&[0x00]);
 
         let result = Link::new_from_request(
             &request,

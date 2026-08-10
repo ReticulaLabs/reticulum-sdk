@@ -126,7 +126,7 @@ impl Packet {
         };
 
         let data_len = buffer.bytes_left();
-        buffer.read(packet.data.try_accuire_buf(data_len)?)?;
+        buffer.read(packet.data.acquire_buf(data_len))?;
 
         Ok(packet)
     }

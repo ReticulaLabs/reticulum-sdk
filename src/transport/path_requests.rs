@@ -170,10 +170,10 @@ impl PathRequests {
         let mut data = PacketDataBuffer::new_from_slice(destination.as_slice());
 
         if let Some(transport_id) = self.transport_id {
-            data.safe_write(transport_id.as_slice());
+            data.write(transport_id.as_slice());
         }
 
-        data.safe_write(tag.unwrap_or_else(|| create_random_tag()).as_slice());
+        data.write(tag.unwrap_or_else(|| create_random_tag()).as_slice());
 
         log::trace!(
             "path_requests({}): generate destination={} data_len={} raw_data={:02x?}",
