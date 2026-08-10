@@ -2962,6 +2962,7 @@ async fn handle_proof(
     pending: &mut PendingSends,
     snr: Option<f32>,
     rssi: Option<i16>,
+    iface: AddressHash,
 ) {
     log::trace!(
         "tp({}): handle proof for {}",
@@ -3028,7 +3029,7 @@ async fn handle_proof(
         });
     }
 
-    let maybe_packet = handler.reverse_table.handle_proof(packet);
+    let maybe_packet = handler.reverse_table.handle_proof(packet, iface);
 
     if let Some((packet, iface)) = maybe_packet {
         pending.push(TxMessage {
@@ -3356,15 +3357,17 @@ async fn handle_data(
                 });
             }
         } else {
-            let has_next_hop = handler
+            let next_hop = handler
                 .send_ctx
                 .path_table
                 .read()
                 .unwrap()
-                .next_hop_full(&packet.destination)
-                .is_some();
-            if has_next_hop {
-                handler.reverse_table.add(packet, iface);
+                .next_hop_full(&packet.destination);
+            if let Some((_, outbound_iface)) = next_hop {
+                // Record the reverse path entry so a proof for this packet
+                // can be routed back to the sender. The proof must arrive on
+                // the same interface the packet was forwarded out on.
+                handler.reverse_table.add(packet, iface, outbound_iface);
             } else {
                 let enough_time_passed = handler
                     .last_path_requests
@@ -4387,7 +4390,15 @@ async fn manage_transport(
                         }
                         PacketType::Proof => {
                             handler.packets_received_by_type.proof += 1;
-                            handle_proof(&packet, &mut *handler, &mut pending, snr, rssi).await
+                            handle_proof(
+                                &packet,
+                                &mut *handler,
+                                &mut pending,
+                                snr,
+                                rssi,
+                                message.address,
+                            )
+                            .await
                         }
                         PacketType::Data => {
                             handler.packets_received_by_type.data += 1;
