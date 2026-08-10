@@ -88,6 +88,13 @@ impl TcpServer {
         let max_connections = { context.inner.lock().unwrap().max_connections };
         let mode = { context.inner.lock().unwrap().mode };
 
+        // Share the server's IFAC configuration with every spawned client
+        // connection. Runtime changes via `set_ifac_config` therefore apply
+        // to newly-accepted clients (matching the Python reference, which
+        // copies `ifac_size`/`ifac_netname`/`ifac_netkey` to spawned
+        // TCPClient interfaces).
+        let ifac_config = context.channel.ifac_config.clone();
+
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
@@ -186,7 +193,7 @@ impl TcpServer {
                             let connections = active_connections.clone();
                             let mut iface_manager = iface_manager.lock().await;
 
-                            iface_manager.spawn(
+                            iface_manager.spawn_with_ifac_config(
                                 TcpClient::new_from_stream(client.1.to_string(), client.0)
                                     .with_optional_bitrate(bitrate)
                                     .with_interface_mode(mode),
@@ -194,6 +201,7 @@ impl TcpServer {
                                     TcpClient::spawn(context).await;
                                     connections.fetch_sub(1, Ordering::Relaxed);
                                 },
+                                ifac_config.lock().unwrap().clone(),
                             );
                         }
                     }

@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::OutputBuffer;
 use crate::error::RnsError;
 use crate::iface::{
-    decode_rx, encode_tx, Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU,
-    RxMessage, configured_bitrate,
+    decode_rx, encode_tx, IfacConfig, Interface, InterfaceContext, InterfaceMode,
+    MAX_AUTOCONFIGURED_HW_MTU, RxMessage, configured_bitrate,
 };
 use crate::iface::reconnect_pacer::{ReconnectPacer, ReconnectPacerMetrics};
 use crate::packet::{Header, HeaderType, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE};
@@ -31,6 +31,10 @@ const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
 
 pub const BACKBONE_DEFAULT_HW_MTU: usize = 1_048_576;
 pub const BACKBONE_DEFAULT_BITRATE: f64 = 1_000_000_000.0;
+
+/// Default Interface Access Code size for backbone interfaces, matching
+/// the Python reference `BackboneInterface.DEFAULT_IFAC_SIZE = 16`.
+pub const DEFAULT_IFAC_SIZE: usize = 16;
 
 fn set_tcp_sockopts(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
@@ -182,6 +186,17 @@ impl BackboneServer {
         let hw_mtu = { context.inner.lock().unwrap().hw_mtu };
         let ifac_netname = { context.inner.lock().unwrap().ifac_netname.clone() };
         let ifac_netkey = { context.inner.lock().unwrap().ifac_netkey.clone() };
+        // Derive the IFAC configuration from the access code once, so every
+        // spawned client connection shares it (manager + interface side).
+        let ifac_config = if ifac_netname.is_some() || ifac_netkey.is_some() {
+            Some(IfacConfig::derive(
+                ifac_netname.as_deref(),
+                ifac_netkey.as_deref(),
+                DEFAULT_IFAC_SIZE,
+            ))
+        } else {
+            None
+        };
         let reconnect_pacer = { context.inner.lock().unwrap().reconnect_pacer.clone() };
         let mode = { context.inner.lock().unwrap().mode };
 
@@ -284,7 +299,7 @@ impl BackboneServer {
 
                             let mut iface_manager = iface_manager.lock().await;
 
-                            let iface_addr = iface_manager.spawn(
+                            let iface_addr = iface_manager.spawn_with_ifac_config(
                                 BackboneClient::new_from_stream(client.1.to_string(), client.0)
                                     .with_optional_bitrate(bitrate)
                                     .with_hw_mtu(hw_mtu)
@@ -293,6 +308,7 @@ impl BackboneServer {
                                 |context| async move {
                                     BackboneClient::spawn(context).await;
                                 },
+                                ifac_config.clone(),
                             );
 
                             // Track the parent-child relationship so the

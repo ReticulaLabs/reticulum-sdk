@@ -1067,13 +1067,14 @@ impl InterfaceManager {
     }
 
     pub fn new_context<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
-        self.new_context_with_options(inner, false)
+        self.new_context_with_options(inner, false, None)
     }
 
     fn new_context_with_options<T: Interface>(
         &mut self,
         inner: T,
         rpc_instance_client: bool,
+        ifac_config: Option<IfacConfig>,
     ) -> InterfaceContext<T> {
         let bitrate = inner.bitrate();
         let announce_cap = inner.announce_cap();
@@ -1101,7 +1102,7 @@ impl InterfaceManager {
             announce_pacer,
             rpc_instance_client,
             hw_mtu,
-            None,
+            ifac_config,
             configured_bitrate(bitrate.unwrap_or(0.0)),
             mode,
             announces_from_internal,
@@ -1155,6 +1156,31 @@ impl InterfaceManager {
         address
     }
 
+    /// Spawn an interface with an explicit Interface Access Code
+    /// configuration. This is used by interfaces that spawn child
+    /// interfaces (e.g. `TcpServer` spawning per-connection `TcpClient`s)
+    /// so the child inherits the parent's IFAC configuration, matching the
+    /// Python reference behaviour (`TCPInterface.incoming_connection` copies
+    /// `ifac_size` / `ifac_netname` / `ifac_netkey` to spawned clients).
+    pub fn spawn_with_ifac_config<T: Interface, F, R>(
+        &mut self,
+        inner: T,
+        worker: F,
+        ifac_config: Option<IfacConfig>,
+    ) -> AddressHash
+    where
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+        R::Output: Send + 'static,
+    {
+        let context = self.new_context_with_options(inner, false, ifac_config);
+        let address = context.channel.address().clone();
+
+        task::spawn(worker(context));
+
+        address
+    }
+
     pub fn spawn_rpc_instance_client<T: Interface, F, R>(
         &mut self,
         inner: T,
@@ -1165,7 +1191,7 @@ impl InterfaceManager {
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context_with_options(inner, true);
+        let context = self.new_context_with_options(inner, true, None);
         let address = context.channel.address().clone();
 
         task::spawn(worker(context));
@@ -2122,6 +2148,82 @@ mod tests {
         for _ in 0..DEFAULT_INTERFACE_TX_QUEUE_CAP {
             assert!(receiver.try_recv().is_ok());
         }
+    }
+
+    /// `spawn_with_ifac_config` must hand the IFAC configuration to the
+    /// spawned interface's channel, so the child interface (e.g. a
+    /// per-connection `TcpClient` spawned by a `TcpServer`) applies the
+    /// parent's Interface Access Code on both TX and RX.
+    #[tokio::test]
+    async fn spawn_with_ifac_config_propagates_config_to_channel() {
+        struct TestInterface;
+
+        impl Interface for TestInterface {
+            fn hw_mtu(&self) -> usize {
+                DEFAULT_HW_MTU
+            }
+        }
+
+        let mut manager = InterfaceManager::new(1);
+        let cfg = IfacConfig::derive(Some("test"), None, 16);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        let addr = manager.spawn_with_ifac_config(
+            TestInterface,
+            |context| async move {
+                let _ = result_tx.send(context.channel.ifac_config());
+            },
+            Some(cfg.clone()),
+        );
+
+        let channel_cfg = result_rx.await.expect("worker ran");
+        let channel_cfg = channel_cfg.expect("channel must receive the IFAC config");
+        assert_eq!(channel_cfg.ifac_len(), cfg.ifac_len());
+
+        // The manager-side LocalInterface must reference the same config so
+        // that `send_flush` attaches the IFAC with the same key the
+        // interface uses for masking.
+        let mgr_cfg = manager
+            .get_ifac_config(&addr)
+            .expect("manager-side config must be set");
+        assert_eq!(mgr_cfg.ifac_len(), cfg.ifac_len());
+    }
+
+    /// A runtime `set_ifac_config` on the manager must be visible to an
+    /// already-spawned interface's channel (both sides share the same
+    /// configuration), so enabling IFAC applies to both the transmit and
+    /// receive paths of the running interface.
+    #[tokio::test]
+    async fn set_ifac_config_reaches_spawned_channel_at_runtime() {
+        struct TestInterface;
+
+        impl Interface for TestInterface {
+            fn hw_mtu(&self) -> usize {
+                DEFAULT_HW_MTU
+            }
+        }
+
+        let mut manager = InterfaceManager::new(1);
+        let cfg = IfacConfig::derive(Some("runtime"), None, 16);
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        let addr = manager.spawn(
+            TestInterface,
+            |context| async move {
+                // Wait until the test has configured IFAC at runtime.
+                let _ = proceed_rx.await;
+                let _ = result_tx.send(context.channel.ifac_config());
+            },
+        );
+
+        // Enable IFAC on the manager after the interface has spawned.
+        manager.set_ifac_config(&addr, Some(cfg.clone()));
+        proceed_tx.send(()).expect("signal worker");
+
+        let channel_cfg = result_rx.await.expect("worker ran");
+        let channel_cfg = channel_cfg.expect("channel must observe the runtime IFAC config");
+        assert_eq!(channel_cfg.ifac_len(), cfg.ifac_len());
     }
 
     #[tokio::test(start_paused = true)]
