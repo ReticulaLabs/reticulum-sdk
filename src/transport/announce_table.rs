@@ -89,9 +89,18 @@ impl AnnounceEntry {
             data: self.packet.data.clone(),
         };
 
+        // Path responses are directed back to the requesting interface.
+        // Everything else is rebroadcast on ALL interfaces, including the
+        // one the announce was received on. The Python reference
+        // implementation does the same (loop prevention relies on packet
+        // hash deduplication and echo counting, not on excluding the
+        // ingress interface). Excluding the ingress interface would break
+        // multi-hop propagation on single-interface nodes, since the
+        // announce would never be forwarded to the next hop on the same
+        // shared medium.
         let tx_type = match self.response_to_iface {
             Some(iface) => TxMessageType::Direct(iface),
-            None => TxMessageType::Broadcast(Some(self.received_from)),
+            None => TxMessageType::BroadcastFrom(self.received_from),
         };
 
         TxMessage { tx_type, packet }
@@ -503,6 +512,51 @@ mod tests {
             msgs[0].packet.context,
             PacketContext::PathResponse,
             "PathResponse context must be preserved through to_retransmit()",
+        );
+    }
+
+    /// A received announce must be rebroadcast on ALL interfaces, including
+    /// the one it was received on. Excluding the ingress interface breaks
+    /// multi-hop propagation on single-interface nodes (the announce is
+    /// never forwarded to the next hop on the same shared medium). This
+    /// matches the Python reference, which rebroadcasts on every interface
+    /// and relies on packet-hash dedup + echo counting for loop control.
+    #[tokio::test(start_paused = true)]
+    async fn announce_rebroadcast_includes_ingress_interface() {
+        let mut table = AnnounceTable::new();
+        let transport_id = AddressHash::new([0x01; 16]);
+        let dest = AddressHash::new([0xee; 16]);
+        let ingress_iface = AddressHash::new([0xff; 16]);
+
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Announce,
+                hops: 1,
+            },
+            ifac: None,
+            destination: dest,
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(&[9, 8, 7]),
+        };
+
+        table.add(&packet, dest, ingress_iface);
+
+        time::advance(Duration::from_secs(1)).await;
+
+        let msgs = table.to_retransmit(&transport_id);
+
+        assert_eq!(msgs.len(), 1, "one announce should be retransmitted");
+        assert_eq!(
+            msgs[0].tx_type,
+            TxMessageType::BroadcastFrom(ingress_iface),
+            "announce must be rebroadcast to all interfaces, carrying the \
+             ingress interface as the mode-filtering origin (not excluded)",
         );
     }
 }

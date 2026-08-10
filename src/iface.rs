@@ -86,8 +86,19 @@ const SATURATED_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TxMessageType {
+    /// Broadcast to every interface, optionally excluding the given one.
+    /// `Broadcast(Some(addr))` excludes `addr`; `Broadcast(None)` sends to all.
     Broadcast(Option<AddressHash>),
+    /// Send only to the given interface.
     Direct(AddressHash),
+    /// Broadcast to every interface *including* the one the packet was
+    /// received on, using the given address as the origin for
+    /// interface-mode-based announce filtering. This matches the Python
+    /// reference implementation, which rebroadcasts received announces on
+    /// all interfaces (loop prevention is handled by packet-hash
+    /// deduplication and echo counting, not by excluding the ingress
+    /// interface).
+    BroadcastFrom(AddressHash),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1463,13 +1474,8 @@ impl InterfaceManager {
         let mut max_wait = Duration::ZERO;
         for iface in &self.ifaces {
             let should_send = match message.tx_type {
-                TxMessageType::Broadcast(address) => {
-                    let mut should_send = true;
-                    if let Some(address) = address {
-                        should_send = address != iface.address;
-                    }
-                    should_send
-                }
+                TxMessageType::Broadcast(Some(address)) => address != iface.address,
+                TxMessageType::Broadcast(None) | TxMessageType::BroadcastFrom(_) => true,
                 TxMessageType::Direct(address) => address == iface.address,
             };
 
@@ -1523,20 +1529,17 @@ impl InterfaceManager {
         // destination interface, so computing them once avoids O(n²) behaviour
         // from the linear scan inside self.interface_mode().
         let source_mode = match &message.tx_type {
-            TxMessageType::Broadcast(Some(addr)) => Some(self.interface_mode(addr)),
+            TxMessageType::Broadcast(Some(addr)) | TxMessageType::BroadcastFrom(addr) => {
+                Some(self.interface_mode(addr))
+            }
             _ => None,
         };
         let is_local = self.is_local_destination(&message.packet.destination);
 
         for iface in &self.ifaces {
             let should_send = match message.tx_type {
-                TxMessageType::Broadcast(address) => {
-                    let mut should_send = true;
-                    if let Some(address) = address {
-                        should_send = address != iface.address;
-                    }
-                    should_send
-                }
+                TxMessageType::Broadcast(Some(address)) => address != iface.address,
+                TxMessageType::Broadcast(None) | TxMessageType::BroadcastFrom(_) => true,
                 TxMessageType::Direct(address) => address == iface.address,
             };
 
@@ -1643,7 +1646,9 @@ impl InterfaceManager {
                 // AP from relaying unrelated network noise to its clients.
                 if iface.mode == InterfaceMode::AccessPoint {
                     let from_other_iface = match &message.tx_type {
-                        TxMessageType::Broadcast(Some(addr)) => *addr != iface.address,
+                        TxMessageType::Broadcast(Some(addr)) | TxMessageType::BroadcastFrom(addr) => {
+                            *addr != iface.address
+                        }
                         _ => false,
                     };
                     if from_other_iface {
@@ -2277,6 +2282,62 @@ mod tests {
         // All other interfaces receive it.
         for (lbl, _addr, rx) in &mut h.ifaces {
             let should = *lbl != "ap";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    /// A forwarded announce rebroadcast (`BroadcastFrom`) must reach ALL
+    /// interfaces, INCLUDING the ingress interface it was received on.
+    /// Excluding the ingress interface breaks multi-hop propagation on
+    /// single-interface nodes.
+    #[tokio::test]
+    async fn forwarded_announce_rebroadcast_reaches_ingress_interface() {
+        let mut h = ModeTestHarness::new();
+        let full_addr = h.ifaces.iter().find(|(l, _, _)| *l == "full").unwrap().1;
+
+        let mut msg = forwarded_announce(0xaa);
+        msg.tx_type = TxMessageType::BroadcastFrom(full_addr);
+        h.mgr.send_flush(msg).await;
+
+        // Full (the ingress interface), Boundary and Internal all receive
+        // the announce rebroadcast. The AP interface blocks all announces
+        // by its own mode filter (unrelated to the ingress-interface bug).
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            let should = *lbl != "ap";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl} must receive the forwarded announce",
+            );
+        }
+    }
+
+    /// `BroadcastFrom` still applies interface-mode announce filtering based
+    /// on the origin interface: an announce received on an Internal-mode
+    /// interface must not be rebroadcast onto an AP interface, but IS sent
+    /// back out the Internal ingress interface.
+    #[tokio::test]
+    async fn forwarded_announce_rebroadcast_still_applies_mode_filter() {
+        let mut h = ModeTestHarness::new();
+        let internal_addr = h
+            .ifaces
+            .iter()
+            .find(|(l, _, _)| *l == "internal")
+            .unwrap()
+            .1;
+
+        let mut msg = forwarded_announce(0xbb);
+        msg.tx_type = TxMessageType::BroadcastFrom(internal_addr);
+        h.mgr.send_flush(msg).await;
+
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            // Internal (source) must receive it back; AP must be blocked by
+            // the mode filter; Full and Boundary are unaffected.
+            let should = *lbl == "internal" || *lbl == "full" || *lbl == "boundary";
             assert_eq!(
                 rx.try_recv().is_ok(),
                 should,
