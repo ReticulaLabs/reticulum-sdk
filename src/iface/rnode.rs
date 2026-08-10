@@ -8,10 +8,11 @@ use tokio::sync::Notify;
 use tokio_serial::{DataBits, SerialPortBuilderExt, SerialStream, StopBits};
 use tokio_util::sync::CancellationToken;
 
-use crate::buffer::{InputBuffer, OutputBuffer};
-use crate::iface::{DEFAULT_ANNOUNCE_CAP, Interface, InterfaceContext, InterfaceMode, RxMessage};
+use crate::iface::{
+    decode_rx, encode_tx, IfacConfig, DEFAULT_ANNOUNCE_CAP, Interface, InterfaceContext,
+    InterfaceMode, RxMessage,
+};
 use crate::packet::Packet;
-use crate::serde::Serialize;
 
 const RNODE_HW_MTU: usize = 508;
 const SERIAL_SPEED: u32 = 115_200;
@@ -229,6 +230,7 @@ impl RNodeInterface {
         let iface_stop = context.channel.stop.clone();
         let iface_address = context.channel.address;
         let config = { context.inner.lock().unwrap().config.clone() };
+        let ifac_config = context.channel.ifac_config();
 
         if let Err(error) = config.validate() {
             log::error!("rnode_interface: invalid configuration: {}", error);
@@ -276,6 +278,7 @@ impl RNodeInterface {
                 let rx_channel = rx_channel.clone();
                 let state = state.clone();
                 let ready = ready.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     read_loop(
@@ -286,6 +289,7 @@ impl RNodeInterface {
                         ready,
                         cancel,
                         stop,
+                        ifac_config,
                     )
                     .await;
                 })
@@ -312,6 +316,7 @@ impl RNodeInterface {
                 let ready = ready.clone();
                 let write_stream = write_stream.clone();
                 let config = config.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     tx_loop(
@@ -323,6 +328,7 @@ impl RNodeInterface {
                         iface_address,
                         cancel,
                         stop,
+                        ifac_config,
                     )
                     .await;
                 })
@@ -789,6 +795,7 @@ async fn read_loop<R>(
     ready: Arc<Notify>,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -811,7 +818,16 @@ async fn read_loop<R>(
                         last_read = tokio::time::Instant::now();
                         for &byte in &buffer[..n] {
                             if let Some(frame) = decoder.push(byte) {
-                                if !handle_frame(frame, iface_address, &rx_channel, &state, &ready).await {
+                                if !handle_frame(
+                                    frame,
+                                    iface_address,
+                                    &rx_channel,
+                                    &state,
+                                    &ready,
+                                    ifac_config.clone(),
+                                )
+                                .await
+                                {
                                     stop.cancel();
                                     break;
                                 }
@@ -839,6 +855,7 @@ async fn handle_frame(
     rx_channel: &crate::iface::InterfaceRxSender,
     state: &Arc<tokio::sync::Mutex<RNodeState>>,
     ready: &Arc<Notify>,
+    ifac_config: Option<IfacConfig>,
 ) -> bool {
     match frame.command {
         kiss::CMD_DATA => {
@@ -850,7 +867,7 @@ async fn handle_frame(
                 return true;
             }
 
-            match Packet::deserialize(&mut InputBuffer::new(&frame.payload)) {
+            match decode_rx(ifac_config.as_ref(), &frame.payload) {
                 Ok(packet) => {
                     log::trace!("rnode_interface: rx << ({}) {} bytes", iface_address, frame.payload.len());
                     let rstate = state.lock().await;
@@ -1091,6 +1108,7 @@ async fn tx_loop<W>(
     iface_address: crate::hash::AddressHash,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) where
     W: AsyncWrite + Unpin,
 {
@@ -1105,8 +1123,15 @@ async fn tx_loop<W>(
 
         if config.flow_control && !packet_queue.is_empty() && is_interface_ready(&state).await {
             if let Some(packet) = packet_queue.pop_front() {
-                if let Err(error) =
-                    send_packet(&writer, &state, &config, packet, iface_address).await
+                if let Err(error) = send_packet(
+                    &writer,
+                    &state,
+                    &config,
+                    packet,
+                    iface_address,
+                    ifac_config.clone(),
+                )
+                .await
                 {
                     log::warn!("rnode_interface: serial write error: {}", error);
                     stop.cancel();
@@ -1128,7 +1153,16 @@ async fn tx_loop<W>(
                     continue;
                 }
 
-                if let Err(error) = send_packet(&writer, &state, &config, packet, iface_address).await {
+                if let Err(error) = send_packet(
+                    &writer,
+                    &state,
+                    &config,
+                    packet,
+                    iface_address,
+                    ifac_config.clone(),
+                )
+                .await
+                {
                     log::warn!("rnode_interface: serial write error: {}", error);
                     stop.cancel();
                     break;
@@ -1152,34 +1186,37 @@ async fn send_packet<W>(
     config: &RNodeConfig,
     packet: Packet,
     iface_address: crate::hash::AddressHash,
+    ifac_config: Option<IfacConfig>,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let mut tx_buffer = [0u8; RNODE_HW_MTU];
-    let mut output = OutputBuffer::new(&mut tx_buffer);
-    if let Err(error) = packet.serialize(&mut output) {
-        log::warn!("rnode_interface: couldn't serialize outbound packet: {error}");
-        return Ok(());
-    }
+    let tx_len = match encode_tx(ifac_config.as_ref(), &packet, &mut tx_buffer) {
+        Ok(len) => len,
+        Err(error) => {
+            log::warn!("rnode_interface: couldn't serialize outbound packet: {error}");
+            return Ok(());
+        }
+    };
 
-    if output.offset() > RNODE_HW_MTU {
+    if tx_len > RNODE_HW_MTU {
         log::warn!(
             "rnode_interface: dropping oversized outbound packet len={} mtu={}",
-            output.offset(),
+            tx_len,
             RNODE_HW_MTU
         );
         return Ok(());
     }
 
-    log::trace!("rnode_interface: tx >> ({}) {} bytes", iface_address, output.offset());
+    log::trace!("rnode_interface: tx >> ({}) {} bytes", iface_address, tx_len);
 
     if config.flow_control {
         let mut state = state.lock().await;
         state.interface_ready = false;
     }
 
-    write_command(writer, kiss::CMD_DATA, output.as_slice()).await
+    write_command(writer, kiss::CMD_DATA, &tx_buffer[..tx_len]).await
 }
 
 #[cfg(test)]

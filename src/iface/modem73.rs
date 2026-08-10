@@ -14,13 +14,10 @@ use tokio::net::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::iface::{
-    DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU,
-    RxMessage, configured_bitrate,
+    decode_rx, encode_tx, IfacConfig, DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode,
+    MAX_AUTOCONFIGURED_HW_MTU, RxMessage, configured_bitrate,
 };
-use crate::packet::Packet;
-use crate::serde::Serialize;
 
 const FEND: u8 = 0xc0;
 const FESC: u8 = 0xdb;
@@ -109,6 +106,7 @@ impl Modem73Interface {
         let iface_stop = context.channel.stop.clone();
         let iface_address = context.channel.address;
         let config = { context.inner.lock().unwrap().clone() };
+        let ifac_config = context.channel.ifac_config();
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
@@ -187,9 +185,11 @@ impl Modem73Interface {
                 let cancel = cancel.clone();
                 let stop = stop.clone();
                 let mtu = config.current_mtu.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
-                    read_loop(read_stream, iface_address, rx_channel, mtu, cancel, stop).await;
+                    read_loop(read_stream, iface_address, rx_channel, mtu, cancel, stop, ifac_config)
+                        .await;
                 })
             };
 
@@ -198,9 +198,19 @@ impl Modem73Interface {
                 let cancel = cancel.clone();
                 let stop = stop.clone();
                 let mtu = config.current_mtu.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
-                    write_loop(write_stream, iface_address, tx_channel, mtu, cancel, stop).await;
+                    write_loop(
+                        write_stream,
+                        iface_address,
+                        tx_channel,
+                        mtu,
+                        cancel,
+                        stop,
+                        ifac_config,
+                    )
+                    .await;
                 })
             };
 
@@ -493,6 +503,7 @@ async fn read_loop(
     mtu: Arc<AtomicUsize>,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) {
     let mut decoder = KissDecoder::new();
     let mut tcp_buffer = [0u8; TCP_READ_BUFFER_SIZE];
@@ -512,7 +523,7 @@ async fn read_loop(
                         let max_frame_len = mtu.load(Ordering::Relaxed).min(MAX_AUTOCONFIGURED_HW_MTU);
                         for &byte in &tcp_buffer[..n] {
                             if let Some(data) = decoder.push(byte, max_frame_len) {
-                                match Packet::deserialize(&mut InputBuffer::new(&data)) {
+                                match decode_rx(ifac_config.as_ref(), &data) {
                                     Ok(packet) => {
                                         if PACKET_TRACE {
                                             log::trace!("modem73_interface: rx << ({}) {}", iface_address, packet);
@@ -542,6 +553,7 @@ async fn write_loop(
     mtu: Arc<AtomicUsize>,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) {
     loop {
         if stop.is_cancelled() {
@@ -555,21 +567,23 @@ async fn write_loop(
             Some(message) = tx_channel.recv() => {
                 let max_payload_len = mtu.load(Ordering::Relaxed).min(MAX_AUTOCONFIGURED_HW_MTU);
                 let mut tx_buffer = vec![0u8; max_payload_len];
-                let mut output = OutputBuffer::new(&mut tx_buffer);
-                if message.packet.serialize(&mut output).is_err() {
-                    log::warn!("modem73_interface: couldn't encode packet");
-                    continue;
-                }
+                let tx_len = match encode_tx(ifac_config.as_ref(), &message.packet, &mut tx_buffer) {
+                    Ok(len) => len,
+                    Err(_) => {
+                        log::warn!("modem73_interface: couldn't encode packet");
+                        continue;
+                    }
+                };
 
                 if PACKET_TRACE {
                     log::trace!(
                         "modem73_interface: tx >> ({}) {} bytes",
                         iface_address,
-                        output.as_slice().len()
+                        tx_len
                     );
                 }
 
-                let frame = encode_data_frame(output.as_slice());
+                let frame = encode_data_frame(&tx_buffer[..tx_len]);
                 if let Err(error) = stream.write_all(&frame).await {
                     log::warn!("modem73_interface: KISS data write error: {}", error);
                     stop.cancel();

@@ -229,17 +229,27 @@ impl Default for Header {
 
 impl Header {
     pub fn to_meta(&self) -> u8 {
-        let meta = (self.header_type as u8) << 6
+        let mut meta = (self.header_type as u8) << 6
             | (self.context_flag as u8) << 5
             | (self.propagation_type as u8) << 4
             | (self.destination_type as u8) << 2
             | (self.packet_type as u8) << 0;
+        // The IFAC flag is the top bit of the header byte. It is only set
+        // on the wire (and by serialization); it is cleared from the
+        // signature input in `Packet::signed_data`.
+        if self.ifac_flag == IfacFlag::Authenticated {
+            meta |= 0b1000_0000;
+        }
         meta
     }
 
     pub fn from_meta(meta: u8) -> Self {
         Self {
-            ifac_flag: IfacFlag::Open,
+            ifac_flag: if meta & 0b1000_0000 != 0 {
+                IfacFlag::Authenticated
+            } else {
+                IfacFlag::Open
+            },
             header_type: HeaderType::from(meta >> 6),
             context_flag: ContextFlag::from(meta >> 5),
             propagation_type: PropagationType::from(meta >> 4),

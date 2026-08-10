@@ -24,13 +24,32 @@ const IFAC_SALT: [u8; 32] = [
 ///
 /// Because the keypair is deterministically derived from the shared access
 /// code, verification of truncated signatures works by re-signing the data
-/// and comparing the first `ifac_len` bytes. Only full 64-byte signatures
-/// use `verify_strict()`.
+/// and comparing the last `ifac_len` bytes (the Python reference truncates
+/// from the *end* of the signature). Only full 64-byte signatures use
+/// `verify_strict()`.
+///
+/// In addition to the signature, the whole packet frame is XOR-masked with
+/// an HKDF-SHA256 keystream derived from the IFAC bytes and the full 64-byte
+/// `ifac_key`. This masking is mandatory on the wire and byte-for-byte
+/// matches the Python reference (`Transport.transmit` / `Transport.inbound`).
 #[derive(Clone)]
 pub struct IfacConfig {
     sign_key: SigningKey,
     verify_key: VerifyingKey,
+    /// Full 64-byte HKDF output derived from the access code. The first 32
+    /// bytes are the X25519 portion, the last 32 the Ed25519 signing seed.
+    /// The full value is used as the HKDF salt for the packet mask.
+    ifac_key: [u8; 64],
     ifac_len: usize,
+}
+
+/// Derive the same HKDF-SHA256 stream as the Python reference `hkdf()`
+/// (RNS/Cryptography/HKDF.py): PRK = HMAC(salt, ikm), then standard
+/// HKDF-Expand with an empty context.
+fn hkdf_stream(salt: &[u8], ikm: &[u8], length: usize) -> Vec<u8> {
+    let mut out = vec![0u8; length];
+    let _ = Hkdf::<Sha256>::new(Some(salt), ikm).expand(&[], &mut out[..]);
+    out
 }
 
 impl IfacConfig {
@@ -81,6 +100,7 @@ impl IfacConfig {
         Self {
             sign_key,
             verify_key,
+            ifac_key,
             ifac_len,
         }
     }
@@ -89,8 +109,9 @@ impl IfacConfig {
     ///
     /// Signs the packet's `signed_data()` (header with IFAC flag cleared,
     /// addresses, context, and data) using the configured Ed25519 key. Stores
-    /// the (possibly truncated) signature in `packet.ifac` and sets
-    /// `ifac_flag` to `Authenticated`.
+    /// the truncated signature (taking the *last* `ifac_len` bytes, matching
+    /// the Python reference `sign(raw)[-ifac_size:]`) in `packet.ifac` and
+    /// sets `ifac_flag` to `Authenticated`.
     pub fn attach(&self, packet: &mut Packet) -> Result<(), RnsError> {
         let signed_data = packet.signed_data()?;
 
@@ -98,10 +119,85 @@ impl IfacConfig {
         let sig_bytes = signature.to_bytes();
 
         let truncated_len = self.ifac_len.min(SIGNATURE_LENGTH);
+        let ifac_start = SIGNATURE_LENGTH - truncated_len;
         packet.header.ifac_flag = IfacFlag::Authenticated;
-        packet.ifac = Some(PacketIfac::new_from_slice(&sig_bytes[..truncated_len]));
+        packet.ifac = Some(PacketIfac::new_from_slice(&sig_bytes[ifac_start..]));
 
         Ok(())
+    }
+
+    /// Mask a fully serialized IFAC frame in place, matching the Python
+    /// reference `Transport.transmit()`:
+    ///
+    /// ```text
+    /// byte 0:                flags ^ mask[0] | 0x80   (IFAC flag kept set)
+    /// byte 1:                hops  ^ mask[1]
+    /// bytes 2..2+ifac_len:   IFAC field               (NOT masked)
+    /// bytes 2+ifac_len..:    rest  ^ mask[i]
+    /// mask = HKDF-SHA256(len(frame), ikm=IFAC, salt=ifac_key)
+    /// ```
+    ///
+    /// The frame must be laid out exactly as `Packet::serialize` writes it:
+    /// header (with the IFAC flag set), then the IFAC field, then the rest.
+    pub fn mask_frame(&self, frame: &mut [u8]) -> Result<(), RnsError> {
+        if self.ifac_len == 0 || frame.len() <= 2 + self.ifac_len {
+            return Err(RnsError::PacketError);
+        }
+
+        let ifac = &frame[2..2 + self.ifac_len];
+        let mask = hkdf_stream(&self.ifac_key, ifac, frame.len());
+
+        for (i, byte) in frame.iter_mut().enumerate() {
+            if i == 0 {
+                *byte = (*byte ^ mask[i]) | 0x80;
+            } else if i == 1 || i > self.ifac_len + 1 {
+                *byte ^= mask[i];
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Decode a received IFAC frame, matching the Python reference
+    /// `Transport.inbound()`: check the IFAC flag, unmask the header and
+    /// payload with the HKDF keystream, strip the IFAC field, verify the
+    /// signature, and return the clean packet bytes (IFAC flag cleared,
+    /// IFAC field removed) ready for `Packet::deserialize`.
+    pub fn decode_frame(&self, frame: &[u8]) -> Result<Vec<u8>, RnsError> {
+        if self.ifac_len == 0 || frame.len() <= 2 + self.ifac_len {
+            return Err(RnsError::PacketError);
+        }
+        if frame[0] & 0x80 == 0 {
+            return Err(RnsError::PacketError);
+        }
+
+        let ifac = &frame[2..2 + self.ifac_len];
+        let mask = hkdf_stream(&self.ifac_key, ifac, frame.len());
+
+        let mut unmasked = frame.to_vec();
+        for (i, byte) in unmasked.iter_mut().enumerate() {
+            if i <= 1 || i > self.ifac_len + 1 {
+                *byte ^= mask[i];
+            }
+        }
+
+        // Re-assemble the packet without the IFAC field, with the IFAC
+        // flag cleared, exactly like Python's `new_header + raw[2+ifac_size:]`.
+        let mut clean = Vec::with_capacity(frame.len() - self.ifac_len);
+        clean.push(unmasked[0] & 0x7f);
+        clean.push(unmasked[1]);
+        clean.extend_from_slice(&unmasked[2 + self.ifac_len..]);
+
+        // The signature is over the clean packet; truncated from the end.
+        let expected = self.sign_key.sign(&clean);
+        let expected_bytes = expected.to_bytes();
+        let expected_truncated = &expected_bytes[SIGNATURE_LENGTH - self.ifac_len..];
+
+        if expected_truncated == ifac {
+            Ok(clean)
+        } else {
+            Err(RnsError::IncorrectSignature)
+        }
     }
 
     /// Verify the IFAC on a received packet.
@@ -140,13 +236,15 @@ impl IfacConfig {
         }
 
         if ifac_bytes.len() < SIGNATURE_LENGTH {
-            // Truncated IFAC: re-sign and compare the prefix.
-            // Both sides share the same signing key (derived from the
-            // access code), so the verifier can deterministically
-            // reconstruct the full signature.
+            // Truncated IFAC: re-sign and compare the suffix. Both sides
+            // share the same signing key (derived from the access code), so
+            // the verifier can deterministically reconstruct the full
+            // signature. The Python reference truncates from the end
+            // (`sign(raw)[-ifac_size:]`), so the last bytes are compared.
             let expected = self.sign_key.sign(signed_data);
             let expected_bytes = expected.to_bytes();
-            if &expected_bytes[..ifac_bytes.len()] == ifac_bytes {
+            let expected_truncated = &expected_bytes[SIGNATURE_LENGTH - ifac_bytes.len()..];
+            if expected_truncated == ifac_bytes {
                 Ok(())
             } else {
                 Err(RnsError::IncorrectSignature)
@@ -181,8 +279,8 @@ mod tests {
     use super::*;
     use crate::hash::AddressHash;
     use crate::packet::{
-        DestinationType, Header, HeaderType, PacketContext, PacketDataBuffer, PacketType,
-        PropagationType,
+        ContextFlag, DestinationType, Header, HeaderType, PacketContext, PacketDataBuffer,
+        PacketType, PropagationType,
     };
 
     #[test]
@@ -433,5 +531,149 @@ mod tests {
         config
             .verify_packet(&parsed)
             .expect("verify after deserialization");
+    }
+
+    /// Full end-to-end wire-format compatibility test against values
+    /// computed with the Python reference implementation
+    /// (`Transport.transmit` / `Transport.inbound`):
+    ///
+    /// For `netname="test", ifac_size=8` and a packet
+    /// `flags=0x00, hops=3, dest=0011...eeff, ctx=0x00, data="hello ifac"`:
+    ///   signature (last 8 bytes) = 39b7c55178fa4801
+    ///   masked frame             = a7b4 39b7c55178fa4801 c9ea78bfb8c4abfece7cfdc682da8aa4b369a367944e3b691db23b
+    ///
+    /// The test proves: (1) the truncated signature uses the LAST bytes of
+    /// the Ed25519 signature, (2) the HKDF mask is applied byte-for-byte
+    /// like Python, (3) the flag byte carries the 0x80 IFAC bit, and
+    /// (4) `decode_frame` inverts the whole process.
+    #[test]
+    fn masked_frame_matches_python_reference_vector() {
+        let config = IfacConfig::derive(Some("test"), None, 8);
+
+        let dest = AddressHash::new([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+
+        let mut packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 3,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: dest,
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(b"hello ifac"),
+        };
+
+        config.attach(&mut packet).expect("attach ifac");
+        assert_eq!(
+            packet.ifac.as_ref().map(|i| i.as_slice().len()),
+            Some(8),
+            "truncated IFAC length"
+        );
+
+        use crate::buffer::OutputBuffer;
+        use crate::serde::Serialize;
+
+        let mut frame = [0u8; 1024];
+        let mut output = OutputBuffer::new(&mut frame);
+        packet.serialize(&mut output).expect("serialize");
+        let len = output.offset();
+
+        // Byte 0 must carry the IFAC flag before masking.
+        assert_eq!(frame[0] & 0x80, 0x80, "IFAC flag must be set in header byte");
+
+        config
+            .mask_frame(&mut frame[..len])
+            .expect("mask frame");
+
+        let expected = vec![
+            0xa7, 0xb4, 0x39, 0xb7, 0xc5, 0x51, 0x78, 0xfa, 0x48, 0x01, 0xc9, 0xea, 0x78, 0xbf,
+            0xb8, 0xc4, 0xab, 0xfe, 0xce, 0x7c, 0xfd, 0xc6, 0x82, 0xda, 0x8a, 0xa4, 0xb3, 0x69,
+            0xa3, 0x67, 0x94, 0x4e, 0x3b, 0x69, 0x1d, 0xb2, 0x3b,
+        ];
+        assert_eq!(&frame[..len], expected.as_slice(), "masked frame must match Python");
+
+        // Now decode it back (Python receiver side).
+        let clean = config.decode_frame(&frame[..len]).expect("decode frame");
+        assert_eq!(
+            clean,
+            [
+                &[0x00u8, 0x03][..],
+                dest.as_slice(),
+                &[0x00u8],
+                b"hello ifac",
+            ]
+            .concat(),
+            "decoded frame must be the clean packet bytes",
+        );
+
+        // And it must round-trip through deserialization.
+        use crate::buffer::InputBuffer;
+        let mut input = InputBuffer::new(&clean);
+        let parsed = Packet::deserialize(&mut input).expect("deserialize clean packet");
+        assert_eq!(parsed.header.hops, 3);
+        assert_eq!(parsed.destination, dest);
+        assert_eq!(parsed.data.as_slice(), b"hello ifac");
+        assert_eq!(parsed.header.ifac_flag, IfacFlag::Open);
+        assert!(parsed.ifac.is_none());
+    }
+
+    /// `decode_frame` must reject frames that do not carry the IFAC flag,
+    /// frames shorter than the IFAC field, and tampered frames.
+    #[test]
+    fn decode_frame_rejects_bad_frames() {
+        let config = IfacConfig::derive(Some("test"), None, 8);
+
+        let mut packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 1,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: AddressHash::new([0x42; 16]),
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(b"data"),
+        };
+
+        config.attach(&mut packet).expect("attach ifac");
+
+        use crate::buffer::OutputBuffer;
+        use crate::serde::Serialize;
+        let mut frame = [0u8; 1024];
+        let mut output = OutputBuffer::new(&mut frame);
+        packet.serialize(&mut output).expect("serialize");
+        let len = output.offset();
+        config.mask_frame(&mut frame[..len]).expect("mask");
+
+        // Valid frame decodes.
+        config.decode_frame(&frame[..len]).expect("valid frame");
+
+        // Missing IFAC flag → rejected.
+        let mut no_flag = frame[..len].to_vec();
+        no_flag[0] &= 0x7f;
+        assert!(config.decode_frame(&no_flag).is_err());
+
+        // Too short → rejected.
+        assert!(config.decode_frame(&frame[..3]).is_err());
+
+        // Tampered payload → signature mismatch.
+        let mut tampered = frame[..len].to_vec();
+        tampered[len - 1] ^= 0x01;
+        assert!(config.decode_frame(&tampered).is_err());
     }
 }

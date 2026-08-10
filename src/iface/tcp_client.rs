@@ -8,16 +8,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::buffer::{InputBuffer, OutputBuffer};
+use crate::buffer::OutputBuffer;
 use crate::error::RnsError;
 use crate::iface::{
-    DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU,
-    RxMessage, configured_bitrate,
+    decode_rx, encode_tx, DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode,
+    MAX_AUTOCONFIGURED_HW_MTU, RxMessage, configured_bitrate,
 };
-use crate::packet::{
-    Header, HeaderType, Packet, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE,
-};
-use crate::serde::Serialize;
+use crate::packet::{Header, HeaderType, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE};
 
 use tokio::io::AsyncReadExt;
 
@@ -129,6 +126,7 @@ impl TcpClient {
         let addr = { context.inner.lock().unwrap().addr.clone() };
         let iface_address = context.channel.address;
         let mut stream = { context.inner.lock().unwrap().stream.take() };
+        let ifac_config = context.channel.ifac_config();
 
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -207,6 +205,7 @@ impl TcpClient {
                 let mut stream = read_stream;
                 let rx_channel = rx_channel.clone();
                 let rx_addr = addr.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     let mut frame_buffer = Vec::with_capacity(DEFAULT_HW_MTU);
@@ -257,7 +256,7 @@ impl TcpClient {
                                                             continue;
                                                         }
 
-                                                        match Packet::deserialize(&mut InputBuffer::new(decoded)) {
+                                                        match decode_rx(ifac_config.as_ref(), decoded) {
                                                             Ok(packet) => {
                                                                 if PACKET_TRACE {
                                                                     log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
@@ -332,6 +331,7 @@ impl TcpClient {
                 let cancel = cancel.clone();
                 let tx_channel = tx_channel.clone();
                 let mut stream = write_stream;
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     let mut hdlc_tx_buffer = vec![0u8; MAX_AUTOCONFIGURED_HW_MTU + 2];
@@ -356,12 +356,11 @@ impl TcpClient {
                                 if PACKET_TRACE {
                                     log::trace!("tcp_client: tx >> ({}) {}", iface_address, packet);
                                 }
-                                let mut output = OutputBuffer::new(&mut tx_buffer[..]);
-                                if let Ok(_) = packet.serialize(&mut output) {
+                                if let Ok(len) = encode_tx(ifac_config.as_ref(), &packet, &mut tx_buffer[..]) {
 
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
 
-                                    if let Ok(_) = Hdlc::encode(output.as_slice(), &mut hdlc_output) {
+                                    if let Ok(_) = Hdlc::encode(&tx_buffer[..len], &mut hdlc_output) {
                                         let _ = stream.write_all(hdlc_output.as_slice()).await;
                                         let _ = stream.flush().await;
                                     }

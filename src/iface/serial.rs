@@ -10,11 +10,9 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::buffer::{InputBuffer, OutputBuffer};
+use crate::buffer::OutputBuffer;
 use crate::iface::hdlc::Hdlc;
-use crate::iface::{Interface, InterfaceContext, RxMessage};
-use crate::packet::Packet;
-use crate::serde::Serialize;
+use crate::iface::{decode_rx, encode_tx, IfacConfig, Interface, InterfaceContext, RxMessage};
 
 const HW_MTU: usize = 564;
 const MAX_CHUNK: usize = 32_768;
@@ -103,6 +101,7 @@ impl SerialInterface {
     pub async fn spawn(context: InterfaceContext<Self>) {
         let iface_stop = context.channel.stop.clone();
         let iface_address = context.channel.address;
+        let ifac_config = context.channel.ifac_config();
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
@@ -143,6 +142,7 @@ impl SerialInterface {
                 let cancel = cancel.clone();
                 let stop = stop.clone();
                 let rx_channel = rx_channel.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     if config.compatibility_mode {
@@ -152,6 +152,7 @@ impl SerialInterface {
                             rx_channel,
                             cancel,
                             stop,
+                            ifac_config,
                         )
                         .await;
                     } else {
@@ -161,6 +162,7 @@ impl SerialInterface {
                             rx_channel,
                             cancel,
                             stop,
+                            ifac_config,
                         )
                         .await;
                     }
@@ -171,6 +173,7 @@ impl SerialInterface {
                 let cancel = cancel.clone();
                 let tx_channel = tx_channel.clone();
                 let stop = stop.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     write_loop(
@@ -179,6 +182,7 @@ impl SerialInterface {
                         tx_channel,
                         cancel,
                         stop,
+                        ifac_config,
                     )
                     .await;
                 })
@@ -271,6 +275,7 @@ async fn read_loop<R>(
     rx_channel: crate::iface::InterfaceRxSender,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) where
     R: tokio::io::AsyncReadExt + Unpin,
 {
@@ -293,7 +298,7 @@ async fn read_loop<R>(
                     Ok(n) => {
                         for &byte in &chunk[..n] {
                             if let Some(frame) = decoder.push(byte) {
-                                if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&frame)) {
+                                if let Ok(packet) = decode_rx(ifac_config.as_ref(), &frame) {
                                     if PACKET_TRACE {
                                         log::trace!("serial_interface: rx << ({}) {}", iface_address, packet);
                                     }
@@ -324,6 +329,7 @@ async fn read_loop_byte<R>(
     rx_channel: crate::iface::InterfaceRxSender,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) where
     R: tokio::io::AsyncReadExt + Unpin,
 {
@@ -349,7 +355,7 @@ async fn read_loop_byte<R>(
                             last_activity = tokio::time::Instant::now();
                             for &byte in &single[..n] {
                                 if let Some(frame) = decoder.push(byte) {
-                                    if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&frame)) {
+                                    if let Ok(packet) = decode_rx(ifac_config.as_ref(), &frame) {
                                         if PACKET_TRACE {
                                             log::trace!("serial_interface: rx << ({}) {}", iface_address, packet);
                                         }
@@ -383,6 +389,7 @@ async fn write_loop<W>(
     tx_channel: Arc<tokio::sync::Mutex<crate::iface::InterfaceTxReceiver>>,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) where
     W: tokio::io::AsyncWriteExt + Unpin,
 {
@@ -397,13 +404,15 @@ async fn write_loop<W>(
             _ = stop.cancelled() => break,
             Some(message) = tx_channel.recv() => {
                 let mut tx_buffer = [0u8; HW_MTU * 2 + 4];
-                let mut output = OutputBuffer::new(&mut tx_buffer);
-                if message.packet.serialize(&mut output).is_err() {
-                    log::warn!("serial_interface: couldn't encode packet");
-                    continue;
-                }
+                let tx_len = match encode_tx(ifac_config.as_ref(), &message.packet, &mut tx_buffer) {
+                    Ok(len) => len,
+                    Err(_) => {
+                        log::warn!("serial_interface: couldn't encode packet");
+                        continue;
+                    }
+                };
 
-                let packet_data = output.as_slice();
+                let packet_data = &tx_buffer[..tx_len];
                 let mut hdlc_buffer = [0u8; HW_MTU * 2 + 4 + 2];
                 let mut hdlc_output = OutputBuffer::new(&mut hdlc_buffer);
                 if Hdlc::encode(packet_data, &mut hdlc_output).is_err() {

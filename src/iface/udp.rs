@@ -3,13 +3,11 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
 use crate::iface::{
-    DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode, RxMessage, configured_bitrate,
+    decode_rx, encode_tx, DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode, RxMessage,
+    configured_bitrate,
 };
-use crate::packet::Packet;
-use crate::serde::Serialize;
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = true;
@@ -45,6 +43,7 @@ impl UdpInterface {
         let bind_addr = { context.inner.lock().unwrap().bind_addr.clone() };
         let forward_addr = { context.inner.lock().unwrap().forward_addr.clone() };
         let iface_address = context.channel.address;
+        let ifac_config = context.channel.ifac_config();
 
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -81,6 +80,7 @@ impl UdpInterface {
                 let stop = stop.clone();
                 let socket = read_socket;
                 let rx_channel = rx_channel.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -101,7 +101,7 @@ impl UdpInterface {
                                         break;
                                     }
                                     Ok((n, _in_addr)) => {
-                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&rx_buffer[..n])) {
+                                        if let Ok(packet) = decode_rx(ifac_config.as_ref(), &rx_buffer[..n]) {
                                             if PACKET_TRACE {
                                                 log::trace!("udp_interface: rx << ({}) {}", iface_address, packet);
                                             }
@@ -127,6 +127,7 @@ impl UdpInterface {
                     let cancel = cancel.clone();
                     let tx_channel = tx_channel.clone();
                     let socket = write_socket;
+                    let ifac_config = ifac_config.clone();
 
                     tokio::spawn(async move {
                         loop {
@@ -150,9 +151,8 @@ impl UdpInterface {
                                     if PACKET_TRACE {
                                         log::trace!("udp_interface: tx >> ({}) {}", iface_address, packet);
                                     }
-                                    let mut output = OutputBuffer::new(&mut tx_buffer);
-                                    if let Ok(_) = packet.serialize(&mut output) {
-                                        let _ = socket.send_to(output.as_slice(), &forward_addr).await;
+                                    if let Ok(len) = encode_tx(ifac_config.as_ref(), &packet, &mut tx_buffer) {
+                                        let _ = socket.send_to(&tx_buffer[..len], &forward_addr).await;
                                     }
                                 }
                             };

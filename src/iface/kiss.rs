@@ -12,10 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::buffer::{InputBuffer, OutputBuffer};
-use crate::iface::{Interface, InterfaceContext, RxMessage};
-use crate::packet::Packet;
-use crate::serde::Serialize;
+use crate::iface::{decode_rx, encode_tx, IfacConfig, Interface, InterfaceContext, RxMessage};
 
 const FEND: u8 = 0xc0;
 const FESC: u8 = 0xdb;
@@ -118,6 +115,7 @@ impl KissInterface {
     pub async fn spawn(context: InterfaceContext<Self>) {
         let iface_stop = context.channel.stop.clone();
         let iface_address = context.channel.address;
+        let ifac_config = context.channel.ifac_config();
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
@@ -169,6 +167,7 @@ impl KissInterface {
                 let cancel = cancel.clone();
                 let stop = stop.clone();
                 let rx_channel = rx_channel.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     read_loop(
@@ -178,6 +177,7 @@ impl KissInterface {
                         ready_send,
                         cancel,
                         stop,
+                        ifac_config,
                     )
                     .await;
                 })
@@ -187,6 +187,7 @@ impl KissInterface {
                 let cancel = cancel.clone();
                 let tx_channel = tx_channel.clone();
                 let stop = stop.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     write_loop(
@@ -197,6 +198,7 @@ impl KissInterface {
                         config.flow_control,
                         cancel,
                         stop,
+                        ifac_config,
                     )
                     .await;
                 })
@@ -285,6 +287,7 @@ async fn read_loop<R>(
     ready_send: mpsc::Sender<()>,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) where
     R: AsyncReadExt + Unpin,
 {
@@ -308,7 +311,7 @@ async fn read_loop<R>(
                         for &byte in &chunk[..n] {
                             match decoder.push(byte) {
                                 Some(KissEvent::Data(data)) => {
-                                    if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&data)) {
+                                    if let Ok(packet) = decode_rx(ifac_config.as_ref(), &data) {
                                         if PACKET_TRACE {
                                             log::trace!("kiss_interface: rx << ({}) {}", iface_address, packet);
                                         }
@@ -346,6 +349,7 @@ async fn write_loop<W>(
     flow_control: bool,
     cancel: CancellationToken,
     stop: CancellationToken,
+    ifac_config: Option<IfacConfig>,
 ) where
     W: AsyncWriteExt + Unpin,
 {
@@ -390,9 +394,8 @@ async fn write_loop<W>(
             }
             Some(message) = tx_channel.recv() => {
                 let mut tx_buffer = [0u8; HW_MTU];
-                let mut output = OutputBuffer::new(&mut tx_buffer);
-                if message.packet.serialize(&mut output).is_ok() {
-                    queue.push_back(output.as_slice().to_vec());
+                if let Ok(len) = encode_tx(ifac_config.as_ref(), &message.packet, &mut tx_buffer) {
+                    queue.push_back(tx_buffer[..len].to_vec());
                 } else {
                     log::warn!("kiss_interface: couldn't encode packet");
                 }

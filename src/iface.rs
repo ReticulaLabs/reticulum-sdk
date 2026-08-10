@@ -23,12 +23,14 @@ use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::buffer::InputBuffer;
+use crate::error::RnsError;
 use crate::hash::ADDRESS_HASH_SIZE;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 use crate::iface::ifac::IfacConfig;
 use crate::iface::reconnect_pacer::ReconnectPacer;
 use crate::packet::{HeaderType, Packet, PacketContext, PacketType};
+use crate::serde::Serialize;
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
 pub type InterfaceTxReceiver = mpsc::Receiver<TxMessage>;
@@ -184,7 +186,10 @@ pub struct InterfaceChannel {
     pub rx_channel: InterfaceRxSender,
     pub tx_channel: InterfaceTxReceiver,
     pub stop: CancellationToken,
-    pub ifac_config: Option<IfacConfig>,
+    /// Interface Access Code configuration, shared with the interface
+    /// manager (`LocalInterface`) so it can be enabled or changed at
+    /// runtime and is visible on both the transmit and receive paths.
+    pub ifac_config: Arc<Mutex<Option<IfacConfig>>>,
     pub channel_load: Option<Arc<Mutex<f64>>>,
 }
 
@@ -208,7 +213,7 @@ impl InterfaceChannel {
             rx_channel,
             tx_channel,
             stop,
-            ifac_config: None,
+            ifac_config: Arc::new(Mutex::new(None)),
             channel_load: None,
         }
     }
@@ -216,25 +221,20 @@ impl InterfaceChannel {
     /// Deserialize a received packet buffer and verify the IFAC if this
     /// channel has IFAC configured.
     ///
-    /// Returns the parsed `Packet` with the IFAC field still attached
-    /// (the transport layer does not inspect the IFAC, so it can be
-    /// forwarded as-is).
+    /// Returns the parsed `Packet` with the IFAC field stripped and the
+    /// IFAC flag cleared (the transport layer does not inspect the IFAC).
     pub fn receive(&self, data: &[u8]) -> Result<Packet, crate::error::RnsError> {
-        match &self.ifac_config {
-            Some(config) => {
-                let packet = Packet::deserialize_with_ifac_len(
-                    &mut InputBuffer::new(data),
-                    config.ifac_len(),
-                )?;
-                config.verify_packet(&packet)?;
-                Ok(packet)
-            }
-            None => Packet::deserialize(&mut InputBuffer::new(data)),
-        }
+        let config = self.ifac_config.lock().unwrap().clone();
+        decode_rx(config.as_ref(), data)
     }
 
     pub fn set_ifac_config(&mut self, config: Option<IfacConfig>) {
-        self.ifac_config = config;
+        *self.ifac_config.lock().unwrap() = config;
+    }
+
+    /// Current IFAC configuration (a snapshot; the manager may change it).
+    pub fn ifac_config(&self) -> Option<IfacConfig> {
+        self.ifac_config.lock().unwrap().clone()
     }
 
     pub fn address(&self) -> &AddressHash {
@@ -243,6 +243,53 @@ impl InterfaceChannel {
 
     pub fn split(self) -> (InterfaceRxSender, InterfaceTxReceiver) {
         (self.rx_channel, self.tx_channel)
+    }
+}
+
+/// Serialize a packet for transmission on an interface, applying the
+/// interface's IFAC mask if configured. Returns the number of bytes
+/// written to `buffer`.
+///
+/// This is the single place where the Python-compatible HKDF packet mask
+/// is applied: the packet is serialized with the IFAC flag set and the IFAC
+/// field inserted, then the whole frame is XOR-masked in place. When no IFAC
+/// is configured this is exactly `packet.serialize()`.
+pub fn encode_tx(
+    ifac_config: Option<&IfacConfig>,
+    packet: &Packet,
+    buffer: &mut [u8],
+) -> Result<usize, RnsError> {
+    let mut out = crate::buffer::OutputBuffer::new(buffer);
+    packet.serialize(&mut out)?;
+    let len = out.offset();
+
+    if let Some(config) = ifac_config {
+        config.mask_frame(&mut buffer[..len])?;
+    }
+
+    Ok(len)
+}
+
+/// Decode a received frame, unmasking and verifying the interface IFAC if
+/// configured. Returns the decoded `Packet`.
+///
+/// When IFAC is configured this inverts `encode_tx` and authenticates the
+/// packet (matching Python `Transport.inbound`). When it is not configured,
+/// frames that carry the IFAC flag are rejected, because they were produced
+/// by a peer on an IFAC-protected interface and must not be processed here.
+pub fn decode_rx(
+    ifac_config: Option<&IfacConfig>,
+    data: &[u8],
+) -> Result<Packet, RnsError> {
+    if let Some(config) = ifac_config {
+        let clean = config.decode_frame(data)?;
+        Packet::deserialize(&mut InputBuffer::new(&clean))
+    } else {
+        // No IFAC configured: drop frames that carry the IFAC flag.
+        if !data.is_empty() && data[0] & 0x80 == 0x80 {
+            return Err(RnsError::PacketError);
+        }
+        Packet::deserialize(&mut InputBuffer::new(data))
     }
 }
 
@@ -509,9 +556,10 @@ struct LocalInterface {
     /// `None` means the interface does not participate in link MTU
     /// discovery / upgrades.
     hw_mtu: Option<Arc<AtomicUsize>>,
-    /// Interface Access Code configuration. When set, outbound packets
-    /// will have an Ed25519 IFAC signature attached before transmission.
-    ifac_config: Option<IfacConfig>,
+    /// Interface Access Code configuration, shared with the interface
+    /// (`InterfaceChannel.ifac_config`). When set, outbound packets will
+    /// have an Ed25519 IFAC signature attached before transmission.
+    ifac_config: Arc<Mutex<Option<IfacConfig>>>,
     /// Interface bitrate in bps, used for data pacing on slow links.
     bitrate: Option<f64>,
     /// Interface mode controlling announce propagation, path expiry
@@ -968,6 +1016,11 @@ impl InterfaceManager {
         let announce_pacer = announce_pacer.map(|mut p| { p.set_iface(address); p });
 
         let stop = CancellationToken::new();
+
+        // Share the IFAC configuration between the manager-side LocalInterface
+        // and the interface task (via InterfaceChannel), so enabling or
+        // changing it at runtime affects both the transmit and receive paths.
+        let ifac_config = Arc::new(Mutex::new(ifac_config));
 
         self.ifaces.push(LocalInterface {
             name,
@@ -1678,7 +1731,7 @@ impl InterfaceManager {
 
             let mut message = message.clone();
 
-            if let Some(ifac_config) = &iface.ifac_config {
+            if let Some(ifac_config) = iface.ifac_config.lock().unwrap().as_ref() {
                 if let Err(err) = ifac_config.attach(&mut message.packet) {
                     log::warn!(
                         "iface: failed to attach IFAC for iface={} err={:?}",
@@ -1717,17 +1770,19 @@ impl InterfaceManager {
     /// Set or clear the IFAC configuration for a specific interface.
     ///
     /// When set, outbound packets sent through this interface will have an
-    /// Ed25519 signature attached as an Interface Access Code.
+    /// Ed25519 signature attached as an Interface Access Code, and inbound
+    /// packets will be authenticated against it. The change takes effect
+    /// immediately on both the transmit and receive paths.
     pub fn set_ifac_config(&mut self, address: &AddressHash, config: Option<IfacConfig>) {
         if let Some(idx) = self.iface_index.get(address).copied() {
-            self.ifaces[idx].ifac_config = config;
+            *self.ifaces[idx].ifac_config.lock().unwrap() = config;
         }
     }
 
     /// Return the IFAC configuration for a specific interface, if set.
-    pub fn get_ifac_config(&self, address: &AddressHash) -> Option<&IfacConfig> {
+    pub fn get_ifac_config(&self, address: &AddressHash) -> Option<IfacConfig> {
         let idx = *self.iface_index.get(address)?;
-        self.ifaces[idx].ifac_config.as_ref()
+        self.ifaces[idx].ifac_config.lock().unwrap().clone()
     }
 
     /// Set the parent interface for an interface.
@@ -2344,6 +2399,53 @@ mod tests {
                 "{lbl}",
             );
         }
+    }
+
+    /// The interface TX/RX helpers must be mutually inverting, and must
+    /// reject frames that were masked with a different access code.
+    #[tokio::test]
+    async fn encode_tx_decode_rx_roundtrip_with_ifac() {
+        let config = IfacConfig::derive(Some("test"), None, 8);
+
+        let mut packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                context_flag: ContextFlag::Unset,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 3,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: AddressHash::new([0x01; 16]),
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(b"interface ifac roundtrip"),
+        };
+
+        // In the real flow the manager attaches the IFAC before the packet
+        // reaches the interface (see `send_flush`).
+        config.attach(&mut packet).expect("attach ifac");
+
+        let mut frame = [0u8; 1024];
+        let len = encode_tx(Some(&config), &packet, &mut frame).expect("encode with ifac");
+
+        // The masked frame carries the IFAC flag in byte 0.
+        assert_eq!(frame[0] & 0x80, 0x80, "IFAC flag set on the wire");
+
+        let decoded = decode_rx(Some(&config), &frame[..len]).expect("decode with ifac");
+        assert_eq!(decoded.destination, packet.destination);
+        assert_eq!(decoded.data.as_slice(), packet.data.as_slice());
+        assert_eq!(decoded.header.hops, packet.header.hops);
+
+        // A different access code must not verify.
+        let wrong = IfacConfig::derive(Some("wrong"), None, 8);
+        assert!(decode_rx(Some(&wrong), &frame[..len]).is_err());
+
+        // Without IFAC configured, a frame carrying the IFAC flag is dropped.
+        assert!(decode_rx(None, &frame[..len]).is_err());
     }
 
     #[tokio::test]

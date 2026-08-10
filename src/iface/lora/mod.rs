@@ -12,10 +12,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::buffer::{InputBuffer, OutputBuffer};
-use crate::iface::{Interface, InterfaceContext, RxMessage};
+use crate::iface::{decode_rx, encode_tx, IfacConfig, Interface, InterfaceContext, RxMessage};
 use crate::packet::Packet;
-use crate::serde::Serialize;
 
 const LORA_HW_MTU: usize = 508;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -582,6 +580,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
         let iface_address = context.channel.address;
         let config = { context.inner.lock().unwrap().config.clone() };
         let stats = { context.inner.lock().unwrap().stats.clone() };
+        let ifac_config = context.channel.ifac_config();
 
         if let Err(error) = config.validate() {
             log::error!("lora_interface: invalid configuration: {}", error);
@@ -622,6 +621,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 let stop = stop.clone();
                 let rx_channel = rx_channel.clone();
                 let stats = stats.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -637,7 +637,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                     );
                                     continue;
                                 }
-                                match Packet::deserialize(&mut InputBuffer::new(&pkt.payload)) {
+                                match decode_rx(ifac_config.as_ref(), &pkt.payload) {
                                     Ok(packet) => {
                                         stats.record_rx_packet();
                                         let _ = rx_channel
@@ -709,6 +709,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 let tx_channel = tx_channel.clone();
                 let config = config.clone();
                 let stats = stats.clone();
+                let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
                     let mut packet_queue: VecDeque<Packet> = VecDeque::new();
@@ -720,7 +721,8 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
 
                         if !packet_queue.is_empty() {
                             let packet = packet_queue.pop_front().unwrap();
-                            Self::do_transmit(&chipset, packet, iface_address, &stats).await;
+                            Self::do_transmit(&chipset, packet, iface_address, &stats, &ifac_config)
+                                .await;
                             continue;
                         }
 
@@ -733,7 +735,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                     packet_queue.push_back(message.packet);
                                     continue;
                                 }
-                                Self::do_transmit(&chipset, message.packet, iface_address, &stats).await;
+                                Self::do_transmit(&chipset, message.packet, iface_address, &stats, &ifac_config).await;
                             }
                         }
                     }
@@ -807,15 +809,18 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
         packet: Packet,
         _iface_address: crate::hash::AddressHash,
         stats: &LoRaInterfaceStats,
+        ifac_config: &Option<IfacConfig>,
     ) {
         let mut tx_buffer = [0u8; LORA_HW_MTU];
-        let mut output = OutputBuffer::new(&mut tx_buffer);
-        if let Err(error) = packet.serialize(&mut output) {
-            log::warn!("lora_interface: couldn't serialize outbound packet: {error}");
-            return;
-        }
+        let tx_len = match encode_tx(ifac_config.as_ref(), &packet, &mut tx_buffer) {
+            Ok(len) => len,
+            Err(error) => {
+                log::warn!("lora_interface: couldn't serialize outbound packet: {error}");
+                return;
+            }
+        };
 
-        let payload = output.as_slice().to_vec();
+        let payload = tx_buffer[..tx_len].to_vec();
         let chipset = chipset.clone();
 
         stats.record_tx_attempt(payload.len());
