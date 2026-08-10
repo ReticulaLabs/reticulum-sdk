@@ -39,7 +39,12 @@ pub const DISCOVERY_JOB_INTERVAL: Duration = Duration::from_secs(60);
 pub const DISCOVERY_MIN_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-const DEFAULT_STAMP_COST: u8 = 14;
+/// Default proof-of-work difficulty (leading zero bits) for interface
+/// discovery stamps. Must match the Python reference implementation's
+/// `InterfaceAnnouncer.DEFAULT_STAMP_VALUE` (16) for discovery announces
+/// to be accepted by Python peers: a stamp generated with a lower
+/// difficulty is rejected by them.
+const DEFAULT_STAMP_COST: u8 = 16;
 const WORKBLOCK_EXPAND_ROUNDS: usize = 20;
 const FLAG_SIGNED: u8 = 0b0000_0001;
 const FLAG_ENCRYPTED: u8 = 0b0000_0010;
@@ -307,6 +312,20 @@ impl DiscoveredInterface {
         hops: u8,
         app_data: &[u8],
     ) -> Result<Self, RnsError> {
+        Self::from_announce_with_required_value(source, hops, app_data, DEFAULT_STAMP_COST)
+    }
+
+    /// Parse and validate a discovery announce, requiring the embedded
+    /// proof-of-work stamp to have at least `required_stamp_value` leading
+    /// zero bits. This mirrors the `required_value` parameter of the Python
+    /// reference `InterfaceDiscovery` listener (default
+    /// `InterfaceAnnouncer.DEFAULT_STAMP_VALUE`).
+    pub fn from_announce_with_required_value(
+        source: DestinationDesc,
+        hops: u8,
+        app_data: &[u8],
+        required_stamp_value: u8,
+    ) -> Result<Self, RnsError> {
         if app_data.is_empty() {
             return Err(RnsError::PacketError);
         }
@@ -350,7 +369,7 @@ impl DiscoveredInterface {
 
         let infohash = Hash::new_from_slice(packed);
         let workblock = stamp_workblock(infohash.as_slice(), WORKBLOCK_EXPAND_ROUNDS)?;
-        if !stamp_valid(stamp, DEFAULT_STAMP_COST, &workblock) {
+        if !stamp_valid(stamp, required_stamp_value, &workblock) {
             return Err(RnsError::IncorrectSignature);
         }
         let stamp_value = stamp_value(stamp, &workblock);
@@ -819,5 +838,126 @@ mod tests {
         app_data.write(&packed).unwrap();
         app_data.write(&stamp).unwrap();
         app_data
+    }
+
+    /// Build a discovery app_data blob whose embedded stamp has exactly
+    /// `difficulty` leading zero bits, independent of `DEFAULT_STAMP_COST`.
+    fn build_discovery_app_data_with_difficulty(
+        info: Vec<(Value, Value)>,
+        difficulty: u8,
+    ) -> PacketDataBuffer {
+        let mut packed = Vec::new();
+        write_value(&mut packed, &Value::Map(info)).unwrap();
+        let infohash = Hash::new_from_slice(&packed);
+        let workblock = stamp_workblock(infohash.as_slice(), WORKBLOCK_EXPAND_ROUNDS).unwrap();
+        let stamp = stamp_with_exact_difficulty(&workblock, difficulty);
+
+        let mut app_data = PacketDataBuffer::new();
+        app_data.write(&[0u8]).unwrap();
+        app_data.write(&packed).unwrap();
+        app_data.write(&stamp).unwrap();
+        app_data
+    }
+
+    /// Brute-force a random stamp whose `count_leading_zero_bits` value is
+    /// exactly `difficulty`.
+    fn stamp_with_exact_difficulty(workblock: &StaticBuffer<8192>, difficulty: u8) -> [u8; HASH_SIZE] {
+        let mut rng = UnwrapErr(SysRng);
+        loop {
+            let mut stamp = [0u8; HASH_SIZE];
+            rng.fill_bytes(&mut stamp);
+            let value = count_leading_zero_bits(
+                Hash::generator()
+                    .chain_update(workblock.as_slice())
+                    .chain_update(&stamp)
+                    .finalize()
+                    .as_slice(),
+            );
+            if value == difficulty {
+                return stamp;
+            }
+        }
+    }
+
+    fn discovery_info(transport_id: &AddressHash, name: &str) -> Vec<(Value, Value)> {
+        vec![
+            (
+                u8_value(KEY_INTERFACE_TYPE),
+                Value::from("TCPServerInterface"),
+            ),
+            (u8_value(KEY_TRANSPORT), Value::Boolean(true)),
+            (
+                u8_value(KEY_TRANSPORT_ID),
+                Value::Binary(transport_id.as_slice().to_vec()),
+            ),
+            (u8_value(KEY_NAME), Value::from(name)),
+            (u8_value(KEY_LATITUDE), Value::Nil),
+            (u8_value(KEY_LONGITUDE), Value::Nil),
+            (u8_value(KEY_HEIGHT), Value::Nil),
+            (u8_value(KEY_REACHABLE_ON), Value::from("127.0.0.1")),
+            (u8_value(KEY_PORT), Value::from(4242u16)),
+        ]
+    }
+
+    /// A discovery stamp with difficulty 14 (the old Rust default) must be
+    /// rejected by the Python-compatible default required value of 16.
+    #[test]
+    fn weak_stamp_rejected_at_python_compatible_difficulty() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
+        let app_data = build_discovery_app_data_with_difficulty(
+            discovery_info(&transport_id, "Weak Stamp Node"),
+            14,
+        );
+
+        let result = DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice());
+        assert!(
+            matches!(result, Err(RnsError::IncorrectSignature)),
+            "stamp with difficulty 14 must be rejected at the default required value of 16"
+        );
+    }
+
+    /// A discovery stamp with the Python-compatible difficulty of 16 is
+    /// accepted, and its reported value reflects the actual difficulty.
+    #[test]
+    fn strong_stamp_accepted_at_python_compatible_difficulty() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
+        let app_data = build_discovery_app_data_with_difficulty(
+            discovery_info(&transport_id, "Strong Stamp Node"),
+            16,
+        );
+
+        let decoded =
+            DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
+        assert_eq!(decoded.name, "Strong Stamp Node");
+        assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);
+    }
+
+    /// The required value is configurable: a stamp with difficulty 14 is
+    /// accepted when the listener explicitly requires a lower value.
+    #[test]
+    fn weak_stamp_accepted_when_required_value_is_lowered() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = source_desc.identity.address_hash;
+
+        let app_data = build_discovery_app_data_with_difficulty(
+            discovery_info(&transport_id, "Weak Stamp Node"),
+            14,
+        );
+
+        let decoded = DiscoveredInterface::from_announce_with_required_value(
+            source_desc,
+            1,
+            app_data.as_slice(),
+            14,
+        )
+        .unwrap();
+        assert_eq!(decoded.name, "Weak Stamp Node");
     }
 }
