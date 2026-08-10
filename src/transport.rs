@@ -4159,7 +4159,12 @@ async fn handle_keep_links(
     for link in handler.out_links.values() {
         let mut link = link.lock().await;
 
-        if link.status() == LinkStatus::Active {
+        // Only send keepalives when the link is idle and the keepalive
+        // interval has elapsed (matching Python's Link watchdog). Sending
+        // a keepalive must never reset the link's staleness timer, so a
+        // link whose peer has stopped responding is still marked stale and
+        // eventually closed.
+        if link.status() == LinkStatus::Active && link.keepalive_due() {
             log::trace!(
                 "tp({}): send keepalive for link {}",
                 handler.config.name,
@@ -4167,7 +4172,7 @@ async fn handle_keep_links(
             );
 
             pending.push(handler.send_ctx.prepare_send_packet(link.keep_alive_packet(KEEP_ALIVE_REQUEST)));
-            link.mark_activity();
+            link.mark_keepalive_sent();
         }
     }
 }

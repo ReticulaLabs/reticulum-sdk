@@ -27,6 +27,11 @@ const CHANNEL_SEQUENCE_MAX: u16 = u16::MAX;
 const CHANNEL_SEQUENCE_MODULUS: u32 = CHANNEL_SEQUENCE_MAX as u32 + 1;
 const CHANNEL_WINDOW_MAX: u16 = 48;
 
+/// Keepalive interval for active links. Matches Python's `Link.KEEPALIVE`
+/// (360 seconds): a keepalive is only sent when the link has been quiet
+/// (no inbound traffic) for this long, and at most once per interval.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(360);
+
 pub(crate) fn link_signalling_bytes(mtu: usize) -> [u8; LINK_MTU_SIZE] {
     let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
     let signalling_value = (mtu as u32 & 0x1F_FFFF) + (mode_bits << 16);
@@ -269,6 +274,11 @@ pub struct Link {
     mtu: usize,
     request_time: Instant,
     rtt: Duration,
+    /// Last time a keepalive request was sent on this link. Used to gate
+    /// keepalive cadence (matches Python's `Link.last_keepalive`).
+    last_keepalive: Instant,
+    /// Keepalive interval for this link (matches Python's `Link.keepalive`).
+    keepalive: Duration,
     event_tx: tokio::sync::broadcast::Sender<LinkEventData>,
     proves_messages: bool,
     next_channel_sequence: u16,
@@ -293,6 +303,8 @@ impl Link {
             mtu: RETICULUM_MTU,
             request_time: Instant::now(),
             rtt: Duration::from_secs(0),
+            last_keepalive: Instant::now(),
+            keepalive: KEEPALIVE_INTERVAL,
             event_tx,
             proves_messages: false,
             next_channel_sequence: 0,
@@ -349,6 +361,8 @@ impl Link {
             mtu,
             request_time: Instant::now(),
             rtt: Duration::from_secs(0),
+            last_keepalive: Instant::now(),
+            keepalive: KEEPALIVE_INTERVAL,
             event_tx,
             proves_messages: false,
             next_channel_sequence: 0,
@@ -1016,8 +1030,33 @@ impl Link {
         &self.destination
     }
 
+    /// Record inbound activity on the link. This is the only event that
+    /// resets the staleness timer: it must never be called when *sending*
+    /// traffic (e.g. keepalives), or a link whose peer has stopped
+    /// responding would never be marked stale and closed.
     pub fn mark_activity(&mut self) {
         self.request_time = Instant::now();
+    }
+
+    /// Whether a keepalive request should be sent on this initiator link.
+    ///
+    /// Keepalives are only sent when the link has been quiet (no inbound
+    /// traffic, i.e. `mark_activity`/received packets have not reset the
+    /// timer) for at least the keepalive interval, and at most once per
+    /// interval. This matches Python's `Link` watchdog: keepalives are sent
+    /// at most every `keepalive` seconds and only when the link is idle
+    /// (`Link.py:749-751`).
+    pub(crate) fn keepalive_due(&self) -> bool {
+        let now = Instant::now();
+        now.saturating_duration_since(self.request_time) >= self.keepalive
+            && now.saturating_duration_since(self.last_keepalive) >= self.keepalive
+    }
+
+    /// Record that a keepalive request was sent. This updates only the
+    /// keepalive cadence timer and deliberately does *not* reset the
+    /// staleness timer (see `mark_activity`).
+    pub(crate) fn mark_keepalive_sent(&mut self) {
+        self.last_keepalive = Instant::now();
     }
 
     pub fn create_rtt(&self) -> Packet {
@@ -1363,8 +1402,10 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        ChannelEnvelope, ChannelMessage, LINK_MTU_SIZE, Link, LinkEvent, LinkHandleResult,
+        ChannelEnvelope, ChannelMessage, KEEPALIVE_INTERVAL, LINK_MTU_SIZE, Link, LinkEvent,
+        LinkHandleResult,
     };
+    use std::time::{Duration, Instant};
 
     struct TestChannelMessage(Vec<u8>);
 
@@ -1700,5 +1741,78 @@ mod tests {
             .expect("system channel packet");
 
         assert_eq!(packet.context, PacketContext::Channel);
+    }
+
+    fn keepalive_test_link() -> Link {
+        let (event_tx, _) = tokio::sync::broadcast::channel(1);
+        let destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_name("keepalive"),
+            DestinationName::new("example_utilities", "keepalive.test"),
+        );
+        Link::new(destination.desc, event_tx)
+    }
+
+    #[test]
+    fn fresh_link_keepalive_is_not_due() {
+        let link = keepalive_test_link();
+        assert!(
+            !link.keepalive_due(),
+            "a freshly created link must not send a keepalive"
+        );
+    }
+
+    #[test]
+    fn idle_link_keepalive_due_after_interval() {
+        let mut link = keepalive_test_link();
+        // The peer has been silent for longer than the keepalive interval
+        // and no keepalive has been sent in that time.
+        let past = Instant::now() - KEEPALIVE_INTERVAL - Duration::from_secs(1);
+        link.request_time = past;
+        link.last_keepalive = past;
+        assert!(
+            link.keepalive_due(),
+            "an idle link must send a keepalive once the interval elapses"
+        );
+    }
+
+    #[test]
+    fn keepalive_send_is_gated_by_cadence() {
+        let mut link = keepalive_test_link();
+        let past = Instant::now() - KEEPALIVE_INTERVAL - Duration::from_secs(1);
+        link.request_time = past;
+        link.last_keepalive = past;
+        assert!(link.keepalive_due());
+
+        link.mark_keepalive_sent();
+        assert!(
+            !link.keepalive_due(),
+            "a second keepalive must not be sent before the interval elapses again"
+        );
+    }
+
+    #[test]
+    fn active_traffic_suppresses_keepalive() {
+        let mut link = keepalive_test_link();
+        link.last_keepalive = Instant::now() - KEEPALIVE_INTERVAL - Duration::from_secs(1);
+        // Inbound traffic keeps the activity timer fresh.
+        link.mark_activity();
+        assert!(
+            !link.keepalive_due(),
+            "recent inbound traffic must suppress keepalives"
+        );
+    }
+
+    #[test]
+    fn keepalive_send_does_not_reset_staleness() {
+        let mut link = keepalive_test_link();
+        let past = Instant::now() - Duration::from_secs(2);
+        link.request_time = past;
+
+        link.mark_keepalive_sent();
+
+        assert_eq!(
+            link.request_time, past,
+            "sending a keepalive must not reset the staleness timer"
+        );
     }
 }
