@@ -1,4 +1,3 @@
-use alloc::fmt::Write;
 use core::cmp;
 use core::fmt;
 
@@ -16,6 +15,44 @@ pub fn create_hash(data: &[u8], out: &mut [u8]) {
     out.copy_from_slice(
         &Sha256::new().chain_update(data).finalize().as_slice()[..cmp::min(out.len(), HASH_SIZE)],
     );
+}
+
+/// Encode `data` as a lowercase hex string.
+pub(crate) fn hex_encode(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for &byte in data {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Decode the first `N` bytes of a hex string. Accepts upper- and lowercase
+/// hex digits, and returns `RnsError::IncorrectHash` instead of panicking on
+/// malformed input.
+pub(crate) fn hex_decode<const N: usize>(hex: &[u8]) -> Result<[u8; N], RnsError> {
+    if hex.len() < N * 2 {
+        return Err(RnsError::IncorrectHash);
+    }
+
+    let mut out = [0u8; N];
+    for i in 0..N {
+        let hi = hex_digit(hex[i * 2]).ok_or(RnsError::IncorrectHash)?;
+        let lo = hex_digit(hex[i * 2 + 1]).ok_or(RnsError::IncorrectHash)?;
+        out[i] = (hi << 4) | lo;
+    }
+
+    Ok(out)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
@@ -94,16 +131,7 @@ impl AddressHash {
     }
 
     pub fn new_from_hex_string(hex_string: &str) -> Result<Self, RnsError> {
-        if hex_string.len() < ADDRESS_HASH_SIZE * 2 {
-            return Err(RnsError::IncorrectHash);
-        }
-
-        let mut bytes = [0u8; ADDRESS_HASH_SIZE];
-
-        for i in 0..ADDRESS_HASH_SIZE {
-            bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16).unwrap();
-        }
-
+        let bytes = hex_decode(hex_string.as_bytes())?;
         Ok(Self { 0: bytes })
     }
 
@@ -126,13 +154,7 @@ impl AddressHash {
     }
 
     pub fn to_hex_string(&self) -> String {
-        let mut hex_string = String::with_capacity(ADDRESS_HASH_SIZE * 2);
-
-        for byte in self.0 {
-            write!(&mut hex_string, "{:02x}", byte).unwrap();
-        }
-
-        hex_string
+        hex_encode(&self.0)
     }
 }
 
@@ -181,6 +203,30 @@ mod tests {
 
         let actual_address_hash =
             AddressHash::new_from_hex_string(&address_hash_hex).expect("valid hash");
+
+        assert_eq!(
+            actual_address_hash.as_slice(),
+            original_address_hash.as_slice()
+        );
+    }
+
+    #[test]
+    fn address_hex_decode_rejects_malformed_input() {
+        let hex = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert!(
+            AddressHash::new_from_hex_string(hex).is_err(),
+            "non-hex characters must return an error, not panic"
+        );
+    }
+
+    #[test]
+    fn address_hex_decode_accepts_uppercase() {
+        let mut rng = UnwrapErr(SysRng);
+        let original_address_hash = AddressHash::new_from_rand(&mut rng);
+        let upper = original_address_hash.to_hex_string().to_uppercase();
+
+        let actual_address_hash =
+            AddressHash::new_from_hex_string(&upper).expect("valid hash");
 
         assert_eq!(
             actual_address_hash.as_slice(),

@@ -1,4 +1,3 @@
-use alloc::fmt::Write;
 use hkdf::Hkdf;
 use rand_core::CryptoRng;
 
@@ -9,7 +8,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret, StaticSecret};
 use crate::{
     crypt::fernet::{Fernet, PlainText, Token},
     error::RnsError,
-    hash::{AddressHash, Hash},
+    hash::{hex_decode, hex_encode, AddressHash, Hash},
 };
 
 pub const PUBLIC_KEY_LENGTH: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
@@ -87,36 +86,23 @@ impl Identity {
     }
 
     pub fn new_from_hex_string(hex_string: &str) -> Result<Self, RnsError> {
-        if hex_string.len() < PUBLIC_KEY_LENGTH * 2 * 2 {
+        let hex = hex_string.as_bytes();
+        if hex.len() < PUBLIC_KEY_LENGTH * 2 * 2 {
             return Err(RnsError::IncorrectHash);
         }
 
-        let mut public_key_bytes = [0u8; PUBLIC_KEY_LENGTH];
-        let mut verifying_key_bytes = [0u8; PUBLIC_KEY_LENGTH];
-
-        for i in 0..PUBLIC_KEY_LENGTH {
-            public_key_bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16).unwrap();
-            verifying_key_bytes[i] = u8::from_str_radix(
-                &hex_string[PUBLIC_KEY_LENGTH * 2 + (i * 2)..PUBLIC_KEY_LENGTH * 2 + (i * 2) + 2],
-                16,
-            )
-            .unwrap();
-        }
+        let public_key_bytes: [u8; PUBLIC_KEY_LENGTH] =
+            hex_decode(&hex[..PUBLIC_KEY_LENGTH * 2])?;
+        let verifying_key_bytes: [u8; PUBLIC_KEY_LENGTH] =
+            hex_decode(&hex[PUBLIC_KEY_LENGTH * 2..])?;
 
         Self::new_from_slices(&public_key_bytes[..], &verifying_key_bytes[..])
     }
 
     pub fn to_hex_string(&self) -> String {
         let mut hex_string = String::with_capacity((PUBLIC_KEY_LENGTH * 2) * 2);
-
-        for byte in self.public_key.as_bytes() {
-            write!(&mut hex_string, "{:02x}", byte).unwrap();
-        }
-
-        for byte in self.verifying_key.as_bytes() {
-            write!(&mut hex_string, "{:02x}", byte).unwrap();
-        }
-
+        hex_string.push_str(&hex_encode(self.public_key.as_bytes()));
+        hex_string.push_str(&hex_encode(self.verifying_key.as_bytes()));
         hex_string
     }
 
@@ -310,21 +296,15 @@ impl PrivateIdentity {
     }
 
     pub fn new_from_hex_string(hex_string: &str) -> Result<Self, RnsError> {
-        if hex_string.len() < PUBLIC_KEY_LENGTH * 2 * 2 {
+        let hex = hex_string.as_bytes();
+        if hex.len() < PUBLIC_KEY_LENGTH * 2 * 2 {
             return Err(RnsError::IncorrectHash);
         }
 
-        let mut private_key_bytes = [0u8; PUBLIC_KEY_LENGTH];
-        let mut sign_key_bytes = [0u8; PUBLIC_KEY_LENGTH];
-
-        for i in 0..PUBLIC_KEY_LENGTH {
-            private_key_bytes[i] = u8::from_str_radix(&hex_string[i * 2..(i * 2) + 2], 16).unwrap();
-            sign_key_bytes[i] = u8::from_str_radix(
-                &hex_string[PUBLIC_KEY_LENGTH * 2 + (i * 2)..PUBLIC_KEY_LENGTH * 2 + (i * 2) + 2],
-                16,
-            )
-            .unwrap();
-        }
+        let private_key_bytes: [u8; PUBLIC_KEY_LENGTH] =
+            hex_decode(&hex[..PUBLIC_KEY_LENGTH * 2])?;
+        let sign_key_bytes: [u8; PUBLIC_KEY_LENGTH] =
+            hex_decode(&hex[PUBLIC_KEY_LENGTH * 2..])?;
 
         Ok(Self::new(
             StaticSecret::from(private_key_bytes),
@@ -350,15 +330,8 @@ impl PrivateIdentity {
 
     pub fn to_hex_string(&self) -> String {
         let mut hex_string = String::with_capacity((PUBLIC_KEY_LENGTH * 2) * 2);
-
-        for byte in self.private_key.as_bytes() {
-            write!(&mut hex_string, "{:02x}", byte).unwrap();
-        }
-
-        for byte in self.sign_key.as_bytes() {
-            write!(&mut hex_string, "{:02x}", byte).unwrap();
-        }
-
+        hex_string.push_str(&hex_encode(self.private_key.as_bytes()));
+        hex_string.push_str(&hex_encode(self.sign_key.as_bytes()));
         hex_string
     }
 
@@ -543,6 +516,15 @@ mod tests {
         assert_eq!(
             actual_id.sign_key.as_bytes(),
             original_id.sign_key.as_bytes()
+        );
+    }
+
+    #[test]
+    fn identity_hex_decode_rejects_malformed_input() {
+        let hex = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert!(
+            PrivateIdentity::new_from_hex_string(hex).is_err(),
+            "non-hex characters must return an error, not panic"
         );
     }
 }
