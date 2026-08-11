@@ -2,7 +2,7 @@ use std::cmp;
 use std::io;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -39,6 +39,31 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const TCP_READ_BUFFER_SIZE: usize = 16 * 1024;
 const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
 
+// Modem types reported in `get_config`.
+const MODEM_OFDM: i64 = 0;
+const MODEM_MFSK: i64 = 1;
+const MODEM_ROBUST: i64 = 2;
+
+// Physical bitrate (bps) per `robust_mode`, matching the reference
+// `Modem73Interface.ROBUST_BPS` and the modem73 `CONTROL_PORT.md`
+// documentation. Modes 10/11 (RDM-800 / RDM-800S) were added in modem73 2.x.
+const ROBUST_BPS: &[f64] = &[
+    1150.0, 585.0, 296.0, 296.0, 149.0, 732.0, 378.0, 194.0, 197.0, 99.0, 780.0, 510.0,
+];
+
+// On-air frame time in seconds per OFDM modulation: (short, normal, long).
+// Matches the reference `Modem73Interface.OFDM_AIRTIME`.
+const OFDM_AIRTIME: &[(&str, (f64, f64, f64))] = &[
+    ("BPSK", (1.64, 2.73, 4.92)),
+    ("QPSK", (1.09, 2.73, 4.92)),
+    ("8PSK", (2.05, 3.55, 6.56)),
+    ("QAM16", (1.09, 2.73, 4.92)),
+    ("QAM64", (2.05, 3.55, 6.56)),
+    ("QAM256", (1.64, 2.73, 4.92)),
+    ("QAM1024", (2.32, 4.10, 4.10)),
+    ("QAM4096", (2.05, 3.55, 3.55)),
+];
+
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
 
@@ -47,7 +72,10 @@ pub struct Modem73Interface {
     kiss_addr: String,
     control_addr: String,
     mtu_overhead: usize,
-    bitrate: Option<f64>,
+    /// Live bitrate in bps (stored as `f64` bits), derived from the TNC
+    /// `get_config` response. Shared with the interface manager so data
+    /// pacing tracks the current modem configuration.
+    bitrate: Arc<AtomicU64>,
     auto_fragmentation: bool,
     current_mtu: Arc<AtomicUsize>,
     fragmentation_target: Arc<AtomicBool>,
@@ -66,7 +94,7 @@ impl Modem73Interface {
             kiss_addr: kiss_addr.into(),
             control_addr: control_addr.into(),
             mtu_overhead: DEFAULT_MTU_OVERHEAD,
-            bitrate: Some(DEFAULT_BITRATE),
+            bitrate: Arc::new(AtomicU64::new(f64::to_bits(DEFAULT_BITRATE))),
             auto_fragmentation: true,
             current_mtu: Arc::new(AtomicUsize::new(RETICULUM_BASE_MTU)),
             fragmentation_target: Arc::new(AtomicBool::new(false)),
@@ -83,8 +111,8 @@ impl Modem73Interface {
         self
     }
 
-    pub fn with_bitrate(mut self, bitrate: f64) -> Self {
-        self.bitrate = configured_bitrate(bitrate);
+    pub fn with_bitrate(self, bitrate: f64) -> Self {
+        self.bitrate.store(f64::to_bits(bitrate), Ordering::Relaxed);
         self
     }
 
@@ -234,7 +262,11 @@ impl Interface for Modem73Interface {
     }
 
     fn bitrate(&self) -> Option<f64> {
-        self.bitrate
+        configured_bitrate(f64::from_bits(self.bitrate.load(Ordering::Relaxed)))
+    }
+
+    fn bitrate_source(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.bitrate.clone())
     }
 
     fn autoconfigure_mtu(&self) -> bool {
@@ -282,6 +314,13 @@ async fn query_initial_mtu(config: &Modem73Interface) -> Option<usize> {
 
     match recv_control_message(&mut read).await {
         Ok(Some(message)) => {
+            if let Some(bitrate) = derive_bitrate(&message) {
+                config.bitrate.store(f64::to_bits(bitrate), Ordering::Relaxed);
+                log::info!(
+                    "modem73_interface: derived bitrate {} bps from TNC configuration",
+                    bitrate as u64
+                );
+            }
             payload_size(&message).map(|payload_size| compute_mtu(config, payload_size))
         }
         Ok(None) => None,
@@ -374,13 +413,29 @@ async fn handle_control_message(
     write: &mut OwnedWriteHalf,
     message: Value,
 ) {
-    let payload_size = if message.get("event").and_then(Value::as_str) == Some("config_changed") {
-        message.get("config").and_then(payload_size)
+    // `config_changed` events carry the configuration in a nested "config"
+    // object; `get_config` replies carry it at the top level.
+    let cfg = if message.get("event").and_then(Value::as_str) == Some("config_changed") {
+        message.get("config")
     } else {
-        payload_size(&message)
+        Some(&message)
+    };
+    let Some(cfg) = cfg else {
+        return;
     };
 
-    let Some(payload_size) = payload_size else {
+    if let Some(bitrate) = derive_bitrate(cfg) {
+        let old_bitrate = config.bitrate.swap(f64::to_bits(bitrate), Ordering::Relaxed);
+        if f64::from_bits(old_bitrate) != bitrate {
+            log::info!(
+                "modem73_interface: bitrate {} -> {} bps (TNC configuration change)",
+                f64::from_bits(old_bitrate) as u64,
+                bitrate as u64
+            );
+        }
+    }
+
+    let Some(payload_size) = payload_size(cfg) else {
         return;
     };
 
@@ -451,6 +506,40 @@ fn payload_size(message: &Value) -> Option<usize> {
         .get("payload_size")
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
+}
+
+/// Derive the physical bitrate (bps) from a modem73 `get_config` response,
+/// mirroring the reference `Modem73Interface._phy_profile`. Returns `None`
+/// for modes with no known rate (e.g. MFSK), in which case the caller keeps
+/// the currently configured bitrate.
+fn derive_bitrate(cfg: &Value) -> Option<f64> {
+    match cfg.get("modem_type").and_then(Value::as_i64) {
+        Some(MODEM_ROBUST) => {
+            let robust_mode = cfg.get("robust_mode").and_then(Value::as_i64)?;
+            if robust_mode < 0 || robust_mode as usize >= ROBUST_BPS.len() {
+                return None;
+            }
+            Some(ROBUST_BPS[robust_mode as usize])
+        }
+        Some(MODEM_OFDM) => {
+            let modulation = cfg.get("modulation").and_then(Value::as_str)?;
+            let airs = OFDM_AIRTIME
+                .iter()
+                .find(|(name, _)| *name == modulation)?
+                .1;
+            let frame_size = cfg.get("frame_size").and_then(Value::as_i64)?;
+            let payload = cfg.get("payload_size").and_then(Value::as_i64)?;
+            if payload <= 0 {
+                return None;
+            }
+            let (short, normal, long) = airs;
+            let airtime = [short, normal, long][frame_size.clamp(0, 2) as usize];
+            Some(payload as f64 * 8.0 / airtime)
+        }
+        // MFSK has no published rate in the config; keep the configured value.
+        Some(MODEM_MFSK) => None,
+        _ => None,
+    }
 }
 
 async fn send_control_command(write: &mut OwnedWriteHalf, value: &Value) -> io::Result<()> {
@@ -739,5 +828,58 @@ mod tests {
                 .bitrate(),
             None
         );
+    }
+
+    #[test]
+    fn derives_bitrate_from_robust_mode() {
+        let config = json!({ "modem_type": MODEM_ROBUST, "robust_mode": 0 });
+        assert_eq!(derive_bitrate(&config), Some(1150.0));
+
+        let config = json!({ "modem_type": MODEM_ROBUST, "robust_mode": 5 });
+        assert_eq!(derive_bitrate(&config), Some(732.0));
+
+        let config = json!({ "modem_type": MODEM_ROBUST, "robust_mode": 10 });
+        assert_eq!(derive_bitrate(&config), Some(780.0));
+    }
+
+    #[test]
+    fn derives_bitrate_from_ofdm_modulation_and_payload() {
+        // BPSK normal frame: payload 500 bytes in 2.73 s.
+        let config = json!({
+            "modem_type": MODEM_OFDM,
+            "modulation": "BPSK",
+            "frame_size": 1,
+            "payload_size": 500,
+        });
+        assert_eq!(derive_bitrate(&config), Some(500.0 * 8.0 / 2.73));
+
+        // frame_size clamps to the (short, normal, long) table.
+        let config = json!({
+            "modem_type": MODEM_OFDM,
+            "modulation": "QAM16",
+            "frame_size": 5,
+            "payload_size": 500,
+        });
+        assert_eq!(derive_bitrate(&config), Some(500.0 * 8.0 / 4.92));
+    }
+
+    #[test]
+    fn derive_bitrate_falls_back_on_unknown_modes() {
+        // MFSK has no published rate in the config.
+        let config = json!({ "modem_type": MODEM_MFSK, "mfsk_mode": 0 });
+        assert_eq!(derive_bitrate(&config), None);
+
+        // Unknown OFDM modulation.
+        let config = json!({
+            "modem_type": MODEM_OFDM,
+            "modulation": "UNKNOWN",
+            "frame_size": 1,
+            "payload_size": 500,
+        });
+        assert_eq!(derive_bitrate(&config), None);
+
+        // Out-of-range robust mode.
+        let config = json!({ "modem_type": MODEM_ROBUST, "robust_mode": 99 });
+        assert_eq!(derive_bitrate(&config), None);
     }
 }

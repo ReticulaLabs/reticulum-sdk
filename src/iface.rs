@@ -367,6 +367,15 @@ pub trait Interface {
         None
     }
 
+    /// A shared, live-updatable bitrate source (bps as `f64` bits). When an
+    /// interface exposes one (e.g. Modem73 derives its bitrate from the TNC
+    /// configuration at runtime), data pacing reads the current value on
+    /// every send instead of the snapshot taken at registration. Defaults to
+    /// `None` (no live updates).
+    fn bitrate_source(&self) -> Option<Arc<AtomicU64>> {
+        None
+    }
+
     /// The interface mode, which controls announce propagation,
     /// path expiry and discovery behaviour.
     fn interface_mode(&self) -> InterfaceMode {
@@ -562,6 +571,10 @@ struct LocalInterface {
     ifac_config: Arc<Mutex<Option<IfacConfig>>>,
     /// Interface bitrate in bps, used for data pacing on slow links.
     bitrate: Option<f64>,
+    /// Shared bitrate source (`f64` bits) for live pacing updates. When
+    /// present, `effective_bitrate()` reads from here on every send instead
+    /// of the `bitrate` snapshot.
+    bitrate_source: Option<Arc<AtomicU64>>,
     /// Interface mode controlling announce propagation, path expiry
     /// and discovery behaviour.
     mode: InterfaceMode,
@@ -602,6 +615,19 @@ struct LocalInterface {
     // --- Egress path-request tracking ---
     /// Timestamps of recently sent path requests for frequency tracking.
     op_freq_deque: std::sync::Mutex<VecDeque<Instant>>,
+}
+
+impl LocalInterface {
+    /// The bitrate used for data pacing. Reads the live shared source when
+    /// the interface exposes one (see `Interface::bitrate_source`), otherwise
+    /// falls back to the `bitrate` snapshot taken at registration.
+    fn effective_bitrate(&self) -> Option<f64> {
+        if let Some(source) = &self.bitrate_source {
+            configured_bitrate(f64::from_bits(source.load(Ordering::Relaxed)))
+        } else {
+            self.bitrate
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -981,7 +1007,7 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new())
+        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new())
     }
 
     fn new_channel_with_pacer(
@@ -992,6 +1018,7 @@ impl InterfaceManager {
         hw_mtu: Option<Arc<AtomicUsize>>,
         ifac_config: Option<IfacConfig>,
         bitrate: Option<f64>,
+        bitrate_source: Option<Arc<AtomicU64>>,
         mode: InterfaceMode,
         announces_from_internal: bool,
         recursive_prs: bool,
@@ -1036,6 +1063,7 @@ impl InterfaceManager {
             hw_mtu,
             ifac_config: ifac_config.clone(),
             bitrate,
+            bitrate_source,
             mode,
             announces_from_internal,
             recursive_prs,
@@ -1077,6 +1105,7 @@ impl InterfaceManager {
         ifac_config: Option<IfacConfig>,
     ) -> InterfaceContext<T> {
         let bitrate = inner.bitrate();
+        let bitrate_source = inner.bitrate_source();
         let announce_cap = inner.announce_cap();
         let channel_load = Arc::new(Mutex::new(0.0));
         let announce_pacer = bitrate
@@ -1104,6 +1133,7 @@ impl InterfaceManager {
             hw_mtu,
             ifac_config,
             configured_bitrate(bitrate.unwrap_or(0.0)),
+            bitrate_source,
             mode,
             announces_from_internal,
             recursive_prs,
@@ -1284,7 +1314,7 @@ impl InterfaceManager {
         let Some(iface) = self.iface_by_address(address) else {
             return false;
         };
-        if iface.bitrate.is_none() {
+        if iface.effective_bitrate().is_none() {
             return false;
         }
 
@@ -1324,7 +1354,7 @@ impl InterfaceManager {
         let Some(iface) = self.iface_by_address(address) else {
             return false;
         };
-        if iface.bitrate.is_none() {
+        if iface.effective_bitrate().is_none() {
             return false;
         }
 
@@ -1357,7 +1387,7 @@ impl InterfaceManager {
     /// Should be called periodically (e.g. every ~10 seconds).
     pub fn ingress_evaluate_all(&self) {
         for iface in &self.ifaces {
-            if iface.stop.is_cancelled() || iface.bitrate.is_none() {
+            if iface.stop.is_cancelled() || iface.effective_bitrate().is_none() {
                 continue;
             }
 
@@ -1567,7 +1597,7 @@ impl InterfaceManager {
                 continue;
             }
 
-            let Some(bitrate) = iface.bitrate else { continue };
+            let Some(bitrate) = iface.effective_bitrate() else { continue };
             if bitrate <= 0.0 { continue; }
 
             let packet_len = packet_wire_len(&message.packet);
@@ -1908,7 +1938,7 @@ mod tests {
         // 1 kbps link – realistic for LoRa at SF11/BW250
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1955,7 +1985,7 @@ mod tests {
         // 10 Mbps – typical fast link, no meaningful pacing needed.
         let bitrate = 10_000_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -1982,7 +2012,7 @@ mod tests {
         let mut manager = InterfaceManager::new(4);
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
         );
         let iface = channel.address;
 
@@ -2042,7 +2072,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -2230,7 +2260,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -2255,7 +2285,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;
@@ -2348,7 +2378,7 @@ mod tests {
             ] {
                 let ch = mgr.new_channel_with_pacer(
                     4, None, false, None, None, Some(1_000_000.0),
-                    *mode, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
+                    None, *mode, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
                     String::new(), String::new(),
                 );
                 ifaces.push((*label, ch.address, ch.tx_channel));
@@ -2659,7 +2689,7 @@ mod tests {
         let mut h = ModeTestHarness::new();
         let roaming_ch = h.mgr.new_channel_with_pacer(
             4, None, false, None, None, Some(1_000_000.0),
-            InterfaceMode::Roaming, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
+            None, InterfaceMode::Roaming, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
             String::new(), String::new(),
         );
 
