@@ -329,28 +329,7 @@ impl Destination<PrivateIdentity, Input, Single> {
     ) -> Result<Packet, RnsError> {
         let timestamp_secs = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() as u64;
         let rand_hash = self.build_announce_rand_hash(rng, timestamp_secs);
-        let packet_data = self.build_announce_packet_data(&rand_hash, app_data)?;
-
-        Ok(Packet {
-            header: Header {
-                ifac_flag: IfacFlag::Open,
-                header_type: HeaderType::Type1,
-                context_flag: if self.desc.ratchet_public_key.is_some() {
-                    ContextFlag::Set
-                } else {
-                    ContextFlag::Unset
-                },
-                propagation_type: PropagationType::Broadcast,
-                destination_type: DestinationType::Single,
-                packet_type: PacketType::Announce,
-                hops: 0,
-            },
-            ifac: None,
-            destination: self.desc.address_hash,
-            transport: None,
-            context: PacketContext::None,
-            data: packet_data,
-        })
+        self.announce_with_rand_hash(rand_hash, app_data)
     }
 
     pub fn path_response<R: CryptoRng + ?Sized>(
@@ -364,44 +343,14 @@ impl Destination<PrivateIdentity, Input, Single> {
         Ok(announce)
     }
 
-    #[cfg(test)]
+    /// Assemble an announce packet for this destination with the given random
+    /// hash. The hash is normally produced by [`Self::announce`]; tests inject
+    /// a deterministic value here to reproduce golden wire vectors.
     fn announce_with_rand_hash(
         &self,
         rand_hash: [u8; RAND_HASH_LENGTH],
         app_data: Option<&[u8]>,
     ) -> Result<Packet, RnsError> {
-        let packet_data = self.build_announce_packet_data(&rand_hash, app_data)?;
-
-        Ok(Packet {
-            header: Header {
-                ifac_flag: IfacFlag::Open,
-                header_type: HeaderType::Type1,
-                context_flag: if self.desc.ratchet_public_key.is_some() {
-                    ContextFlag::Set
-                } else {
-                    ContextFlag::Unset
-                },
-                propagation_type: PropagationType::Broadcast,
-                destination_type: DestinationType::Single,
-                packet_type: PacketType::Announce,
-                hops: 0,
-            },
-            ifac: None,
-            destination: self.desc.address_hash,
-            transport: None,
-            context: PacketContext::None,
-            data: packet_data,
-        })
-    }
-
-    #[cfg(test)]
-    fn announce_with_timestamp<R: CryptoRng + ?Sized>(
-        &self,
-        rng: &mut R,
-        timestamp_secs: u64,
-        app_data: Option<&[u8]>,
-    ) -> Result<Packet, RnsError> {
-        let rand_hash = self.build_announce_rand_hash(rng, timestamp_secs);
         let packet_data = self.build_announce_packet_data(&rand_hash, app_data)?;
 
         Ok(Packet {
