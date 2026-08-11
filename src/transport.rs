@@ -3111,38 +3111,36 @@ fn verify_relay_lrproof(
     }
 }
 
-async fn send_to_next_hop(
+/// Resolve the outbound packet (with its header rewritten for transport) and
+/// the next-hop interface for an inbound packet from the path table. Returns
+/// `None` if no path is known for `lookup` (defaulting to the packet's
+/// destination).
+fn resolve_next_hop(
+    handler: &TransportHandler,
     packet: &Packet,
+    lookup: Option<AddressHash>,
+) -> Option<(Packet, AddressHash)> {
+    let pt = handler.send_ctx.path_table.read().unwrap();
+    match pt.handle_inbound_packet(packet, lookup) {
+        (packet, Some(iface)) => Some((packet, iface)),
+        _ => None,
+    }
+}
+
+/// Queue a pre-resolved packet for transmission to `iface`, refreshing the
+/// path table entry for its destination.
+async fn send_to_next_hop(
+    packet: Packet,
     handler: &TransportHandler,
     pending: &mut PendingSends,
-    lookup: Option<AddressHash>,
-) -> bool {
+    iface: AddressHash,
+) {
     let dst = packet.destination;
-    let (packet, maybe_iface) = {
-        let pt = handler.send_ctx.path_table.read().unwrap();
-        pt.handle_inbound_packet(packet, lookup)
-    };
-
-    if let Some(iface) = maybe_iface {
-        handler
-            .send_ctx
-            .path_table
-            .write()
-            .unwrap()
-            .refresh(&dst);
-        pending.push(TxMessage {
-            tx_type: TxMessageType::Direct(iface),
-            packet,
-        });
-    } else {
-        log::trace!(
-            "tp({}): no next-hop for dst={}, dropping forwarded packet",
-            handler.config.name,
-            packet.destination,
-        );
-    }
-
-    maybe_iface.is_some()
+    handler.send_ctx.path_table.write().unwrap().refresh(&dst);
+    pending.push(TxMessage {
+        tx_type: TxMessageType::Direct(iface),
+        packet,
+    });
 }
 
 /// Returns `(true, Some(...))` if the keepalive was handled and needs
@@ -3282,8 +3280,14 @@ async fn handle_data(
         }
 
         let lookup = handler.link_table.original_destination(&packet.destination);
-        if lookup.is_some() {
-            let sent = send_to_next_hop(packet, handler, pending, lookup).await;
+        if let Some(lookup) = lookup {
+            let sent = match resolve_next_hop(handler, packet, Some(lookup)) {
+                Some((packet, iface)) => {
+                    send_to_next_hop(packet, handler, pending, iface).await;
+                    true
+                }
+                None => false,
+            };
 
             log::trace!(
                 "tp({}): {} packet to remote link {}",
@@ -3357,32 +3361,30 @@ async fn handle_data(
                 });
             }
         } else {
-            let next_hop = handler
-                .send_ctx
-                .path_table
-                .read()
-                .unwrap()
-                .next_hop_full(&packet.destination);
-            if let Some((_, outbound_iface)) = next_hop {
-                // Record the reverse path entry so a proof for this packet
-                // can be routed back to the sender. The proof must arrive on
-                // the same interface the packet was forwarded out on.
-                handler.reverse_table.add(packet, iface, outbound_iface);
-            } else {
-                let enough_time_passed = handler
-                    .last_path_requests
-                    .get(&packet.destination)
-                    .map(|last| last.elapsed() > PATH_REQUEST_MI)
-                    .unwrap_or(true);
-
-                if enough_time_passed {
-                    handler
-                        .request_path(&packet.destination, pending, Some(iface), None)
-                        .await;
+            data_handled = match resolve_next_hop(handler, packet, None) {
+                Some((packet, outbound_iface)) => {
+                    // Record the reverse path entry so a proof for this packet
+                    // can be routed back to the sender. The proof must arrive
+                    // on the same interface the packet was forwarded out on.
+                    handler.reverse_table.add(&packet, iface, outbound_iface);
+                    send_to_next_hop(packet, handler, pending, outbound_iface).await;
+                    true
                 }
-            }
+                None => {
+                    let enough_time_passed = handler
+                        .last_path_requests
+                        .get(&packet.destination)
+                        .map(|last| last.elapsed() > PATH_REQUEST_MI)
+                        .unwrap_or(true);
 
-            data_handled = send_to_next_hop(packet, handler, pending, None).await;
+                    if enough_time_passed {
+                        handler
+                            .request_path(&packet.destination, pending, Some(iface), None)
+                            .await;
+                    }
+                    false
+                }
+            };
         }
     }
 
@@ -3830,15 +3832,7 @@ async fn handle_link_request_as_intermediate(
         packet.clone()
     };
 
-    let sent = send_to_next_hop(&forwarded, handler, pending, None).await;
-    if !sent {
-        log::warn!(
-            "tp({}): failed to forward link request dst={} to_iface={}",
-            handler.config.name,
-            packet.destination,
-            next_hop_iface,
-        );
-    }
+    send_to_next_hop(forwarded, handler, pending, next_hop_iface).await;
 }
 
 async fn clamp_link_request_mtu(
