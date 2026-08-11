@@ -107,6 +107,15 @@ const CMD_BL_READ_JOIN_EUI: u16 = 0x800D;
 /// WriteFlashEncrypted command. The final chunk may be shorter.
 const BL_FLASH_CHUNK_WORDS: usize = 64;
 
+/// RX/TX data buffer size in bytes. Unlike the SX1262 FIFO, whose read
+/// wraps at this boundary in hardware, the LR11xx `ReadBuffer8` is a
+/// linear span: a read that crosses the 256-byte mark returns garbage
+/// for the part past the end. RX-continuous mode advances the write
+/// pointer through the buffer for each packet, so `buffer_start_pointer
+/// + pld_len` can exceed this on large packets and the read must be
+/// split at the boundary.
+const RX_BUFFER_SIZE: usize = 256;
+
 /// Bootloader version returned by GetVersion (0x0101) when the chip is
 /// running in bootloader mode. Same wire format as the system version:
 /// 4 bytes packed as [hw, type, fw_major, fw_minor]. Per
@@ -268,19 +277,52 @@ fn calibrate_image_bands(freq_hz: u64) -> Option<(u8, u8)> {
 }
 
 // ── PA configuration helpers ──────────────────────────────────────────────
+//
+// Per-dBm PA duty-cycle/hp_sel values sourced from Seeed's reference
+// ral_lr11xx_bsp.c (LR11XX_PA_LP_LF_CFG_TABLE / LR11XX_PA_HP_LF_CFG_TABLE)
+// for the LR11xx sub-GHz PA. A single fixed duty_cycle/hp_sel pair is only
+// correct at one specific dBm target; using it for any other power
+// mis-biases the PA and quietly mistunes radiated power/range.
 
-fn subghz_pa_duty_cycle(power_dbm: i8) -> (u8, u8) {
-    let clamped = power_dbm.clamp(-9, 22);
-    if clamped >= 22 {
-        (0x04, 0x07)
-    } else if clamped >= 20 {
-        (0x03, 0x05)
-    } else if clamped >= 17 {
-        (0x02, 0x03)
-    } else if clamped >= 14 {
-        (0x02, 0x02)
+const PA_LP_MIN_DBM: i8 = -17;
+const PA_LP_MAX_DBM: i8 = 15;
+const PA_HP_MIN_DBM: i8 = -9;
+const PA_HP_MAX_DBM: i8 = 22;
+
+/// Low-power PA duty cycle, indexed by `power_dbm - PA_LP_MIN_DBM`.
+const PA_LP_DUTY_CYCLE: [u8; 33] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02, 0x03, 0x04, 0x07,
+];
+
+/// Low-power PA hp_sel — always 0 for the LP PA.
+const PA_LP_HP_SEL: [u8; 33] = [0x00; 33];
+
+/// High-power PA duty cycle, indexed by `power_dbm - PA_HP_MIN_DBM`.
+const PA_HP_DUTY_CYCLE: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02, 0x04, 0x00, 0x00, 0x01, 0x02, 0x00, 0x04, 0x02,
+    0x01, 0x04, 0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x04, 0x01, 0x02, 0x01, 0x03, 0x03, 0x04, 0x04,
+];
+
+/// High-power PA hp_sel, indexed by `power_dbm - PA_HP_MIN_DBM`.
+const PA_HP_HP_SEL: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x02,
+    0x03, 0x02, 0x01, 0x01, 0x01, 0x01, 0x03, 0x03, 0x02, 0x04, 0x04, 0x06, 0x05, 0x07, 0x06, 0x07,
+];
+
+/// Resolve the per-dBm PA bias for a sub-GHz output power. Returns
+/// (pa_sel, pa_reg_supply, pa_duty_cycle, pa_hp_sel). Powers up to and
+/// including +15 dBm use the low-power PA (VREG); higher powers use the
+/// high-power PA (VBAT).
+fn subghz_pa_config(power_dbm: i8) -> (u8, u8, u8, u8) {
+    if power_dbm <= PA_LP_MAX_DBM {
+        let level = power_dbm.clamp(PA_LP_MIN_DBM, PA_LP_MAX_DBM);
+        let idx = (level - PA_LP_MIN_DBM) as usize;
+        (0x00, 0x00, PA_LP_DUTY_CYCLE[idx], PA_LP_HP_SEL[idx])
     } else {
-        (0x00, 0x00)
+        let level = power_dbm.clamp(PA_HP_MIN_DBM, PA_HP_MAX_DBM);
+        let idx = (level - PA_HP_MIN_DBM) as usize;
+        (0x01, 0x01, PA_HP_DUTY_CYCLE[idx], PA_HP_HP_SEL[idx])
     }
 }
 
@@ -974,10 +1016,12 @@ impl LR1121 {
     fn set_tx_params(&mut self, power_dbm: i8, band: FrequencyBand) -> Result<(), LoRaError> {
         match band {
             FrequencyBand::SubGhz => {
-                // High power PA: range -9 to +22 dBm (0xF7 to 0x16)
-                let clamped = power_dbm.clamp(-9, 22);
-                let power = if clamped >= 14 { 0x16 } else { clamped as u8 };
-                self.write_command(CMD_SET_TX_PARAMS, &[power, RAMP_800U])?;
+                // Full sub-GHz PA range: -17 dBm (LP PA min) to +22 dBm
+                // (HP PA max). The SetTxParams power byte is the dBm value
+                // directly (two's complement for negative powers); the PA
+                // bias for the requested level is applied by set_pa_config.
+                let clamped = power_dbm.clamp(PA_LP_MIN_DBM, PA_HP_MAX_DBM);
+                self.write_command(CMD_SET_TX_PARAMS, &[clamped as u8, RAMP_800U])?;
             }
             FrequencyBand::LBand | FrequencyBand::SBand | FrequencyBand::Band2p4G => {
                 // High frequency PA: range -18 to +13 dBm (0xEE to 0x0F)
@@ -991,14 +1035,11 @@ impl LR1121 {
     fn set_pa_config(&mut self, power_dbm: i8, band: FrequencyBand) -> Result<(), LoRaError> {
         match band {
             FrequencyBand::SubGhz => {
-                if power_dbm <= 14 {
-                    // Low Power PA (PaSel=0x00): range -17 to +14 dBm
-                    self.write_command(CMD_SET_PA_CONFIG, &[0x00, 0x00, 0x04, 0x00])?;
-                } else {
-                    // High Power PA (PaSel=0x01): range -9 to +22 dBm
-                    let (pa_duty_cycle, hp_max) = subghz_pa_duty_cycle(power_dbm);
-                    self.write_command(CMD_SET_PA_CONFIG, &[0x01, 0x01, pa_duty_cycle, hp_max])?;
-                }
+                // Per-dBm PA bias: low-power PA (LP, VREG) up to +15 dBm,
+                // high-power PA (HP, VBAT) above, each with the Seeed
+                // per-dBm duty_cycle/hp_sel tables.
+                let (pa_sel, reg_supply, pa_duty_cycle, pa_hp_sel) = subghz_pa_config(power_dbm);
+                self.write_command(CMD_SET_PA_CONFIG, &[pa_sel, reg_supply, pa_duty_cycle, pa_hp_sel])?;
             }
             FrequencyBand::LBand | FrequencyBand::SBand | FrequencyBand::Band2p4G => {
                 // High frequency PA
@@ -1009,8 +1050,25 @@ impl LR1121 {
     }
 
     fn set_sync_word(&mut self, word: u16) -> Result<(), LoRaError> {
-        // LR1121 uses a single-byte sync word (MSB of SX1262 16-bit word)
-        let sync = if (word >> 8) != 0 { (word >> 8) as u8 } else { word as u8 };
+        // The LR11xx SetLoRaSyncWord command accepts a single byte, unlike
+        // the SX126x family's two-byte custom sync word, and its standard
+        // values are 0x12 (private) and 0x34 (public) — NOT the MSB of the
+        // SX1262's 0x1424/0x3444 words (0x14 would be a non-standard value
+        // that LR11xx RNodes would not hear). Map the SX126x-style words
+        // onto their LR11xx equivalents; any other value is taken as the
+        // raw single byte.
+        let sync = match word {
+            0x1424 => 0x12, // private network
+            0x3444 => 0x34, // public network
+            w if w <= 0xFF => w as u8,
+            _ => {
+                log::warn!(
+                    "lr1121: sync word 0x{word:04X} does not fit in a single byte; \
+                     using 0x12 (private)"
+                );
+                0x12
+            }
+        };
         self.write_command(CMD_SET_LORA_SYNC_WORD, &[sync])?;
         Ok(())
     }
@@ -1693,7 +1751,21 @@ impl LoRaChipset for LR1121 {
         if irq_status & IRQ_RX_DONE != 0 {
             let (payload_len, start_ptr) = self.get_rx_buffer_status()?;
             if payload_len > 0 {
-                let payload = self.read_buffer(start_ptr, payload_len)?;
+                // LR11xx ReadBuffer8 is linear and does NOT wrap at the
+                // 256-byte buffer boundary (unlike the SX1262 FIFO, which
+                // wraps in hardware). RX-continuous mode advances the write
+                // pointer through the buffer for each packet, so a packet
+                // whose start_ptr + payload_len exceeds 256 would read
+                // garbage for its tail. Split the read at the wrap point:
+                // [start..end-of-buffer] + [0..remainder].
+                let payload = if start_ptr as usize + payload_len <= RX_BUFFER_SIZE {
+                    self.read_buffer(start_ptr, payload_len)?
+                } else {
+                    let first = RX_BUFFER_SIZE - start_ptr as usize;
+                    let mut payload = self.read_buffer(start_ptr, first)?;
+                    payload.extend(self.read_buffer(0, payload_len - first)?);
+                    payload
+                };
                 let (rssi, snr, _signal_rssi) = self.get_packet_status()?;
 
                 if irq_status & IRQ_ERR == 0 {
