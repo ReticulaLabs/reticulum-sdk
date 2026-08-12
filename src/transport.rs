@@ -3766,35 +3766,58 @@ async fn handle_link_request_as_destination(
     match destination.handle_packet(&packet) {
         DestinationHandleStatus::LinkProof => {
             let link_id = LinkId::from(&packet);
-            if !handler.in_links.contains_key(&link_id) {
-                log::trace!(
-                    "tp({}): send proof to {}",
-                    handler.config.name,
-                    packet.destination
-                );
 
-                let link = Link::new_from_request(
-                    &packet,
-                    destination.sign_key().clone(),
-                    destination.desc,
-                    handler.link_in_event_tx.clone(),
-                );
-
-                if let Ok(mut link) = link {
-                    let prove_packet = link.prove();
-                    pending.push(handler.send_ctx.prepare_send_packet(prove_packet));
-
-                    log::debug!(
-                        "tp({}): save input link {} for destination {}",
+            // If we already have an in-link for this link id, the initiator
+            // has repeated its link request because it never received our
+            // link request proof (e.g. it was lost in transit). Re-prove the
+            // existing link and refresh its activity timer, so the initiator
+            // can complete the handshake instead of waiting for this in-link
+            // to time out (~12 minutes). This mirrors the Python reference,
+            // which re-proves an in-link on a repeated link request.
+            if let Some(existing) = handler.in_links.get(&link_id).cloned() {
+                let mut existing = existing.lock().await;
+                if existing.status() != LinkStatus::Closed {
+                    log::trace!(
+                        "tp({}): re-prove existing in-link {}",
                         handler.config.name,
-                        link.id(),
-                        link.destination().address_hash
+                        existing.id()
                     );
-
-                    handler
-                        .in_links
-                        .insert(*link.id(), Arc::new(Mutex::new(link)));
+                    let prove_packet = existing.prove();
+                    pending.push(handler.send_ctx.prepare_send_packet(prove_packet));
+                    existing.mark_activity();
+                    return;
                 }
+                // If the existing link is closed, fall through and establish
+                // a fresh one below.
+            }
+
+            log::trace!(
+                "tp({}): send proof to {}",
+                handler.config.name,
+                packet.destination
+            );
+
+            let link = Link::new_from_request(
+                &packet,
+                destination.sign_key().clone(),
+                destination.desc,
+                handler.link_in_event_tx.clone(),
+            );
+
+            if let Ok(mut link) = link {
+                let prove_packet = link.prove();
+                pending.push(handler.send_ctx.prepare_send_packet(prove_packet));
+
+                log::debug!(
+                    "tp({}): save input link {} for destination {}",
+                    handler.config.name,
+                    link.id(),
+                    link.destination().address_hash
+                );
+
+                handler
+                    .in_links
+                    .insert(*link.id(), Arc::new(Mutex::new(link)));
             }
         }
         DestinationHandleStatus::None => {}
@@ -6013,5 +6036,66 @@ mod tests {
 
         assert!(destinations.contains(&first_destination.desc.address_hash));
         assert!(destinations.contains(&second_destination.desc.address_hash));
+    }
+
+    #[tokio::test]
+    async fn repeated_link_request_reproves_existing_in_link() {
+        let mut transport = Transport::new(Default::default());
+        let mut rng = UnwrapErr(SysRng);
+        let destination = transport
+            .add_destination(
+                PrivateIdentity::new_from_rand(&mut rng),
+                DestinationName::new("example_utilities", "link.reprove"),
+            )
+            .await;
+
+        let dest_desc = destination.lock().await.desc.clone();
+        let handler = transport.get_handler();
+        let event_tx = handler.lock().await.link_in_event_tx.clone();
+
+        // Build a link request packet as the initiator would
+        let mut initiator_link = Link::new(dest_desc, event_tx);
+        let request_packet = initiator_link.request(None);
+
+        let iface = AddressHash::new_from_rand(&mut rng);
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_link_request_as_destination(
+                destination.clone(),
+                &request_packet,
+                &mut *h,
+                &mut pending,
+                iface,
+            )
+            .await;
+        }
+
+        // First request: exactly one in-link and one queued proof
+        assert_eq!(handler.lock().await.in_links.len(), 1);
+        assert_eq!(pending.messages.len(), 1);
+        pending.messages.clear();
+
+        // Replay the same request: the existing in-link must be re-proved
+        // (a fresh proof queued), not silently ignored, and no duplicate
+        // in-link may be created.
+        {
+            let mut h = handler.lock().await;
+            handle_link_request_as_destination(
+                destination.clone(),
+                &request_packet,
+                &mut *h,
+                &mut pending,
+                iface,
+            )
+            .await;
+        }
+        assert_eq!(handler.lock().await.in_links.len(), 1);
+        assert_eq!(
+            pending.messages.len(),
+            1,
+            "repeated link request must re-prove the existing in-link"
+        );
     }
 }
