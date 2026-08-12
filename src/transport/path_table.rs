@@ -133,7 +133,7 @@ impl PathTable {
         transport_id: Option<AddressHash>,
         iface: AddressHash,
         path_expiry: Duration,
-    ) {
+    ) -> bool {
         let hops = announce.header.hops;
 
         let random_blob = announce_random_blob(announce);
@@ -151,7 +151,7 @@ impl PathTable {
             };
 
             if !should_install {
-                return;
+                return false;
             }
         }
 
@@ -200,6 +200,22 @@ self_referential_transport={}",
             hops,
             received_from,
         );
+
+        true
+    }
+
+    /// Whether the path table already records this announce emission
+    /// (same random blob) for the destination. Used to avoid re-applying
+    /// the announce rate limiter to duplicate copies of a single emission
+    /// heard on multiple interfaces.
+    pub fn knows_emission(&self, destination: &AddressHash, announce: &Packet) -> bool {
+        let Some(blob) = announce_random_blob(announce) else {
+            return false;
+        };
+        self.map
+            .get(destination)
+            .map(|entry| entry.random_blobs.contains(&blob))
+            .unwrap_or(false)
     }
 
     /// Remove a specific destination from the path table.
@@ -381,6 +397,21 @@ impl PathEntry {
         let path_timebase = self.timebase();
 
         if self.random_blobs.contains(&random_blob) {
+            // The same announce emission was already recorded. Accept it
+            // only if it now arrives via a strictly closer (fewer-hop)
+            // path, so a multi-interface node converges on the best route
+            // for a single emission. This mirrors the Python reference,
+            // which updates the path when the same announce is received
+            // on an interface with higher gravity (Transport.py:1836-1845).
+            if hops < self.hops {
+                log::trace!(
+                    "path_table accept same-emission announce for {} via closer path ({} < {} hops)",
+                    destination,
+                    hops,
+                    self.hops,
+                );
+                return true;
+            }
             log::trace!(
                 "path_table reject duplicate announce for {} at timebase {}",
                 destination,
@@ -732,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_announce_random_blob_does_not_replace_path() {
+    fn same_emission_with_fewer_hops_replaces_path() {
         let destination = AddressHash::new_from_slice(b"replayed-destination");
         let first_iface = AddressHash::new_from_slice(b"first-iface");
         let second_iface = AddressHash::new_from_slice(b"second-iface");
@@ -752,9 +783,12 @@ mod tests {
             Duration::from_secs(60 * 60 * 24 * 7),
         );
 
+        // The same emission arriving via a strictly closer (fewer-hop)
+        // path must replace the existing route, so a multi-interface node
+        // converges on the closest peer for a single announce emission.
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
-        assert_eq!(iface, first_iface);
-        assert_eq!(hops, 2);
+        assert_eq!(iface, second_iface);
+        assert_eq!(hops, 1);
     }
 
     #[test]

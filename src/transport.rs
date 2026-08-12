@@ -2822,7 +2822,15 @@ impl TransportHandler {
         let mut allow_duplicate = false;
 
         match packet.header.packet_type {
-            PacketType::Announce => {}
+            PacketType::Announce => {
+                // A single announce emission carries the same hop-invariant
+                // packet hash on every interface it is heard on. Python's
+                // packet_filter re-processes SINGLE announces even when the
+                // hash is already known (Transport.py:1417-1424), so that a
+                // multi-interface node can converge on the best route and
+                // echoes can drive announce completion. Match that here.
+                allow_duplicate = packet.header.destination_type == DestinationType::Single;
+            }
             PacketType::LinkRequest => {
                 allow_duplicate = true;
             }
@@ -3413,7 +3421,21 @@ async fn handle_announce(
     }
 
     if packet.context != PacketContext::PathResponse {
-        if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
+        // A single announce emission carries the same hop-invariant packet
+        // hash on every interface it is heard on, so a duplicate copy of an
+        // emission that was already recorded in the path table is not a new
+        // announce from the destination. Skip the per-destination announce
+        // rate limiter for such copies; otherwise a legitimate destination
+        // heard on multiple interfaces would be falsely rate-limited.
+        let emission_known = handler
+            .send_ctx
+            .path_table
+            .read()
+            .unwrap()
+            .knows_emission(&packet.destination, packet);
+        if !emission_known
+            && let Some(blocked_until) = handler.announce_limits.check(&packet.destination)
+        {
             handler.announces_rate_limited += 1;
             log::info!(
                 "tp({}): too many announces from {}, blocked for {} seconds",
@@ -3534,7 +3556,7 @@ is_path_response={}",
             .lock()
             .await
             .path_expiry_for_iface(&iface);
-        handler
+        let path_updated = handler
             .send_ctx
             .path_table
             .write()
@@ -3573,23 +3595,30 @@ is_path_response={}",
             );
         }
 
-        warn_if_event_channel_full(&handler.announce_tx, handler.config.event_channel_capacity, "announce", &handler.config.name);
-        let _ = handler.announce_tx.send(AnnounceEvent {
-            destination,
-            hops: packet.header.hops,
-            snr,
-            rssi,
-            app_data: PacketDataBuffer::new_from_slice(&app_data),
-        });
+        // Only notify applications and discovery of announces that actually
+        // resulted in a path table change. A duplicate copy of an emission
+        // already recorded on another interface (without improving the
+        // route) must not be re-delivered to the app, matching Python's
+        // `should_add` gating of announce handler callbacks.
+        if path_updated {
+            warn_if_event_channel_full(&handler.announce_tx, handler.config.event_channel_capacity, "announce", &handler.config.name);
+            let _ = handler.announce_tx.send(AnnounceEvent {
+                destination,
+                hops: packet.header.hops,
+                snr,
+                rssi,
+                app_data: PacketDataBuffer::new_from_slice(&app_data),
+            });
 
-        if is_discovery_destination(&dest_desc) {
-            if let Ok(discovered) = DiscoveredInterface::from_announce(
-                dest_desc,
-                packet.header.hops,
-                app_data,
-            ) {
-                warn_if_event_channel_full(&handler.discovery_tx, handler.config.event_channel_capacity, "discovery", &handler.config.name);
-                let _ = handler.discovery_tx.send(discovered);
+            if is_discovery_destination(&dest_desc) {
+                if let Ok(discovered) = DiscoveredInterface::from_announce(
+                    dest_desc,
+                    packet.header.hops,
+                    app_data,
+                ) {
+                    warn_if_event_channel_full(&handler.discovery_tx, handler.config.event_channel_capacity, "discovery", &handler.config.name);
+                    let _ = handler.discovery_tx.send(discovered);
+                }
             }
         }
     } else {
@@ -5574,6 +5603,10 @@ mod tests {
         announce.header.hops = 3;
         announce.transport = Some(destination);
 
+        // SINGLE announces are always re-processed, even when the packet
+        // hash is already known (matching Python's packet_filter): the
+        // hash excludes the hop count, so the same emission heard on a
+        // second interface must still reach the path table and echo logic.
         assert!(
             handler
                 .lock()
@@ -5582,11 +5615,32 @@ mod tests {
                 .await
         );
         assert!(
-            !handler
+            handler
                 .lock()
                 .await
                 .filter_duplicate_packets(&announce)
+                .await,
+            "duplicate SINGLE announces must be re-processed, not dropped"
+        );
+
+        // Non-SINGLE announce types are still deduplicated by the packet
+        // cache (the second copy of a GROUP announce is dropped).
+        let mut group_announce: Packet = announce.clone();
+        group_announce.header.destination_type = DestinationType::Group;
+        assert!(
+            handler
+                .lock()
                 .await
+                .filter_duplicate_packets(&group_announce)
+                .await
+        );
+        assert!(
+            !handler
+                .lock()
+                .await
+                .filter_duplicate_packets(&group_announce)
+                .await,
+            "duplicate GROUP announces must be dropped"
         );
 
         let mut pending = PendingSends::new();
@@ -6096,6 +6150,121 @@ mod tests {
             pending.messages.len(),
             1,
             "repeated link request must re-prove the existing in-link"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_emission_on_two_interfaces_converges_on_closest_path() {
+        // Regression test for the multi-interface path selection bug: a
+        // single announce emission carries the same hop-invariant packet
+        // hash on every interface, so the copy heard on a second interface
+        // must still reach the path table. When the second copy arrives via
+        // a strictly closer (fewer-hop) path, the route must be updated to
+        // it instead of pinning traffic to the stale longer path.
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "multi.iface"),
+        );
+        let announce = remote_destination
+            .announce(&mut rng, None)
+            .expect("valid announce");
+        let destination = announce.destination;
+
+        let slow_iface = AddressHash::new_from_slice(b"slow-relay-iface");
+        let fast_iface = AddressHash::new_from_slice(b"fast-direct-iface");
+
+        // First, the announce is heard via a 2-hop relay.
+        let mut via_relay = announce.clone();
+        via_relay.header.header_type = HeaderType::Type2;
+        via_relay.header.propagation_type = PropagationType::Transport;
+        via_relay.header.hops = 2;
+        via_relay.transport = Some(AddressHash::new_from_slice(b"relay-transport"));
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_announce(&via_relay, &mut *h, &mut pending, slow_iface, None, None).await;
+        }
+
+        let (_, iface, hops) = handler
+            .lock()
+            .await
+            .send_ctx
+            .path_table
+            .read()
+            .unwrap()
+            .next_hop_route(&destination)
+            .unwrap();
+        assert_eq!(iface, slow_iface);
+        assert_eq!(hops, 2);
+
+        // Then the same emission (same random blob, same hash) is heard
+        // directly at 1 hop on a second interface.
+        let mut direct = announce;
+        direct.header.header_type = HeaderType::Type1;
+        direct.header.propagation_type = PropagationType::Broadcast;
+        direct.header.hops = 1;
+        direct.transport = None;
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_announce(&direct, &mut *h, &mut pending, fast_iface, None, None).await;
+        }
+
+        let (_, iface, hops) = handler
+            .lock()
+            .await
+            .send_ctx
+            .path_table
+            .read()
+            .unwrap()
+            .next_hop_route(&destination)
+            .unwrap();
+        assert_eq!(
+            iface, fast_iface,
+            "path must converge to the closest (1-hop) interface for the same emission"
+        );
+        assert_eq!(hops, 1);
+    }
+
+    #[tokio::test]
+    async fn same_emission_on_multiple_interfaces_is_not_rate_limited() {
+        // A single announce emission heard on several interfaces carries
+        // the same hash and is re-processed for path selection. It must not
+        // count as multiple new announces against the per-destination
+        // announce rate limiter, or a legitimate destination heard on many
+        // interfaces would be falsely blocked.
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "multi.rate"),
+        );
+        let announce = remote_destination
+            .announce(&mut rng, None)
+            .expect("valid announce");
+
+        let mut pending = PendingSends::new();
+        for (i, hop_count) in [1u8, 1, 1].iter().enumerate() {
+            let mut copy = announce.clone();
+            copy.header.hops = *hop_count;
+            let iface = AddressHash::new_from_slice(&[i as u8 + 1; 32]);
+            let mut h = handler.lock().await;
+            handle_announce(&copy, &mut *h, &mut pending, iface, None, None).await;
+            drop(h);
+        }
+
+        let m = transport.metrics().await;
+        assert_eq!(
+            m.announces_rate_limited, 0,
+            "duplicate copies of one emission must not consume rate-limit budget"
         );
     }
 }
