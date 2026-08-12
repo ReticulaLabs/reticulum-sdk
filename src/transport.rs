@@ -1255,6 +1255,22 @@ impl Transport {
 
         let mut link = Link::new(destination, self.link_out_event_tx.clone());
 
+        // Bound how long the link may stay unestablished: a pending link
+        // that never receives its proof must eventually fail and be
+        // removed, otherwise the application is stuck with a non-activating
+        // link forever (matches Python's `Link.establishment_timeout`).
+        // The budget scales with the path hop count.
+        let establishment_hops = {
+            let pt = self.send_ctx.path_table.read().unwrap();
+            pt.next_hop_route(&destination.address_hash)
+                .map(|(_, _, hops)| hops)
+                .unwrap_or(1)
+                .max(1)
+        };
+        link.set_establishment_deadline(Duration::from_secs(
+            DEFAULT_PER_HOP_TIMEOUT_SECS * (establishment_hops as u64 + 1),
+        ));
+
         let packet = link.request(path_mtu);
 
         log::debug!(
@@ -4138,6 +4154,32 @@ async fn handle_check_links(
                 }
             }
             LinkStatus::Pending => {
+                // A pending out-link that never receives its proof must
+                // eventually fail. The establishment deadline is anchored
+                // at request creation and is *not* extended by request
+                // retransmissions, so a link to an unreachable destination
+                // is closed, removed and its path rediscovered instead of
+                // lingering forever (matches Python's
+                // `Link.establishment_timeout` watchdog + jobloop path
+                // expiry).
+                if link.establishment_expired() {
+                    log::warn!(
+                        "tp({}): link {} establishment timed out, closing and rediscovering \
+                         path to {}",
+                        handler.config.name,
+                        link.id(),
+                        link.destination().address_hash,
+                    );
+
+                    // Notify the application that the link failed, then
+                    // drop it and rediscover the destination path.
+                    link.close();
+                    links_to_remove.push(*link_entry.0);
+                    out_link_ids_to_remove.push(*link.id());
+                    rediscover_destinations.push((*link_entry.0, None));
+                    continue;
+                }
+
                 if link.elapsed() > INTERVAL_OUTPUT_LINK_REPEAT {
                     log::warn!(
                         "tp({}): repeat link request {}",
@@ -6302,5 +6344,54 @@ mod tests {
             m.announces_rate_limited, 0,
             "duplicate copies of one emission must not consume rate-limit budget"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_out_link_is_closed_and_removed_after_establishment_deadline() {
+        let mut transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        // Create a destination that will never respond, and a link to it.
+        let destination = transport
+            .add_destination(
+                PrivateIdentity::new_from_rand(&mut rng),
+                DestinationName::new("example_utilities", "link.expire"),
+            )
+            .await;
+        let dest_desc = destination.lock().await.desc.clone();
+        let link = transport.link(dest_desc.clone()).await;
+        let link_id = *link.lock().await.id();
+
+        // The link is registered as a pending out-link.
+        assert!(handler.lock().await.out_links.contains_key(&dest_desc.address_hash));
+
+        // Force the establishment deadline into the past and advance the
+        // periodic link check.
+        link.lock().await.set_establishment_deadline(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_check_links(&mut *h, &mut pending).await;
+        }
+
+        // The pending out-link must have been closed and removed, and its
+        // link-id mapping dropped, so a later `link()` call starts fresh.
+        assert_eq!(link.lock().await.status(), LinkStatus::Closed);
+        assert!(
+            !handler.lock().await.out_links.contains_key(&dest_desc.address_hash),
+            "expired pending out-link must be removed"
+        );
+        assert!(
+            !handler.lock().await.out_links_by_link_id.contains_key(&link_id),
+            "expired pending out-link id must be removed"
+        );
+
+        // The next link attempt creates a fresh link instead of reusing
+        // the expired zombie.
+        let fresh = transport.link(dest_desc).await;
+        assert_ne!(*fresh.lock().await.id(), link_id);
     }
 }

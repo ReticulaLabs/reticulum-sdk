@@ -32,6 +32,11 @@ const CHANNEL_WINDOW_MAX: u16 = 48;
 /// (no inbound traffic) for this long, and at most once per interval.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(360);
 
+/// Default establishment budget for a pending out-link before it is
+/// failed. `Transport::link` overrides this with a hop-count-based value
+/// (matching Python's `Link.establishment_timeout`).
+const DEFAULT_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) fn link_signalling_bytes(mtu: usize) -> [u8; LINK_MTU_SIZE] {
     let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
     let signalling_value = (mtu as u32 & 0x1F_FFFF) + (mode_bits << 16);
@@ -273,6 +278,12 @@ pub struct Link {
     status: LinkStatus,
     mtu: usize,
     request_time: Instant,
+    /// Absolute deadline by which an initiator out-link must be
+    /// established. Set once when the link request is first sent and
+    /// *not* extended by request retransmissions; if the link is still
+    /// Pending past this point it is failed and removed. Matches Python's
+    /// `Link.establishment_timeout`.
+    establishment_deadline: Instant,
     rtt: Duration,
     /// Last time a keepalive request was sent on this link. Used to gate
     /// keepalive cadence (matches Python's `Link.last_keepalive`).
@@ -302,6 +313,7 @@ impl Link {
             status: LinkStatus::Pending,
             mtu: RETICULUM_MTU,
             request_time: Instant::now(),
+            establishment_deadline: Instant::now() + DEFAULT_ESTABLISHMENT_TIMEOUT,
             rtt: Duration::from_secs(0),
             last_keepalive: Instant::now(),
             keepalive: KEEPALIVE_INTERVAL,
@@ -360,6 +372,7 @@ impl Link {
             status: LinkStatus::Pending,
             mtu,
             request_time: Instant::now(),
+            establishment_deadline: Instant::now() + DEFAULT_ESTABLISHMENT_TIMEOUT,
             rtt: Duration::from_secs(0),
             last_keepalive: Instant::now(),
             keepalive: KEEPALIVE_INTERVAL,
@@ -1191,6 +1204,19 @@ impl Link {
         self.request_time.elapsed()
     }
 
+    /// Set the establishment deadline for this out-link. Called once when
+    /// the link request is created; request retransmissions must not
+    /// re-arm it or a pending link would never fail.
+    pub fn set_establishment_deadline(&mut self, timeout: Duration) {
+        self.establishment_deadline = Instant::now() + timeout;
+    }
+
+    /// Whether this out-link is still Pending past its establishment
+    /// deadline and should be failed and removed.
+    pub fn establishment_expired(&self) -> bool {
+        self.status == LinkStatus::Pending && Instant::now() >= self.establishment_deadline
+    }
+
     pub fn status(&self) -> LinkStatus {
         self.status
     }
@@ -1403,7 +1429,7 @@ mod tests {
 
     use super::{
         ChannelEnvelope, ChannelMessage, KEEPALIVE_INTERVAL, LINK_MTU_SIZE, Link, LinkEvent,
-        LinkHandleResult,
+        LinkHandleResult, LinkStatus,
     };
     use std::time::{Duration, Instant};
 
@@ -1814,5 +1840,25 @@ mod tests {
             link.request_time, past,
             "sending a keepalive must not reset the staleness timer"
         );
+    }
+
+    #[test]
+    fn pending_link_expires_after_establishment_deadline() {
+        let mut link = keepalive_test_link();
+        link.status = LinkStatus::Pending;
+
+        // A pending link inside its establishment budget has not expired.
+        link.set_establishment_deadline(Duration::from_secs(60));
+        assert!(!link.establishment_expired());
+
+        // Once the deadline passes, a still-pending link has expired.
+        link.set_establishment_deadline(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(link.establishment_expired());
+
+        // An established link is never considered establishment-expired,
+        // even if the deadline has long since passed.
+        link.status = LinkStatus::Active;
+        assert!(!link.establishment_expired());
     }
 }
