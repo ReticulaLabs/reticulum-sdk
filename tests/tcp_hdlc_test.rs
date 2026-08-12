@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::net::TcpListener;
 use std::sync::Once;
 use std::time::Duration;
@@ -172,4 +173,86 @@ async fn unavailable_tcp_client_does_not_block_server_traffic() {
     })
     .await
     .expect("TCP server traffic stopped after another TCP client failed to connect");
+}
+
+/// Fill a listener's accept backlog so a fresh connect to `addr` is
+/// genuinely in flight (blocked) until a slot is freed. Returns the
+/// filler connections that must be kept alive to hold the backlog open.
+fn fill_accept_backlog(addr: std::net::SocketAddr) -> Vec<std::net::TcpStream> {
+    let mut fillers = Vec::new();
+    loop {
+        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+            Ok(stream) => fillers.push(stream),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        fillers.len() >= 2,
+        "could not fill the listen backlog (only {} fillers)",
+        fillers.len()
+    );
+    fillers
+}
+
+#[tokio::test]
+async fn outbound_traffic_does_not_abort_in_flight_connect() {
+    setup();
+
+    // A listener whose accept backlog we fill, so a fresh connect to it is
+    // blocked until a slot is freed.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fillers = fill_accept_backlog(addr);
+    // Spawn a TcpClient towards the backlogged address.
+    let mut rng = UnwrapErr(SysRng);
+    let transport = Transport::new(TransportConfig::new(
+        "abort-test",
+        &PrivateIdentity::new_from_rand(&mut rng),
+        true,
+    ));
+    transport
+        .iface_manager()
+        .lock()
+        .await
+        .spawn(TcpClient::new(addr.to_string()), TcpClient::spawn);
+
+    // Give the client time to get its connect stuck in flight.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Outbound traffic now arrives while the connect is in flight.
+    let mut packet = Packet::default();
+    packet.data.write(&[0xAA, 0xBB, 0xCC]);
+    transport.send_packet(packet).await;
+
+    // Free one backlog slot so the client's pending connect completes,
+    // then close the backlog fillers and drain the accept queue, reading
+    // from each connection until the client's data arrives. Stale filler
+    // connections (closed via RST) return 0 bytes and are skipped.
+    let _slot = listener.accept().unwrap();
+    drop(fillers);
+    listener.set_nonblocking(true).unwrap();
+
+    let mut buf = [0u8; 256];
+    let mut got_data = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !got_data && std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut conn, _)) => {
+                conn.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+                match conn.read(&mut buf) {
+                    Ok(n) if n > 0 => got_data = true,
+                    _ => {}
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => break,
+        }
+    }
+
+    assert!(
+        got_data,
+        "client connected but no outbound data arrived: message was dropped"
+    );
 }
