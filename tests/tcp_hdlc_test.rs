@@ -151,7 +151,7 @@ async fn unavailable_tcp_client_does_not_block_server_traffic() {
     let sender = tokio::spawn(async move {
         for counter in 0..3u8 {
             let mut packet = Packet::default();
-            packet.data.write(&[counter]).unwrap();
+            packet.data.write(&[counter]);
             transport_a.send_packet(packet).await;
         }
     });

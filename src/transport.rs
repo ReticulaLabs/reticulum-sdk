@@ -3856,6 +3856,7 @@ async fn handle_link_request_as_destination(
 async fn handle_link_request_as_intermediate(
     received_from: AddressHash,
     next_hop_iface: AddressHash,
+    next_hop_transport: AddressHash,
     remaining_hops: u8,
     packet: &Packet,
     handler: &mut TransportHandler,
@@ -3882,6 +3883,33 @@ async fn handle_link_request_as_intermediate(
         clamp_link_request_mtu(packet, handler, Some(received_from), Some(next_hop_iface)).await
     } else {
         packet.clone()
+    };
+
+    // Re-stamp the transport header for the next hop, mirroring the Python
+    // reference (Transport.py _process_transport_packet). If more hops remain
+    // the packet stays Type2 with the next-hop transport id; otherwise the
+    // transport headers are stripped so the directly-reachable destination
+    // accepts the link request.
+    let forwarded = if remaining_hops > 0 {
+        Packet {
+            header: Header {
+                header_type: HeaderType::Type2,
+                propagation_type: PropagationType::Transport,
+                ..forwarded.header
+            },
+            transport: Some(next_hop_transport),
+            ..forwarded
+        }
+    } else {
+        Packet {
+            header: Header {
+                header_type: HeaderType::Type1,
+                propagation_type: PropagationType::Broadcast,
+                ..forwarded.header
+            },
+            transport: None,
+            ..forwarded
+        }
     };
 
     send_to_next_hop(forwarded, handler, pending, next_hop_iface).await;
@@ -3979,7 +4007,7 @@ async fn handle_link_request(
             let pt = handler.send_ctx.path_table.read().unwrap();
             pt.next_hop_route(&packet.destination)
         };
-        if let Some((_, next_iface, path_hops)) = route {
+        if let Some((next_hop, next_iface, path_hops)) = route {
             log::trace!(
                 "tp({}): handle link request for remote destination {}",
                 handler.config.name,
@@ -3987,8 +4015,16 @@ async fn handle_link_request(
             );
 
             let remaining_hops = path_hops.saturating_sub(1);
-            handle_link_request_as_intermediate(iface, next_iface, remaining_hops, packet, handler, pending)
-                .await;
+            handle_link_request_as_intermediate(
+                iface,
+                next_iface,
+                next_hop,
+                remaining_hops,
+                packet,
+                handler,
+                pending,
+            )
+            .await;
         } else {
             log::trace!(
                 "tp({}): dropping link request to unknown destination {}",
