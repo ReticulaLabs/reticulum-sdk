@@ -1031,6 +1031,107 @@ impl Resource {
         })
     }
 
+    // ---- Timeout / retry handling ----
+
+    /// Timeout before re-requesting missing parts (receiver side), or
+    /// before deciding the transfer has stalled. Scales with the measured
+    /// RTT, the number of outstanding parts, and how many retries have
+    /// already been burned (each retry adds `PER_RETRY_DELAY`).
+    fn part_timeout(&self) -> Duration {
+        let rtt = self.rtt.unwrap_or(Duration::from_secs(1)).as_secs_f64();
+        let outstanding = self.outstanding_parts.max(1) as f64;
+        let retries_used = (self.max_retries.saturating_sub(self.retries_left)) as f64;
+        let extra_wait = retries_used * PER_RETRY_DELAY;
+        // Each outstanding part is expected to take roughly one RTT;
+        // scale by the part timeout factor for a safety margin (the
+        // Python reference reaches the same value when EIFR ≈ one part
+        // per RTT).
+        let expected = self.part_timeout_factor * outstanding * rtt;
+        Duration::from_secs_f64(expected + RETRY_GRACE_TIME + extra_wait)
+    }
+
+    /// Timeout before re-advertising on the sender side (waiting for the
+    /// first part request), and before re-querying the proof once all
+    /// parts have been sent.
+    fn sender_timeout(&self) -> Duration {
+        let rtt = self.rtt.unwrap_or(Duration::from_secs(1)).as_secs_f64();
+        Duration::from_secs_f64(rtt * PROOF_TIMEOUT_FACTOR + SENDER_GRACE_TIME)
+    }
+
+    /// Check whether the transfer has stalled past its timeout budget.
+    ///
+    /// A driver should call this periodically (e.g. once per link tick)
+    /// and act on the returned [`ResourceTimeoutAction`]. On a timeout the
+    /// retry budget is decremented and a retry action is returned; once the
+    /// budget is exhausted the resource is marked [`ResourceStatus::Failed`]
+    /// so the caller can tear it down. Without this, a stalled transfer
+    /// would hang forever with no retransmission or expiry path.
+    pub fn check_timeout(&mut self) -> Result<ResourceTimeoutAction, RnsError> {
+        let now = std::time::Instant::now();
+        match self.status {
+            ResourceStatus::Advertised => {
+                // Sender advertised but no part request arrived yet.
+                let deadline = self
+                    .adv_sent
+                    .unwrap_or(self.last_activity)
+                    .checked_add(self.sender_timeout());
+                if deadline.is_none_or(|d| now >= d) {
+                    if self.max_adv_retries == 0 {
+                        self.status = ResourceStatus::Failed;
+                        return Ok(ResourceTimeoutAction::Failed);
+                    }
+                    self.max_adv_retries -= 1;
+                    Ok(ResourceTimeoutAction::RetryAdvertisement)
+                } else {
+                    Ok(ResourceTimeoutAction::None)
+                }
+            }
+            ResourceStatus::Transferring => {
+                let deadline = self.last_activity.checked_add(self.part_timeout());
+                if deadline.is_none_or(|d| now >= d) {
+                    if self.retries_left == 0 {
+                        self.status = ResourceStatus::Failed;
+                        return Ok(ResourceTimeoutAction::Failed);
+                    }
+                    self.retries_left -= 1;
+                    // Shrink the window on timeout (matches Python).
+                    if self.window > self.window_min {
+                        self.window -= 1;
+                        if self.window_max > self.window_min {
+                            self.window_max -= 1;
+                            if self.window_max - self.window > self.window_flexibility - 1 {
+                                self.window_max -= 1;
+                            }
+                        }
+                    }
+                    self.waiting_for_hmu = false;
+                    let request = self.build_request()?;
+                    Ok(ResourceTimeoutAction::RetryPartRequest(request))
+                } else {
+                    Ok(ResourceTimeoutAction::None)
+                }
+            }
+            ResourceStatus::AwaitingProof => {
+                // Sender has sent all parts but no proof arrived.
+                let deadline = self
+                    .last_part_sent
+                    .unwrap_or(self.last_activity)
+                    .checked_add(self.sender_timeout());
+                if deadline.is_none_or(|d| now >= d) {
+                    if self.retries_left == 0 {
+                        self.status = ResourceStatus::Failed;
+                        return Ok(ResourceTimeoutAction::Failed);
+                    }
+                    self.retries_left -= 1;
+                    Ok(ResourceTimeoutAction::RetryProof)
+                } else {
+                    Ok(ResourceTimeoutAction::None)
+                }
+            }
+            _ => Ok(ResourceTimeoutAction::None),
+        }
+    }
+
     // ---- Getters ----
 
     pub fn hash(&self) -> &Hash {
@@ -1106,6 +1207,26 @@ pub struct ResourceRequestResult {
     pub parts: Vec<Vec<u8>>,
     pub hmu_packet: Option<Vec<u8>>,
     pub all_sent: bool,
+}
+
+/// What a resource timeout check decided the driver should do next.
+///
+/// The resource state machine alone cannot send packets, so it reports
+/// the action a driver should perform when a transfer stalls past its
+/// timeout budget. Each action decrements the corresponding retry budget;
+/// once the budget is exhausted the resource is marked `Failed`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResourceTimeoutAction {
+    /// The transfer is still within its timeout budget; nothing to do yet.
+    None,
+    /// The receiver should re-send a part request (request payload included).
+    RetryPartRequest(Vec<u8>),
+    /// The sender should re-send the resource advertisement.
+    RetryAdvertisement,
+    /// The sender should re-query the network cache for the resource proof.
+    RetryProof,
+    /// The transfer failed and must be torn down and cleaned up.
+    Failed,
 }
 
 // ============================================================================
@@ -1215,5 +1336,165 @@ mod tests {
             expected_hash,
             "resource hash must be SHA-256(plaintext || random_hash)"
         );
+    }
+
+    #[test]
+    fn receiver_part_request_is_reissued_after_timeout() {
+        // Data large enough to span several parts, with non-repeating
+        // bytes so the (dummy-encrypted) parts have distinct map hashes.
+        let data: Vec<u8> = (0..1200u32).map(|i| (i % 251) as u8).collect();
+        let link_mdu = 400;
+        let mut sender =
+            Resource::new(&data, link_mdu, dummy_encrypt, None, false).expect("sender");
+        let adv = ResourceAdvertisement::from_resource(&sender);
+        let rtt = Duration::from_millis(50);
+        let mut receiver =
+            Resource::new_from_advertisement(&adv, link_mdu, rtt, None).expect("receiver");
+
+        // Start transfer: receiver issues a part request.
+        let first_req = receiver.start_receive(&adv.hashmap).expect("first request");
+        let req_result = sender.handle_request(&first_req, None).expect("handle req");
+        assert!(sender.total_parts() > 1, "test requires multiple parts");
+
+        // Receive only the first part, leaving parts outstanding.
+        assert!(receiver.receive_part(&req_result.parts[0]), "part accepted");
+
+        // No timeout has elapsed yet: nothing due.
+        receiver.last_activity = std::time::Instant::now();
+        assert_eq!(
+            receiver.check_timeout().expect("check"),
+            ResourceTimeoutAction::None
+        );
+
+        // Force a timeout: the retry budget is consumed and a fresh part
+        // request must be produced so the missing parts can be re-fetched.
+        receiver.last_activity =
+            std::time::Instant::now() - Duration::from_secs(3600);
+        let retries_before = receiver.retries_left;
+        let action = receiver.check_timeout().expect("check");
+        assert_eq!(receiver.retries_left, retries_before - 1, "retry budget decremented");
+        match action {
+            ResourceTimeoutAction::RetryPartRequest(request) => {
+                assert!(!request.is_empty(), "re-request must carry hashes");
+                // The re-request must actually solicit the missing parts.
+                let req_result = sender
+                    .handle_request(&request, None)
+                    .expect("handle re-request");
+                assert!(!req_result.parts.is_empty(), "re-request must yield parts");
+            }
+            other => panic!("expected RetryPartRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receiver_fails_after_retries_exhausted() {
+        let data: Vec<u8> = (0..1200u32).map(|i| (i % 251) as u8).collect();
+        let link_mdu = 400;
+        let mut sender =
+            Resource::new(&data, link_mdu, dummy_encrypt, None, false).expect("sender");
+        let adv = ResourceAdvertisement::from_resource(&sender);
+        let rtt = Duration::from_millis(50);
+        let mut receiver =
+            Resource::new_from_advertisement(&adv, link_mdu, rtt, None).expect("receiver");
+
+        let first_req = receiver.start_receive(&adv.hashmap).expect("first request");
+        let req_result = sender.handle_request(&first_req, None).expect("handle req");
+        assert!(receiver.receive_part(&req_result.parts[0]), "part accepted");
+
+        // Burn the entire retry budget with timeouts. Each timeout must
+        // consume a retry and eventually transition the transfer to Failed
+        // rather than hanging forever. `max_retries + 1` iterations are
+        // needed: the first `max_retries` consume the budget (each returns
+        // a retry), and the final one observes it exhausted.
+        let mut failed = false;
+        for _ in 0..=receiver.max_retries {
+            receiver.last_activity =
+                std::time::Instant::now() - Duration::from_secs(3600);
+            let action = receiver.check_timeout().expect("check");
+            match action {
+                ResourceTimeoutAction::RetryPartRequest(_) => {
+                    // Keep stalling: the next timeout will consume another retry.
+                }
+                ResourceTimeoutAction::Failed => {
+                    failed = true;
+                    break;
+                }
+                other => panic!("unexpected action {other:?}"),
+            }
+        }
+
+        assert!(failed, "transfer must fail once the retry budget is exhausted");
+        assert_eq!(receiver.status(), ResourceStatus::Failed);
+    }
+
+    #[test]
+    fn sender_re_advertises_then_fails_without_first_request() {
+        let data = b"Advertise but nobody asks!";
+        let link_mdu = 400;
+        let mut sender =
+            Resource::new(data, link_mdu, dummy_encrypt, None, false).expect("sender");
+
+        // Simulate an advertisement having been sent and no part request
+        // ever arriving.
+        sender.status = ResourceStatus::Advertised;
+        sender.adv_sent = Some(std::time::Instant::now() - Duration::from_secs(3600));
+        sender.max_adv_retries = 2;
+        sender.retries_left = MAX_ADV_RETRIES;
+
+        // First timeout: re-advertise.
+        assert_eq!(
+            sender.check_timeout().expect("check"),
+            ResourceTimeoutAction::RetryAdvertisement
+        );
+        assert_eq!(sender.max_adv_retries, 1);
+
+        // Second timeout: re-advertise again.
+        assert_eq!(
+            sender.check_timeout().expect("check"),
+            ResourceTimeoutAction::RetryAdvertisement
+        );
+        assert_eq!(sender.max_adv_retries, 0);
+
+        // Budget exhausted: the transfer fails.
+        assert_eq!(
+            sender.check_timeout().expect("check"),
+            ResourceTimeoutAction::Failed
+        );
+        assert_eq!(sender.status(), ResourceStatus::Failed);
+    }
+
+    #[test]
+    fn sender_re_queries_proof_then_fails_without_proof() {
+        let data = b"All sent, where is my proof?";
+        let link_mdu = 400;
+        let mut sender =
+            Resource::new(data, link_mdu, dummy_encrypt, None, false).expect("sender");
+
+        // Force the sender into the awaiting-proof state, as if all parts
+        // were sent and the proof never arrived.
+        sender.status = ResourceStatus::AwaitingProof;
+        sender.last_part_sent = Some(std::time::Instant::now() - Duration::from_secs(3600));
+        sender.retries_left = 2;
+
+        // First timeout: re-query the proof.
+        assert_eq!(
+            sender.check_timeout().expect("check"),
+            ResourceTimeoutAction::RetryProof
+        );
+        assert_eq!(sender.retries_left, 1);
+
+        // Second timeout: re-query again.
+        assert_eq!(
+            sender.check_timeout().expect("check"),
+            ResourceTimeoutAction::RetryProof
+        );
+        assert_eq!(sender.retries_left, 0);
+
+        // Budget exhausted: the transfer fails instead of hanging forever.
+        assert_eq!(
+            sender.check_timeout().expect("check"),
+            ResourceTimeoutAction::Failed
+        );
+        assert_eq!(sender.status(), ResourceStatus::Failed);
     }
 }
