@@ -99,7 +99,6 @@ const INTERVAL_INPUT_LINK_CLOSE: Duration = Duration::from_secs(5);
 const INTERVAL_OUTPUT_LINK_RESTART: Duration = Duration::from_secs(60);
 const INTERVAL_OUTPUT_LINK_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_OUTPUT_LINK_CLOSE: Duration = Duration::from_secs(5);
-const INTERVAL_OUTPUT_LINK_REPEAT: Duration = Duration::from_secs(6);
 const INTERVAL_OUTPUT_LINK_TRIED: Duration = Duration::from_secs(30);
 const INTERVAL_OUTPUT_LINK_KEEP: Duration = Duration::from_secs(5);
 const INTERVAL_IFACE_CLEANUP: Duration = Duration::from_secs(10);
@@ -4218,7 +4217,12 @@ async fn handle_check_links(
                     continue;
                 }
 
-                if link.elapsed() > INTERVAL_OUTPUT_LINK_REPEAT {
+                // The request is retransmitted on the link's retry cadence
+                // (6s). This is deliberately independent of `request_time`:
+                // retransmitting must not reset the establishment anchor,
+                // or `elapsed()` could never reach the "tried" threshold
+                // below and the path would never be rediscovered.
+                if link.request_retry_due() {
                     log::warn!(
                         "tp({}): repeat link request {}",
                         handler.config.name,
@@ -5243,8 +5247,19 @@ mod tests {
     use super::*;
 
     use crate::destination::{DestinationName, SingleInputDestination, SingleOutputDestination};
+    use crate::iface::Interface;
     use crate::packet::{HeaderType, PACKET_MDU};
     use std::net::TcpListener as StdTcpListener;
+
+    /// Minimal interface used to give the transport an active interface in
+    /// tests that exercise egress paths.
+    struct TestIface;
+
+    impl Interface for TestIface {
+        fn hw_mtu(&self) -> usize {
+            1500
+        }
+    }
 
     fn free_local_ports(count: usize) -> Option<Vec<u16>> {
         let listeners = (0..count)
@@ -6431,6 +6446,87 @@ mod tests {
         // the expired zombie.
         let fresh = transport.link(dest_desc).await;
         assert_ne!(*fresh.lock().await.id(), link_id);
+    }
+
+    #[tokio::test]
+    async fn pending_out_link_tried_branch_marks_path_unresponsive_and_rediscovers() {
+        let mut config = TransportConfig::default();
+        config.set_retransmit(true);
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        // Install a path to a destination that will never answer the link
+        // request, so the pending out-link has a path entry to act on.
+        let remote = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "link.tried"),
+        );
+        let mut announce = remote.announce(&mut rng, None).expect("valid announce");
+        let dest_hash = announce.destination;
+        announce.header.header_type = HeaderType::Type2;
+        announce.header.propagation_type = PropagationType::Transport;
+        announce.header.hops = 1;
+        announce.transport = Some(AddressHash::new_from_slice(b"next-hop"));
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_announce(
+                &announce,
+                &mut *h,
+                &mut pending,
+                AddressHash::new_from_slice(b"iface"),
+                None,
+                None,
+            )
+            .await;
+        }
+
+        // Create a pending out-link that will never be proven.
+        let link = transport.link(remote.desc).await;
+
+        // Give it a long establishment budget, then age it past the
+        // "tried" interval so the rediscovery branch fires while the link
+        // is still within its establishment deadline. (This would be dead
+        // code if retransmissions reset the establishment anchor.)
+        link.lock()
+            .await
+            .set_establishment_deadline(Duration::from_secs(60));
+        link.lock()
+            .await
+            .set_establishment_elapsed_for_test(Duration::from_secs(31));
+
+        // An active interface, so the rediscovery path request is actually
+        // issued for the marked-unresponsive destination.
+        {
+            let handler_guard = handler.lock().await;
+            let mut mgr = handler_guard.send_ctx.iface_manager.lock().await;
+            mgr.new_context(TestIface);
+        }
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_check_links(&mut *h, &mut pending).await;
+        }
+
+        // The link is still pending (inside its establishment budget) and
+        // the path has been marked unresponsive, with a path request
+        // issued to rediscover it.
+        let h = handler.lock().await;
+        assert_eq!(link.lock().await.status(), LinkStatus::Pending);
+        assert!(
+            h.send_ctx
+                .path_table
+                .read()
+                .unwrap()
+                .is_unresponsive(&dest_hash),
+            "pending link past the tried interval must mark its path unresponsive"
+        );
+        assert!(
+            h.last_path_requests.contains_key(&dest_hash),
+            "pending link past the tried interval must issue a path request"
+        );
     }
 
     #[tokio::test]

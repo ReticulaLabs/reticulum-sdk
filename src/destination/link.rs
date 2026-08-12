@@ -37,6 +37,13 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(360);
 /// (matching Python's `Link.establishment_timeout`).
 const DEFAULT_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often a pending out-link request is retransmitted while waiting
+/// for its proof. This is a *cadence* timer: it is independent of the
+/// establishment anchor (`request_time`), so repeated retransmissions do
+/// not push the pending-link rediscovery logic (`INTERVAL_OUTPUT_LINK_TRIED`)
+/// forever into the future.
+const LINK_REQUEST_RETRY_INTERVAL: Duration = Duration::from_secs(6);
+
 pub(crate) fn link_signalling_bytes(mtu: usize) -> [u8; LINK_MTU_SIZE] {
     let mode_bits = ((LINK_MODE_AES256_CBC << 5) & 0xE0) as u32;
     let signalling_value = (mtu as u32 & 0x1F_FFFF) + (mode_bits << 16);
@@ -284,6 +291,12 @@ pub struct Link {
     /// Pending past this point it is failed and removed. Matches Python's
     /// `Link.establishment_timeout`.
     establishment_deadline: Instant,
+    /// When the next link-request retransmission may be sent. Advanced
+    /// by `request()` on each retransmission; deliberately *not* tied to
+    /// `request_time`, so a pending link still trips the rediscovery
+    /// logic once its establishment anchor has aged past
+    /// `INTERVAL_OUTPUT_LINK_TRIED` instead of retransmitting forever.
+    next_retry_time: Instant,
     rtt: Duration,
     /// Last time a keepalive request was sent on this link. Used to gate
     /// keepalive cadence (matches Python's `Link.last_keepalive`).
@@ -314,6 +327,7 @@ impl Link {
             mtu: RETICULUM_MTU,
             request_time: Instant::now(),
             establishment_deadline: Instant::now() + DEFAULT_ESTABLISHMENT_TIMEOUT,
+            next_retry_time: Instant::now(),
             rtt: Duration::from_secs(0),
             last_keepalive: Instant::now(),
             keepalive: KEEPALIVE_INTERVAL,
@@ -373,6 +387,7 @@ impl Link {
             mtu,
             request_time: Instant::now(),
             establishment_deadline: Instant::now() + DEFAULT_ESTABLISHMENT_TIMEOUT,
+            next_retry_time: Instant::now(),
             rtt: Duration::from_secs(0),
             last_keepalive: Instant::now(),
             keepalive: KEEPALIVE_INTERVAL,
@@ -413,7 +428,13 @@ impl Link {
         self.status = LinkStatus::Pending;
         self.id = LinkId::from(&packet);
         self.mtu = mtu;
-        self.request_time = Instant::now();
+        // Only the *retry cadence* advances on a (re)transmission. The
+        // establishment anchor `request_time` is set once at creation and
+        // deliberately left untouched here: resetting it on every
+        // retransmission would keep `elapsed()` below
+        // `INTERVAL_OUTPUT_LINK_TRIED` forever and make the pending-link
+        // rediscovery branch dead code (finding 1.1).
+        self.next_retry_time = Instant::now() + LINK_REQUEST_RETRY_INTERVAL;
 
         log::debug!(
             "link({}): link request created dst={} mtu={}",
@@ -1198,10 +1219,26 @@ impl Link {
         );
 
         self.status = LinkStatus::Pending;
+
+        // A restart begins a fresh establishment attempt: re-anchor the
+        // establishment timers so the pending-link watchdog and
+        // rediscovery logic apply to this new attempt instead of failing
+        // the link immediately on the budget from the previous one.
+        self.request_time = Instant::now();
+        self.next_retry_time = Instant::now();
+        self.establishment_deadline = Instant::now() + DEFAULT_ESTABLISHMENT_TIMEOUT;
     }
 
     pub fn elapsed(&self) -> Duration {
         self.request_time.elapsed()
+    }
+
+    /// Whether the pending out-link request should be retransmitted. The
+    /// cadence is tracked independently of the establishment anchor
+    /// (`request_time`), so retransmissions cannot keep pushing the
+    /// `INTERVAL_OUTPUT_LINK_TRIED` rediscovery logic into the future.
+    pub(crate) fn request_retry_due(&self) -> bool {
+        Instant::now() >= self.next_retry_time
     }
 
     /// Set the establishment deadline for this out-link. Called once when
@@ -1215,6 +1252,13 @@ impl Link {
     /// deadline and should be failed and removed.
     pub fn establishment_expired(&self) -> bool {
         self.status == LinkStatus::Pending && Instant::now() >= self.establishment_deadline
+    }
+
+    /// Test-only: age the establishment anchor so the pending-link
+    /// rediscovery logic can be exercised without sleeping.
+    #[cfg(test)]
+    pub(crate) fn set_establishment_elapsed_for_test(&mut self, elapsed: Duration) {
+        self.request_time = Instant::now() - elapsed;
     }
 
     pub fn status(&self) -> LinkStatus {
@@ -1860,5 +1904,96 @@ mod tests {
         // even if the deadline has long since passed.
         link.status = LinkStatus::Active;
         assert!(!link.establishment_expired());
+    }
+
+    #[test]
+    fn request_retransmission_does_not_reset_establishment_anchor() {
+        let mut link = keepalive_test_link();
+        link.status = LinkStatus::Pending;
+        let anchor = link.request_time;
+
+        // A (re)transmission must advance the retry cadence but leave the
+        // establishment anchor untouched, otherwise `elapsed()` could
+        // never reach the "tried" threshold and the pending-link
+        // rediscovery logic would be dead code.
+        link.request(None);
+        assert_eq!(
+            link.request_time, anchor,
+            "retransmitting a link request must not reset request_time"
+        );
+        assert!(
+            link.request_time.elapsed() < Duration::from_secs(1),
+            "the establishment anchor must stay fresh after creation"
+        );
+    }
+
+    #[test]
+    fn request_retry_is_not_due_until_interval_elapses() {
+        let mut link = keepalive_test_link();
+        link.status = LinkStatus::Pending;
+
+        // Right after a request is sent the retry is not yet due...
+        link.request(None);
+        assert!(
+            !link.request_retry_due(),
+            "a freshly sent request must not be immediately due for retransmission"
+        );
+
+        // ...but once the cadence interval has elapsed it is.
+        link.next_retry_time = Instant::now() - Duration::from_millis(1);
+        assert!(link.request_retry_due());
+    }
+
+    #[test]
+    fn pending_elapsed_keeps_aging_across_retransmissions() {
+        let mut link = keepalive_test_link();
+        link.status = LinkStatus::Pending;
+
+        // Age the link past the "tried" threshold, then retransmit several
+        // times: each retransmission must not reset the establishment
+        // anchor, so the link stays past the threshold where the
+        // rediscovery logic fires.
+        link.request_time = Instant::now() - Duration::from_secs(31);
+        for _ in 0..10 {
+            link.next_retry_time = Instant::now() - Duration::from_millis(1);
+            link.request(None);
+        }
+
+        assert!(
+            link.elapsed() > Duration::from_secs(30),
+            "retransmissions must not reset the establishment anchor"
+        );
+    }
+
+    #[test]
+    fn restart_reanchors_establishment_timers() {
+        let mut link = keepalive_test_link();
+        link.status = LinkStatus::Active;
+
+        // Age the link far past both the tried threshold and the
+        // establishment deadline from its original attempt.
+        let past = Instant::now() - Duration::from_secs(3600);
+        link.request_time = past;
+        link.next_retry_time = past;
+        link.set_establishment_deadline(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(5));
+
+        // A restart begins a fresh establishment attempt, so every
+        // establishment timer must be re-anchored.
+        link.restart();
+
+        assert_eq!(link.status, LinkStatus::Pending);
+        assert!(
+            link.request_time.elapsed() < Duration::from_secs(1),
+            "restart must reset the establishment anchor"
+        );
+        assert!(
+            !link.establishment_expired(),
+            "restart must re-arm the establishment deadline"
+        );
+        assert!(
+            link.request_retry_due(),
+            "a restarted link should send a fresh request promptly"
+        );
     }
 }
