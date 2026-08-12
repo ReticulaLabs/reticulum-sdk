@@ -6,6 +6,7 @@ use discovery::RegisteredDiscoveryInterface;
 use discovery::create_discovery_destination;
 use discovery::is_discovery_destination;
 use hmac::{Hmac, Mac};
+use link_table::AddLinkRequest;
 use link_table::LinkTable;
 use packet_cache::PacketCache;
 use path_requests::PathRequests;
@@ -3887,13 +3888,50 @@ async fn handle_link_request_as_intermediate(
         remaining_hops,
     );
 
-    handler.link_table.add(
+    // A link request that has already traversed the maximum allowed hop
+    // count is either malformed or caught in a routing loop. Never
+    // forward it further.
+    if packet.header.hops > PATHFINDER_M as u8 {
+        log::warn!(
+            "tp({}): dropping link request {} for {} exceeding max hops ({})",
+            handler.config.name,
+            LinkId::from(packet),
+            packet.destination,
+            PATHFINDER_M,
+        );
+        return;
+    }
+
+    match handler.link_table.add(
         packet,
         packet.destination,
         received_from,
         next_hop_iface,
         remaining_hops,
-    );
+    ) {
+        AddLinkRequest::New => {}
+        AddLinkRequest::Retransmission => {
+            log::trace!(
+                "tp({}): re-forwarding retransmitted link request {} for {}",
+                handler.config.name,
+                LinkId::from(packet),
+                packet.destination,
+            );
+        }
+        AddLinkRequest::Loop => {
+            // The link request looped back to us with a higher hop count
+            // than when we first forwarded it: two (or more) transport
+            // nodes hold stale paths pointing at each other. Dropping here
+            // breaks the packet loop that would otherwise ping-pong forever.
+            log::warn!(
+                "tp({}): dropping looped link request {} for {}",
+                handler.config.name,
+                LinkId::from(packet),
+                packet.destination,
+            );
+            return;
+        }
+    }
 
     let forwarded = if handler.config.link_mtu_discovery {
         clamp_link_request_mtu(packet, handler, Some(received_from), Some(next_hop_iface)).await
@@ -6393,5 +6431,127 @@ mod tests {
         // the expired zombie.
         let fresh = transport.link(dest_desc).await;
         assert_ne!(*fresh.lock().await.id(), link_id);
+    }
+
+    #[tokio::test]
+    async fn link_request_looped_at_intermediate_is_not_forwarded() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        // A remote destination reachable through a 2-hop path via a next-hop
+        // transport, so link requests to it are forwarded as an intermediate.
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "link.loop"),
+        );
+        let mut announce = remote_destination
+            .announce(&mut rng, None)
+            .expect("valid announce");
+        let destination = announce.destination;
+        let next_hop = AddressHash::new_from_slice(b"next-hop-transport");
+        let ingress_iface = AddressHash::new_from_slice(b"ingress-iface");
+        let egress_iface = AddressHash::new_from_slice(b"egress-iface");
+
+        announce.header.header_type = HeaderType::Type2;
+        announce.header.propagation_type = PropagationType::Transport;
+        announce.header.hops = 2;
+        announce.transport = Some(next_hop);
+
+        // The announce for the remote destination is heard via the next-hop
+        // transport on the egress interface, so the path to the destination
+        // points out the egress interface.
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_announce(&announce, &mut *h, &mut pending, egress_iface, None, None).await;
+        }
+
+        // Build the link request as the initiator would.
+        let event_tx = handler.lock().await.link_in_event_tx.clone();
+        let mut initiator = Link::new(remote_destination.desc, event_tx);
+        let mut request_packet = initiator.request(None);
+
+        // The link request reaches this intermediate node with 1 hop taken.
+        request_packet.header.hops = 1;
+
+        // First arrival on the ingress interface: forwarded toward the
+        // next hop on the egress interface.
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_link_request(&request_packet, ingress_iface, &mut *h, &mut pending).await;
+        }
+        assert_eq!(
+            pending.messages.len(),
+            1,
+            "first link request must be forwarded"
+        );
+        assert_eq!(pending.messages[0].tx_type, TxMessageType::Direct(egress_iface));
+        assert_eq!(pending.messages[0].packet.transport, Some(next_hop));
+
+        // The same link request arrives again, looped back through a stale
+        // path with one additional hop taken. It must be dropped, not
+        // re-forwarded.
+        request_packet.header.hops = 2;
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_link_request(&request_packet, egress_iface, &mut *h, &mut pending).await;
+        }
+        assert_eq!(
+            pending.messages.len(),
+            0,
+            "looped link request must not be re-forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_request_over_hop_limit_is_not_forwarded() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "link.hoplimit"),
+        );
+        let mut announce = remote_destination
+            .announce(&mut rng, None)
+            .expect("valid announce");
+        let destination = announce.destination;
+        let next_hop = AddressHash::new_from_slice(b"next-hop-transport");
+        let ingress_iface = AddressHash::new_from_slice(b"ingress-iface");
+        let egress_iface = AddressHash::new_from_slice(b"egress-iface");
+
+        announce.header.header_type = HeaderType::Type2;
+        announce.header.propagation_type = PropagationType::Transport;
+        announce.header.hops = 2;
+        announce.transport = Some(next_hop);
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_announce(&announce, &mut *h, &mut pending, egress_iface, None, None).await;
+        }
+
+        let event_tx = handler.lock().await.link_in_event_tx.clone();
+        let mut initiator = Link::new(remote_destination.desc, event_tx);
+        let mut request_packet = initiator.request(None);
+
+        // A link request that has already traversed more than PATHFINDER_M
+        // hops is caught in a loop and must be dropped before forwarding.
+        request_packet.header.hops = PATHFINDER_M as u8 + 1;
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_link_request(&request_packet, ingress_iface, &mut *h, &mut pending).await;
+        }
+        assert_eq!(
+            pending.messages.len(),
+            0,
+            "link request over the hop limit must be dropped"
+        );
     }
 }

@@ -62,6 +62,20 @@ fn propagate(packet: &Packet, iface: AddressHash) -> (Packet, AddressHash) {
 
 pub struct LinkTable(HashMap<LinkId, LinkEntry>);
 
+/// Outcome of adding a link request to the link table.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddLinkRequest {
+    /// A new entry was created; forward the request.
+    New,
+    /// The link is already known and the request arrived from the original
+    /// ingress direction (a legitimate initiator retransmission); forward it.
+    Retransmission,
+    /// The link is already known and the request arrived on the interface
+    /// it was previously forwarded out of — i.e. it has looped back through
+    /// a stale path. Drop it to break the loop.
+    Loop,
+}
+
 impl LinkTable {
     pub fn new() -> Self {
         Self(HashMap::new())
@@ -78,11 +92,31 @@ impl LinkTable {
         received_from: AddressHash,
         iface: AddressHash,
         remaining_hops: u8,
-    ) {
+    ) -> AddLinkRequest {
         let link_id = LinkId::from(link_request);
 
-        if self.0.contains_key(&link_id) {
-            return;
+        if let Some(existing) = self.0.get(&link_id) {
+            // The link is already known from a previous forward of this
+            // request. If it now arrives with a strictly higher hop count
+            // than when we first forwarded it, it has looped back through
+            // a stale path and must be dropped. If it arrives with the
+            // same hop count, it is a legitimate initiator retransmission
+            // and should be forwarded again.
+            if link_request.header.hops > existing.taken_hops {
+                log::trace!(
+                    "link_table: link request {} looped back at {} hops (first seen at {}), dropping",
+                    link_id,
+                    link_request.header.hops,
+                    existing.taken_hops,
+                );
+                return AddLinkRequest::Loop;
+            }
+            log::trace!(
+                "link_table: link request {} retransmitted at {} hops, forwarding",
+                link_id,
+                link_request.header.hops,
+            );
+            return AddLinkRequest::Retransmission;
         }
 
         let now = Instant::now();
@@ -102,6 +136,7 @@ impl LinkTable {
         };
 
         self.0.insert(link_id, entry);
+        AddLinkRequest::New
     }
 
     pub fn original_destination(&self, link_id: &LinkId) -> Option<AddressHash> {
@@ -308,7 +343,7 @@ impl LinkTable {
 
 #[cfg(test)]
 mod tests {
-    use super::LinkTable;
+    use super::{AddLinkRequest, LinkTable};
     use crate::{
         destination::link::LinkId,
         hash::AddressHash,
@@ -554,6 +589,86 @@ mod tests {
         assert!(
             outcome.rebalance.is_none(),
             "non-LRPROOF context must never signal a rebalance"
+        );
+    }
+
+    #[test]
+    fn first_link_request_is_new_and_subsequent_ingress_repeat_is_retransmission() {
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let ingress_iface = AddressHash::new_from_slice(b"ingress-iface");
+        let egress_iface = AddressHash::new_from_slice(b"egress-iface");
+        let request = link_request(destination);
+        let mut table = LinkTable::new();
+
+        // First arrival: a new entry is created and the request forwarded.
+        assert_eq!(
+            table.add(&request, destination, ingress_iface, egress_iface, 0),
+            AddLinkRequest::New
+        );
+
+        // A retransmission arriving again from the same ingress direction
+        // at the same hop count is a legitimate initiator retry and must
+        // still be forwarded.
+        assert_eq!(
+            table.add(&request, destination, ingress_iface, egress_iface, 0),
+            AddLinkRequest::Retransmission
+        );
+    }
+
+    #[test]
+    fn link_request_looped_back_with_higher_hops_is_dropped() {
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let ingress_iface = AddressHash::new_from_slice(b"ingress-iface");
+        let egress_iface = AddressHash::new_from_slice(b"egress-iface");
+        let mut request = link_request(destination);
+        let mut table = LinkTable::new();
+
+        // First forward: request arrives with 1 hop, forwarded out the
+        // egress interface.
+        request.header.hops = 1;
+        assert_eq!(
+            table.add(&request, destination, ingress_iface, egress_iface, 0),
+            AddLinkRequest::New
+        );
+
+        // The same request comes back after having been forwarded once more
+        // (now 2 hops): it looped through a stale path. It must be dropped,
+        // not re-forwarded.
+        request.header.hops = 2;
+        assert_eq!(
+            table.add(&request, destination, egress_iface, ingress_iface, 0),
+            AddLinkRequest::Loop
+        );
+    }
+
+    #[test]
+    fn same_hop_retransmission_on_single_interface_is_not_dropped() {
+        // A node with a single shared-medium interface (e.g. LoRa) sees the
+        // initiator's retransmission on the same interface it forwards out
+        // of. The retransmission must not be misclassified as a loop: only a
+        // strictly higher hop count marks a loop.
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let single_iface = AddressHash::new_from_slice(b"only-iface");
+        let mut request = link_request(destination);
+        let mut table = LinkTable::new();
+
+        request.header.hops = 1;
+        assert_eq!(
+            table.add(&request, destination, single_iface, single_iface, 0),
+            AddLinkRequest::New
+        );
+
+        // Retransmission at the same hop count: forward it.
+        assert_eq!(
+            table.add(&request, destination, single_iface, single_iface, 0),
+            AddLinkRequest::Retransmission
+        );
+
+        // A looped copy at a higher hop count: drop it.
+        request.header.hops = 3;
+        assert_eq!(
+            table.add(&request, destination, single_iface, single_iface, 0),
+            AddLinkRequest::Loop
         );
     }
 }
