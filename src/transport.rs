@@ -3546,7 +3546,14 @@ is_path_response={}",
         // table and we've previously retransmitted it, a peer is relaying
         // our announce back to us.  Count the echo and stop retransmitting
         // once LOCAL_REBROADCASTS_MAX is reached (matches Python behaviour).
+        //
+        // Only *forwarded* announces (transport != None) can be echoes: a
+        // direct announce straight from the destination is a fresh emission
+        // that must refresh the announce table entry for propagation, never
+        // count as an echo of our own retransmission (Python Transport.py
+        // only enters echo handling when `packet.transport_id != None`).
         let is_echo = handler.config.retransmit
+            && packet.transport.is_some()
             && handler.announce_table.contains_key(&packet.destination);
 
         if is_echo {
@@ -6648,6 +6655,80 @@ mod tests {
             pending.messages.len(),
             0,
             "link request over the hop limit must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_reannounce_refreshes_announce_table_entry() {
+        // A destination that re-announces directly (transport=None) while
+        // an earlier emission for it is still pending retransmission must
+        // refresh the announce table entry with the new emission, so the
+        // fresh announce is propagated. Python only treats *forwarded*
+        // announces (transport_id != None) as echoes of our own
+        // retransmission (Transport.py:1779); a direct announce is always
+        // re-inserted (Transport.py:1957).
+        let mut config = TransportConfig::default();
+        config.set_retransmit(true);
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        let remote = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "announce.refresh"),
+        );
+        let dest_hash = {
+            let announce = remote.announce(&mut rng, None).expect("valid announce");
+            announce.destination
+        };
+        let _ = dest_hash;
+
+        let next_hop = AddressHash::new_from_slice(b"relay-transport");
+        let relay_iface = AddressHash::new_from_slice(b"relay-iface");
+        let direct_iface = AddressHash::new_from_slice(b"direct-iface");
+
+        // First emission, heard via a relay (a forwarded announce).
+        let e1 = {
+            let mut announce = remote.announce(&mut rng, None).expect("valid announce");
+            announce.header.header_type = HeaderType::Type2;
+            announce.header.propagation_type = PropagationType::Transport;
+            announce.header.hops = 2;
+            announce.transport = Some(next_hop);
+            announce
+        };
+
+        // A fresh direct emission from the destination itself (transport=None).
+        let e2 = remote.announce(&mut rng, None).expect("valid announce");
+        assert_ne!(
+            e1.data.as_slice(),
+            e2.data.as_slice(),
+            "test requires two distinct announce emissions"
+        );
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_announce(&e1, &mut *h, &mut pending, relay_iface, None, None).await;
+        }
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_announce(&e2, &mut *h, &mut pending, direct_iface, None, None).await;
+        }
+
+        // The announce table entry must now carry the new emission (e2),
+        // which is what will be retransmitted to the rest of the mesh.
+        let msgs = {
+            let mut h = handler.lock().await;
+            h.announce_table.reset_retransmit_timers();
+            let transport_id = *h.config.identity.address_hash();
+            h.announce_table.to_retransmit(&transport_id)
+        };
+
+        assert!(
+            msgs.iter()
+                .any(|m| m.packet.data.as_slice() == e2.data.as_slice()),
+            "a direct re-announce must refresh the announce table entry so the new emission is propagated"
         );
     }
 }
