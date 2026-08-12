@@ -4350,7 +4350,7 @@ async fn manage_transport(
                     }
 
                     if !handler.filter_duplicate_packets(&packet).await {
-                        log::debug!(
+                        log::trace!(
                             "tp({}): dropping duplicate packet: dst={}, ctx={:?}, type={:?}",
                             tp_name,
                             packet.destination,
