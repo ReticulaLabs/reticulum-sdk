@@ -15,9 +15,9 @@ use tokio::net::{
 use tokio_util::sync::CancellationToken;
 
 use crate::iface::{
-    decode_rx, encode_tx, IfacConfig, DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF, Interface,
-    InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage,
-    configured_bitrate,
+    decode_rx, encode_tx, CONNECT_TIMEOUT, IfacConfig, DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF,
+    Interface, InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF,
+    RxMessage, configured_bitrate,
 };
 
 const FEND: u8 = 0xc0;
@@ -172,7 +172,16 @@ impl Modem73Interface {
             let stream = tokio::select! {
                 biased;
                 _ = context.cancel.cancelled() => break,
-                result = TcpStream::connect(config.kiss_addr.clone()) => result,
+                result = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(config.kiss_addr.clone())) => {
+                    match result {
+                        Ok(Ok(stream)) => Ok(stream),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "connect timed out",
+                        )),
+                    }
+                }
             };
 
             let stream = match stream {

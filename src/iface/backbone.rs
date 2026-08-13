@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::OutputBuffer;
 use crate::error::RnsError;
 use crate::iface::{
-    decode_rx, encode_tx, IfacConfig, Interface, InterfaceContext, InterfaceMode,
+    decode_rx, encode_tx, CONNECT_TIMEOUT, IfacConfig, Interface, InterfaceContext, InterfaceMode,
     INITIAL_RECONNECT_BACKOFF, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage,
     configured_bitrate,
 };
@@ -445,8 +445,11 @@ impl BackboneClient {
                         _ = context.cancel.cancelled() => {
                             break;
                         }
-                        result = TcpStream::connect(addr.clone()) => {
-                            result.map_err(|_| RnsError::ConnectionError)
+                        result = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr.clone())) => {
+                            match result {
+                                Ok(Ok(stream)) => Ok(stream),
+                                Ok(Err(_)) | Err(_) => Err(RnsError::ConnectionError),
+                            }
                         }
                     }
                 }
@@ -654,8 +657,8 @@ impl BackboneClient {
                 })
             };
 
-            tx_task.await.unwrap();
-            rx_task.await.unwrap();
+            let _ = tx_task.await;
+            let _ = rx_task.await;
 
             log::info!("backbone_client: disconnected from <{}>", addr);
 

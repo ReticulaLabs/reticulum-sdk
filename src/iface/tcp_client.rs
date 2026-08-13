@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::OutputBuffer;
 use crate::error::RnsError;
 use crate::iface::{
-    decode_rx, encode_tx, DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF, Interface, InterfaceContext,
-    InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage, configured_bitrate,
+    decode_rx, encode_tx, CONNECT_TIMEOUT, DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF, Interface,
+    InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage,
+    configured_bitrate,
 };
 use crate::packet::{Header, HeaderType, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE};
 
@@ -155,8 +156,11 @@ impl TcpClient {
                         _ = context.cancel.cancelled() => {
                             break;
                         }
-                        result = TcpStream::connect(addr.clone()) => {
-                            result.map_err(|_| RnsError::ConnectionError)
+                        result = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr.clone())) => {
+                            match result {
+                                Ok(Ok(stream)) => Ok(stream),
+                                Ok(Err(_)) | Err(_) => Err(RnsError::ConnectionError),
+                            }
                         }
                     }
                 }
@@ -352,8 +356,14 @@ impl TcpClient {
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
 
                                     if let Ok(_) = Hdlc::encode(&tx_buffer[..len], &mut hdlc_output) {
-                                        let _ = stream.write_all(hdlc_output.as_slice()).await;
-                                        let _ = stream.flush().await;
+                                        if let Err(_) = stream.write_all(hdlc_output.as_slice()).await {
+                                            stop.cancel();
+                                            break;
+                                        }
+                                        if let Err(_) = stream.flush().await {
+                                            stop.cancel();
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -362,8 +372,8 @@ impl TcpClient {
                 })
             };
 
-            tx_task.await.unwrap();
-            rx_task.await.unwrap();
+            let _ = tx_task.await;
+            let _ = rx_task.await;
 
             log::info!("tcp_client: disconnected from <{}>", addr);
 

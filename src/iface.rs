@@ -95,6 +95,11 @@ const SATURATED_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum reconnect backoff for client-style interfaces.
 pub(crate) const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// Maximum time a single client-side connect attempt may take before it is
+/// abandoned and the reconnect backoff path is engaged.  Prevents a silent
+/// (SYN-dropping or firewalled) remote from pinning the interface in a
+/// long-lived connect that stalls reconnect pacing and fills the tx queue.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wait until `retry_at` before the next client-side reconnect attempt,
 /// waking early on outbound traffic so the transmit channel keeps draining
