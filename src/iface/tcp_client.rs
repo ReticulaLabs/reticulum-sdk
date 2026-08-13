@@ -1,8 +1,6 @@
 use std::cmp;
 use std::fmt::Write as _;
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -13,64 +11,13 @@ use crate::error::RnsError;
 use crate::iface::{
     decode_rx, encode_tx, CONNECT_TIMEOUT, DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF, Interface,
     InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage,
-    configured_bitrate,
+    configured_bitrate, set_tcp_sockopts,
 };
 use crate::packet::{Header, HeaderType, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE};
 
 use tokio::io::AsyncReadExt;
 
 use alloc::string::String;
-
-fn set_tcp_sockopts(stream: &TcpStream) {
-    let _ = stream.set_nodelay(true);
-
-    #[cfg(target_os = "linux")]
-    {
-        let fd = stream.as_raw_fd();
-        let on: libc::c_int = 1;
-        let idle: libc::c_int = 5;
-        let intvl: libc::c_int = 2;
-        let cnt: libc::c_int = 12;
-        let uto: libc::c_int = 24_000;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_KEEPALIVE,
-                &on as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPIDLE,
-                &idle as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPINTVL,
-                &intvl as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPCNT,
-                &cnt as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_USER_TIMEOUT,
-                &uto as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-}
 
 use super::hdlc::Hdlc;
 
@@ -172,12 +119,11 @@ impl TcpClient {
                     addr,
                     reconnect_backoff.as_secs()
                 );
-                let retry_at =
-                    tokio::time::Instant::now() + super::jitter_reconnect_delay(reconnect_backoff);
+                let delay = reconnect_backoff;
                 reconnect_backoff =
                     cmp::min(reconnect_backoff.saturating_mul(2), MAX_RECONNECT_BACKOFF);
 
-                if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {
+                if super::wait_to_reconnect(&context.cancel, &tx_channel, delay).await {
                     break 'outer;
                 }
                 continue;
@@ -377,20 +323,26 @@ impl TcpClient {
 
             log::info!("tcp_client: disconnected from <{}>", addr);
 
+            // A connection provided by a parent (e.g. an accepted
+            // TcpServer client) is one-shot: tear down instead of
+            // reconnecting.
+            if !running {
+                break 'outer;
+            }
+
             // Reconnecting immediately after a dropped connection can turn
             // accept-then-drop peers into a reconnect storm.  Apply the
             // same 1s→30s exponential backoff used for failed connections,
             // resetting it after a connection that stayed up long enough to
             // be considered stable.
-            let delay = super::jitter_reconnect_delay(super::reconnect_backoff_after_drop(
+            let delay = super::reconnect_backoff_after_drop(
                 connected_at,
                 &mut reconnect_backoff,
                 INITIAL_RECONNECT_BACKOFF,
                 MAX_RECONNECT_BACKOFF,
-            ));
-            let retry_at = tokio::time::Instant::now() + delay;
+            );
 
-            if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {
+            if super::wait_to_reconnect(&context.cancel, &tx_channel, delay).await {
                 break 'outer;
             }
         }

@@ -1,6 +1,5 @@
 use std::cmp;
 use std::fmt::Write as _;
-use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::OutputBuffer;
 use crate::error::RnsError;
 use crate::iface::{
-    decode_rx, encode_tx, CONNECT_TIMEOUT, IfacConfig, Interface, InterfaceContext, InterfaceMode,
-    INITIAL_RECONNECT_BACKOFF, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage,
-    configured_bitrate,
+    decode_rx, encode_tx, set_tcp_sockopts, CONNECT_TIMEOUT, IfacConfig, Interface,
+    InterfaceContext, InterfaceMode, INITIAL_RECONNECT_BACKOFF, MAX_AUTOCONFIGURED_HW_MTU,
+    MAX_RECONNECT_BACKOFF, RxMessage, configured_bitrate,
 };
 use crate::iface::reconnect_pacer::{ReconnectPacer, ReconnectPacerMetrics};
 use crate::packet::{Header, HeaderType, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE};
@@ -34,57 +33,6 @@ pub const BACKBONE_DEFAULT_BITRATE: f64 = 1_000_000_000.0;
 /// Default Interface Access Code size for backbone interfaces, matching
 /// the Python reference `BackboneInterface.DEFAULT_IFAC_SIZE = 16`.
 pub const DEFAULT_IFAC_SIZE: usize = 16;
-
-fn set_tcp_sockopts(stream: &TcpStream) {
-    let _ = stream.set_nodelay(true);
-
-    #[cfg(target_os = "linux")]
-    {
-        let fd = stream.as_raw_fd();
-        let on: libc::c_int = 1;
-        let idle: libc::c_int = 5;
-        let intvl: libc::c_int = 2;
-        let cnt: libc::c_int = 12;
-        let uto: libc::c_int = 24_000;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_KEEPALIVE,
-                &on as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPIDLE,
-                &idle as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPINTVL,
-                &intvl as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPCNT,
-                &cnt as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_USER_TIMEOUT,
-                &uto as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-}
 
 /// Server-side listening interface modeled after Python's `BackboneInterface`.
 /// Accepts incoming TCP connections and spawns `BackboneClient` handlers.
@@ -461,12 +409,11 @@ impl BackboneClient {
                     addr,
                     reconnect_backoff.as_secs(),
                 );
-                let retry_at =
-                    tokio::time::Instant::now() + super::jitter_reconnect_delay(reconnect_backoff);
+                let delay = reconnect_backoff;
                 reconnect_backoff =
                     cmp::min(reconnect_backoff.saturating_mul(2), MAX_RECONNECT_BACKOFF);
 
-                if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {
+                if super::wait_to_reconnect(&context.cancel, &tx_channel, delay).await {
                     break 'outer;
                 }
                 continue;
@@ -662,20 +609,26 @@ impl BackboneClient {
 
             log::info!("backbone_client: disconnected from <{}>", addr);
 
+            // A connection provided by a parent (e.g. an accepted
+            // BackboneServer client) is one-shot: tear down instead of
+            // reconnecting.
+            if !running {
+                break 'outer;
+            }
+
             // Reconnecting immediately after a dropped connection can turn
             // accept-then-drop peers into a reconnect storm.  Apply the
             // same 1s→30s exponential backoff used for failed connections,
             // resetting it after a connection that stayed up long enough to
             // be considered stable.
-            let delay = super::jitter_reconnect_delay(super::reconnect_backoff_after_drop(
+            let delay = super::reconnect_backoff_after_drop(
                 connected_at,
                 &mut reconnect_backoff,
                 INITIAL_RECONNECT_BACKOFF,
                 MAX_RECONNECT_BACKOFF,
-            ));
-            let retry_at = tokio::time::Instant::now() + delay;
+            );
 
-            if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {
+            if super::wait_to_reconnect(&context.cancel, &tx_channel, delay).await {
                 break 'outer;
             }
         }

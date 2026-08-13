@@ -193,13 +193,11 @@ impl Modem73Interface {
                         error,
                         reconnect_backoff.as_secs()
                     );
-                    let retry_at =
-                        tokio::time::Instant::now() + super::jitter_reconnect_delay(reconnect_backoff);
+                    let delay = reconnect_backoff;
                     reconnect_backoff =
                         cmp::min(reconnect_backoff.saturating_mul(2), MAX_RECONNECT_BACKOFF);
 
-                    if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await
-                    {
+                    if super::wait_to_reconnect(&context.cancel, &tx_channel, delay).await {
                         break 'outer;
                     }
                     continue;
@@ -263,15 +261,14 @@ impl Modem73Interface {
             // same 1s→30s exponential backoff used for failed connections,
             // resetting it after a connection that stayed up long enough to
             // be considered stable.
-            let delay = super::jitter_reconnect_delay(super::reconnect_backoff_after_drop(
+            let delay = super::reconnect_backoff_after_drop(
                 connected_at,
                 &mut reconnect_backoff,
                 INITIAL_RECONNECT_BACKOFF,
                 MAX_RECONNECT_BACKOFF,
-            ));
-            let retry_at = tokio::time::Instant::now() + delay;
+            );
 
-            if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {
+            if super::wait_to_reconnect(&context.cancel, &tx_channel, delay).await {
                 break 'outer;
             }
         }

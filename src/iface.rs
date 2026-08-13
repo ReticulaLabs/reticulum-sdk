@@ -16,11 +16,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task;
 use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 
 use getrandom::SysRng;
 use rand_core::{Rng, UnwrapErr};
@@ -163,6 +167,73 @@ pub(crate) fn jitter_reconnect_delay(delay: Duration) -> Duration {
     let mut rng = UnwrapErr(SysRng);
     let jitter_ms = rng.next_u64() % (base_ms + 1);
     delay + Duration::from_millis(jitter_ms)
+}
+
+/// Wait `delay` (with jitter applied) before the next reconnect attempt,
+/// waking early on outbound traffic so the transmit channel keeps draining
+/// while the interface is down.  Returns `true` if the interface is being
+/// shut down and the reconnect loop should exit.
+pub(crate) async fn wait_to_reconnect(
+    cancel: &CancellationToken,
+    tx_channel: &Arc<tokio::sync::Mutex<InterfaceTxReceiver>>,
+    delay: Duration,
+) -> bool {
+    let retry_at = Instant::now() + jitter_reconnect_delay(delay);
+    await_reconnect_delay(cancel, tx_channel, retry_at).await
+}
+
+/// Apply TCP socket tuning to client connections: disable Nagle and, on
+/// Linux, enable keepalive plus a user-level timeout so dead peers are
+/// detected promptly instead of leaving the interface wedged.
+pub(crate) fn set_tcp_sockopts(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = stream.as_raw_fd();
+        let on: libc::c_int = 1;
+        let idle: libc::c_int = 5;
+        let intvl: libc::c_int = 2;
+        let cnt: libc::c_int = 12;
+        let uto: libc::c_int = 24_000;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                &idle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                &intvl as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
+                &cnt as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                &uto as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
