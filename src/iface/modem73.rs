@@ -162,14 +162,18 @@ impl Modem73Interface {
                 break;
             }
 
-            let mut tx_guard = tx_channel.lock().await;
+            // Connect to completion without draining the transmit channel.
+            // Previously, outbound traffic arriving while the connect was
+            // in flight would fire a `tx_channel.recv()` branch, aborting
+            // the connect and restarting it from scratch (and dropping the
+            // message).  Messages now simply queue in the bounded tx
+            // channel and are drained by the transmit task once the
+            // connection is established.
             let stream = tokio::select! {
                 biased;
                 _ = context.cancel.cancelled() => break,
                 result = TcpStream::connect(config.kiss_addr.clone()) => result,
-                Some(_) = tx_guard.recv() => continue,
             };
-            drop(tx_guard);
 
             let stream = match stream {
                 Ok(stream) => stream,
