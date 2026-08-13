@@ -168,7 +168,8 @@ impl TcpClient {
                     addr,
                     reconnect_backoff.as_secs()
                 );
-                let retry_at = tokio::time::Instant::now() + reconnect_backoff;
+                let retry_at =
+                    tokio::time::Instant::now() + super::jitter_reconnect_delay(reconnect_backoff);
                 reconnect_backoff =
                     cmp::min(reconnect_backoff.saturating_mul(2), MAX_RECONNECT_BACKOFF);
 
@@ -371,12 +372,12 @@ impl TcpClient {
             // same 1s→30s exponential backoff used for failed connections,
             // resetting it after a connection that stayed up long enough to
             // be considered stable.
-            let delay = super::reconnect_backoff_after_drop(
+            let delay = super::jitter_reconnect_delay(super::reconnect_backoff_after_drop(
                 connected_at,
                 &mut reconnect_backoff,
                 INITIAL_RECONNECT_BACKOFF,
                 MAX_RECONNECT_BACKOFF,
-            );
+            ));
             let retry_at = tokio::time::Instant::now() + delay;
 
             if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {

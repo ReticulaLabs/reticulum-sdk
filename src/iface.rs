@@ -22,6 +22,9 @@ use tokio::task;
 use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+use getrandom::SysRng;
+use rand_core::{Rng, UnwrapErr};
+
 use crate::buffer::InputBuffer;
 use crate::error::RnsError;
 use crate::hash::ADDRESS_HASH_SIZE;
@@ -138,6 +141,23 @@ pub(crate) fn reconnect_backoff_after_drop(
         *backoff = max.min(backoff.saturating_mul(2));
     }
     *backoff
+}
+
+/// Add random jitter to a reconnect delay so that many clients on the same
+/// backoff schedule don't synchronize their reconnect attempts into a
+/// thundering herd against a recovering server.  The base delay is never
+/// reduced, preserving the storm-prevention pacing, and up to `base` of
+/// additional delay is added at random (so the wait lands in
+/// `[base, 2*base]`).
+pub(crate) fn jitter_reconnect_delay(delay: Duration) -> Duration {
+    let base_ms = delay.as_millis() as u64;
+    if base_ms == 0 {
+        return delay;
+    }
+
+    let mut rng = UnwrapErr(SysRng);
+    let jitter_ms = rng.next_u64() % (base_ms + 1);
+    delay + Duration::from_millis(jitter_ms)
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -2839,5 +2859,25 @@ mod tests {
         );
         assert_eq!(delay, INITIAL_RECONNECT_BACKOFF);
         assert_eq!(backoff, INITIAL_RECONNECT_BACKOFF);
+    }
+
+    #[test]
+    fn reconnect_delay_jitter_stays_within_bounds() {
+        let base = Duration::from_secs(30);
+        for _ in 0..1000 {
+            let jittered = jitter_reconnect_delay(base);
+            assert!(jittered >= base);
+            assert!(jittered <= base * 2);
+        }
+
+        // Zero delay stays zero.
+        assert_eq!(jitter_reconnect_delay(Duration::ZERO), Duration::ZERO);
+        // A sub-second base also stays in [base, 2*base].
+        let short = Duration::from_millis(1);
+        for _ in 0..100 {
+            let jittered = jitter_reconnect_delay(short);
+            assert!(jittered >= short);
+            assert!(jittered <= short * 2);
+        }
     }
 }
