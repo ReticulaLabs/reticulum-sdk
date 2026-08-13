@@ -1,5 +1,6 @@
 use core::time::Duration;
 use std::collections::VecDeque;
+use std::io::{Read, Write};
 
 use getrandom::SysRng;
 use rand_core::{Rng, UnwrapErr};
@@ -46,6 +47,36 @@ pub const RETRY_GRACE_TIME: f64 = 0.25;
 pub const PER_RETRY_DELAY: f64 = 0.5;
 pub const HASHMAP_IS_NOT_EXHAUSTED: u8 = 0x00;
 pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
+
+/// Compress with bz2 at level 9 (matching Python `bz2.compress`, whose
+/// default level is also 9).
+fn bzip2_compress(data: &[u8]) -> Result<Vec<u8>, RnsError> {
+    use bzip2::{Compression, write::BzEncoder};
+
+    let mut encoder = BzEncoder::new(Vec::new(), Compression::new(9));
+    encoder
+        .write_all(data)
+        .and_then(|()| encoder.finish())
+        .map_err(|_| RnsError::PacketError)
+}
+
+/// Decompress a bz2 stream into a `Vec`, rejecting output larger than
+/// `limit`. Mirrors Python's `bz2.BZ2Decompressor(max_length=...)` + eof
+/// check, which caps the decompressed size of inbound resources.
+fn bzip2_decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, RnsError> {
+    use bzip2::read::BzDecoder;
+
+    let decoder = BzDecoder::new(data);
+    let mut out = Vec::new();
+    decoder
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|_| RnsError::PacketError)?;
+    if out.len() > limit {
+        return Err(RnsError::PacketError);
+    }
+    Ok(out)
+}
 
 // ============================================================================
 // ResourceStatus
@@ -372,17 +403,39 @@ pub struct Resource {
 }
 
 impl Resource {
+    /// Build an outgoing resource from plaintext data.
+    ///
+    /// The data is bz2-compressed at level 9 when `auto_compress` is enabled,
+    /// the payload fits within `AUTO_COMPRESS_MAX_SIZE` and compression
+    /// actually shrinks it (matching the Python reference). The resource hash
+    /// and proof are always computed over the original plaintext. The caller
+    /// supplies `encrypt`, which wraps the assembled payload for transmission.
     pub fn new(
         data: &[u8],
         link_mdu: usize,
         encrypt: impl FnOnce(&[u8], &mut Vec<u8>) -> Result<usize, RnsError>,
         request_id: Option<Vec<u8>>,
         is_response: bool,
+        auto_compress: bool,
     ) -> Result<Self, RnsError> {
         let original_plaintext = data.to_vec();
         let total_size = data.len();
         let sdu = link_mdu;
-        let compressed = false;
+
+        // bz2-compress the payload when auto-compression is enabled and the
+        // compressed form is smaller (matching the Python reference). The
+        // resource hash and proof are still computed over the *original*
+        // plaintext, so the receiver can verify after decompressing.
+        let (payload, compressed) = if auto_compress && data.len() <= AUTO_COMPRESS_MAX_SIZE {
+            let compressed_data = bzip2_compress(data)?;
+            if compressed_data.len() < data.len() {
+                (compressed_data, true)
+            } else {
+                (data.to_vec(), false)
+            }
+        } else {
+            (data.to_vec(), false)
+        };
 
         // Generate random hash (used for map hash computation, matching Python)
         let random_hash: [u8; RANDOM_HASH_SIZE] = {
@@ -392,14 +445,14 @@ impl Resource {
             buf
         };
 
-        // Build plaintext blob: inline_random_hash(4) + data
+        // Build plaintext blob: inline_random_hash(4) + payload
         // (the inline random hash is separate from self.random_hash)
-        let mut plaintext_blob = Vec::with_capacity(RANDOM_HASH_SIZE + data.len());
+        let mut plaintext_blob = Vec::with_capacity(RANDOM_HASH_SIZE + payload.len());
         let mut inline_random = [0u8; RANDOM_HASH_SIZE];
         let mut rng = UnwrapErr(SysRng);
         rng.fill_bytes(&mut inline_random);
         plaintext_blob.extend_from_slice(&inline_random);
-        plaintext_blob.extend_from_slice(data);
+        plaintext_blob.extend_from_slice(&payload);
 
         // Encrypt the entire blob
         let mut encrypted_buf = Vec::with_capacity(
@@ -843,8 +896,19 @@ impl Resource {
         }
         let payload = &decrypted[RANDOM_HASH_SIZE..];
 
-        // Decompress (not yet implemented — stored as-is)
-        let plaintext = payload.to_vec();
+        // Decompress when the advertisement's compressed flag is set.
+        // Matching Python, the decompressed size is capped to protect the
+        // receiver against resource-exhaustion via an oversized payload.
+        let plaintext = if self.compressed {
+            let decompressed = bzip2_decompress(payload, AUTO_COMPRESS_MAX_SIZE)?;
+            if self.total_segments <= 1 && decompressed.len() != self.uncompressed_size {
+                self.status = ResourceStatus::Corrupt;
+                return Err(RnsError::PacketError);
+            }
+            decompressed
+        } else {
+            payload.to_vec()
+        };
 
         // Verify hash: SHA-256(plaintext || random_hash)  (matching Python)
         let mut hasher = Sha256::new();
@@ -1254,7 +1318,7 @@ mod tests {
         let data = b"Hello, Resource World!";
         let link_mdu = 400;
         let resource =
-            Resource::new(data, link_mdu, dummy_encrypt, None, false).expect("resource creation");
+            Resource::new(data, link_mdu, dummy_encrypt, None, false, true).expect("resource creation");
 
         let adv = ResourceAdvertisement::from_resource(&resource);
         let packed = adv.pack(0, link_mdu).expect("pack");
@@ -1277,7 +1341,7 @@ mod tests {
         let link_mdu = 400;
 
         let mut sender =
-            Resource::new(original_data, link_mdu, dummy_encrypt, None, false).expect("sender");
+            Resource::new(original_data, link_mdu, dummy_encrypt, None, false, true).expect("sender");
 
         let adv = ResourceAdvertisement::from_resource(&sender);
         let rtt = Duration::from_millis(50);
@@ -1320,10 +1384,101 @@ mod tests {
     }
 
     #[test]
+    fn resource_auto_compresses_and_roundtrips() {
+        // Highly repetitive data so bz2 compresses it well.
+        let original_data = b"compress me, I repeat, compress me, I repeat, ".repeat(64);
+        let link_mdu = 400;
+
+        let mut sender =
+            Resource::new(&original_data, link_mdu, dummy_encrypt, None, false, true)
+                .expect("sender");
+
+        assert!(sender.is_compressed(), "compressible data should be compressed");
+
+        let adv = ResourceAdvertisement::from_resource(&sender);
+        assert_ne!(adv.flags & 0x02, 0, "compressed flag must be set");
+
+        let rtt = Duration::from_millis(50);
+        let mut receiver =
+            Resource::new_from_advertisement(&adv, link_mdu, rtt, None).expect("receiver");
+        assert!(receiver.is_compressed());
+
+        let first_req = receiver.start_receive(&adv.hashmap).expect("first request");
+        let req_result = sender.handle_request(&first_req, None).expect("handle req");
+        for part in &req_result.parts {
+            assert!(receiver.receive_part(part), "part accepted");
+        }
+
+        assert!(receiver.all_parts_received(), "all parts received");
+
+        let plaintext = receiver.assemble(dummy_decrypt).expect("assemble");
+        assert_eq!(plaintext, original_data);
+
+        let proof = receiver.build_proof();
+        assert!(sender.validate_proof(&proof), "proof valid");
+    }
+
+    #[test]
+    fn resource_does_not_compress_incompressible_data() {
+        // Random bytes defeat bz2 compression.
+        let mut data = vec![0u8; 512];
+        let mut rng = UnwrapErr(SysRng);
+        rng.fill_bytes(&mut data);
+        let link_mdu = 400;
+
+        let sender = Resource::new(&data, link_mdu, dummy_encrypt, None, false, true)
+            .expect("sender");
+
+        assert!(!sender.is_compressed(), "incompressible data must be sent uncompressed");
+
+        let adv = ResourceAdvertisement::from_resource(&sender);
+        assert_eq!(adv.flags & 0x02, 0, "compressed flag must be clear");
+    }
+
+    // A bz2 stream produced by Python 3's `bz2.compress(data)` (level 9,
+    // the default), where data is `b"Reticulum resource compression interop
+    // test data! " * 40` (2000 bytes). Used to prove our decompressor accepts
+    // exactly what the Python reference emits, and that our compressor is
+    // byte-identical to it.
+    const PYTHON_BZ2_GOLDEN: &str = "425a683931415926535937b963f500009f9380600010002e27de003000d8050d34c001434d300014a94608da989813613b13913913f09c09b89a89f44e84f62644c0991351340981322604d04ec4f027813813813027026a2682644d84dc4c89d09b09815604fc27426a26827227827d13f8bb9229c28481bdcb1fa8";
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn bzip2_interops_with_python_reference() {
+        let data = b"Reticulum resource compression interop test data! ".repeat(40);
+
+        // Our compressor must be byte-identical to Python's bz2.compress.
+        let compressed = bzip2_compress(&data).expect("compress");
+        assert_eq!(compressed, decode_hex(PYTHON_BZ2_GOLDEN));
+
+        // Our decompressor must accept the Python-produced stream.
+        let decompressed = bzip2_decompress(&decode_hex(PYTHON_BZ2_GOLDEN), data.len())
+            .expect("decompress");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn bzip2_decompress_rejects_oversized_output() {
+        let data = vec![0x41u8; 8192];
+        let compressed = bzip2_compress(&data).expect("compress");
+
+        assert!(matches!(
+            bzip2_decompress(&compressed, 1024),
+            Err(RnsError::PacketError)
+        ));
+    }
+
+    #[test]
     fn resource_hash_verification() {
         let data = b"Verify my hash!";
         let link_mdu = 200;
-        let resource = Resource::new(data, link_mdu, dummy_encrypt, None, false).expect("resource");
+        let resource = Resource::new(data, link_mdu, dummy_encrypt, None, false, true).expect("resource");
 
         // Hash should be SHA-256(original_plaintext || random_hash)
         let mut expected = Sha256::new();
@@ -1345,7 +1500,7 @@ mod tests {
         let data: Vec<u8> = (0..1200u32).map(|i| (i % 251) as u8).collect();
         let link_mdu = 400;
         let mut sender =
-            Resource::new(&data, link_mdu, dummy_encrypt, None, false).expect("sender");
+            Resource::new(&data, link_mdu, dummy_encrypt, None, false, true).expect("sender");
         let adv = ResourceAdvertisement::from_resource(&sender);
         let rtt = Duration::from_millis(50);
         let mut receiver =
@@ -1391,7 +1546,7 @@ mod tests {
         let data: Vec<u8> = (0..1200u32).map(|i| (i % 251) as u8).collect();
         let link_mdu = 400;
         let mut sender =
-            Resource::new(&data, link_mdu, dummy_encrypt, None, false).expect("sender");
+            Resource::new(&data, link_mdu, dummy_encrypt, None, false, true).expect("sender");
         let adv = ResourceAdvertisement::from_resource(&sender);
         let rtt = Duration::from_millis(50);
         let mut receiver =
@@ -1432,7 +1587,7 @@ mod tests {
         let data = b"Advertise but nobody asks!";
         let link_mdu = 400;
         let mut sender =
-            Resource::new(data, link_mdu, dummy_encrypt, None, false).expect("sender");
+            Resource::new(data, link_mdu, dummy_encrypt, None, false, true).expect("sender");
 
         // Simulate an advertisement having been sent and no part request
         // ever arriving.
@@ -1468,7 +1623,7 @@ mod tests {
         let data = b"All sent, where is my proof?";
         let link_mdu = 400;
         let mut sender =
-            Resource::new(data, link_mdu, dummy_encrypt, None, false).expect("sender");
+            Resource::new(data, link_mdu, dummy_encrypt, None, false, true).expect("sender");
 
         // Force the sender into the awaiting-proof state, as if all parts
         // were sent and the proof never arrived.

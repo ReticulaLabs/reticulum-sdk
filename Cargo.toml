@@ -34,6 +34,12 @@ subtle = "2"
 hmac = "0.12.1"
 sha2 = "0.10.8"
 
+# Compression
+# bzip2 >= 0.6 uses the pure-Rust libbz2-rs-sys backend by default; output
+# is byte-identical to libbz2, which Python's bz2 module uses, so resources
+# interoperate.
+bzip2 = "0.6"
+
 # Random Number generator
 rand_core = "0.10.0"
 

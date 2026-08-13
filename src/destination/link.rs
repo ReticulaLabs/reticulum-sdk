@@ -1501,7 +1501,7 @@ mod tests {
 
     use super::{
         ChannelEnvelope, ChannelMessage, KEEPALIVE_INTERVAL, LINK_MTU_SIZE, Link, LinkEvent,
-        LinkEventData, LinkHandleResult, LinkStatus,
+        LinkHandleResult, LinkStatus,
     };
     use std::time::{Duration, Instant};
 
@@ -2053,7 +2053,7 @@ mod tests {
                 assert_eq!(resource.data, proof_data);
                 assert_eq!(resource.packet_hash, proof.hash());
             }
-            other => panic!("expected resource event, got other event"),
+            _ => panic!("expected resource event, got other event"),
         }
     }
 }
