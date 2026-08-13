@@ -86,6 +86,60 @@ const EGRESS_PR_FREQ: f64 = 5.0;
 const INGRESS_NEW_TIME_S: u64 = 2 * 60 * 60; // 2 hours
 const SATURATED_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Initial reconnect backoff for client-style interfaces that reconnect on
+/// link loss.  Doubles up to [`MAX_RECONNECT_BACKOFF`] on each failed or
+/// short-lived connection.
+pub(crate) const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+/// Maximum reconnect backoff for client-style interfaces.
+pub(crate) const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Wait until `retry_at` before the next client-side reconnect attempt,
+/// waking early on outbound traffic so the transmit channel keeps draining
+/// while the interface is down.  Returns `true` if the interface is being
+/// shut down and the reconnect loop should exit.
+pub(crate) async fn await_reconnect_delay(
+    cancel: &CancellationToken,
+    tx_channel: &Arc<tokio::sync::Mutex<InterfaceTxReceiver>>,
+    retry_at: Instant,
+) -> bool {
+    loop {
+        let mut tx_channel = tx_channel.lock().await;
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return true;
+            }
+            _ = time::sleep_until(retry_at) => {
+                return false;
+            }
+            Some(_) = tx_channel.recv() => {}
+        }
+    }
+}
+
+/// Advance the reconnect backoff after a client connection drops.
+///
+/// A connection that stayed up long enough to be considered stable
+/// (`>= max`) resets the backoff so a fresh drop recovers quickly, while
+/// short-lived connections escalate it to avoid rapid reconnect loops
+/// (e.g. against a peer that accepts connections then immediately drops
+/// them).  Returns the delay the caller should wait before the next
+/// reconnect attempt.
+pub(crate) fn reconnect_backoff_after_drop(
+    connected_at: Instant,
+    backoff: &mut Duration,
+    initial: Duration,
+    max: Duration,
+) -> Duration {
+    if connected_at.elapsed() >= max {
+        *backoff = initial;
+    } else {
+        *backoff = max.min(backoff.saturating_mul(2));
+    }
+    *backoff
+}
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TxMessageType {
     /// Broadcast to every interface, optionally excluding the given one.
@@ -2734,5 +2788,56 @@ mod tests {
                 "{lbl}",
             );
         }
+    }
+
+    #[test]
+    fn reconnect_backoff_escalates_on_short_lived_drop() {
+        let mut backoff = INITIAL_RECONNECT_BACKOFF;
+
+        for expected in [
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+        ] {
+            let delay = reconnect_backoff_after_drop(
+                Instant::now(),
+                &mut backoff,
+                INITIAL_RECONNECT_BACKOFF,
+                MAX_RECONNECT_BACKOFF,
+            );
+            assert_eq!(delay, expected);
+            assert_eq!(backoff, expected);
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_caps_at_max() {
+        let mut backoff = Duration::from_secs(20);
+
+        let delay = reconnect_backoff_after_drop(
+            Instant::now(),
+            &mut backoff,
+            INITIAL_RECONNECT_BACKOFF,
+            MAX_RECONNECT_BACKOFF,
+        );
+        assert_eq!(delay, MAX_RECONNECT_BACKOFF);
+        assert_eq!(backoff, MAX_RECONNECT_BACKOFF);
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_after_stable_connection() {
+        let mut backoff = MAX_RECONNECT_BACKOFF;
+
+        // A connection that stayed up longer than the max backoff is
+        // considered stable and resets the backoff to the initial value.
+        let connected_at = Instant::now() - MAX_RECONNECT_BACKOFF - Duration::from_secs(1);
+        let delay = reconnect_backoff_after_drop(
+            connected_at,
+            &mut backoff,
+            INITIAL_RECONNECT_BACKOFF,
+            MAX_RECONNECT_BACKOFF,
+        );
+        assert_eq!(delay, INITIAL_RECONNECT_BACKOFF);
+        assert_eq!(backoff, INITIAL_RECONNECT_BACKOFF);
     }
 }

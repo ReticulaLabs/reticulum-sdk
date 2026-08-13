@@ -15,8 +15,9 @@ use tokio::net::{
 use tokio_util::sync::CancellationToken;
 
 use crate::iface::{
-    decode_rx, encode_tx, IfacConfig, DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode,
-    MAX_AUTOCONFIGURED_HW_MTU, RxMessage, configured_bitrate,
+    decode_rx, encode_tx, IfacConfig, DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF, Interface,
+    InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage,
+    configured_bitrate,
 };
 
 const FEND: u8 = 0xc0;
@@ -34,8 +35,6 @@ const DEFAULT_BITRATE: f64 = 600.0;
 const RETICULUM_BASE_MTU: usize = 500;
 const CONTROL_RECONNECT_WAIT: Duration = Duration::from_secs(5);
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const TCP_READ_BUFFER_SIZE: usize = 16 * 1024;
 const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
 
@@ -185,20 +184,15 @@ impl Modem73Interface {
                     reconnect_backoff =
                         cmp::min(reconnect_backoff.saturating_mul(2), MAX_RECONNECT_BACKOFF);
 
-                    loop {
-                        let mut tx_guard = tx_channel.lock().await;
-                        tokio::select! {
-                            biased;
-                            _ = context.cancel.cancelled() => break 'outer,
-                            _ = tokio::time::sleep_until(retry_at) => break,
-                            Some(_) = tx_guard.recv() => {}
-                        }
+                    if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await
+                    {
+                        break 'outer;
                     }
                     continue;
                 }
             };
 
-            reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
+            let connected_at = tokio::time::Instant::now();
             let cancel = context.cancel.clone();
             let stop = CancellationToken::new();
             let (read_stream, write_stream) = stream.into_split();
@@ -249,6 +243,23 @@ impl Modem73Interface {
                 "modem73_interface: KISS data port disconnected <{}>",
                 config.kiss_addr
             );
+
+            // Reconnecting immediately after a dropped connection can turn
+            // accept-then-drop peers into a reconnect storm.  Apply the
+            // same 1s→30s exponential backoff used for failed connections,
+            // resetting it after a connection that stayed up long enough to
+            // be considered stable.
+            let delay = super::reconnect_backoff_after_drop(
+                connected_at,
+                &mut reconnect_backoff,
+                INITIAL_RECONNECT_BACKOFF,
+                MAX_RECONNECT_BACKOFF,
+            );
+            let retry_at = tokio::time::Instant::now() + delay;
+
+            if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {
+                break 'outer;
+            }
         }
 
         let _ = control_task.await;

@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::OutputBuffer;
 use crate::error::RnsError;
 use crate::iface::{
-    decode_rx, encode_tx, DEFAULT_HW_MTU, Interface, InterfaceContext, InterfaceMode,
-    MAX_AUTOCONFIGURED_HW_MTU, RxMessage, configured_bitrate,
+    decode_rx, encode_tx, DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF, Interface, InterfaceContext,
+    InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage, configured_bitrate,
 };
 use crate::packet::{Header, HeaderType, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE};
 
@@ -75,8 +75,6 @@ use super::hdlc::Hdlc;
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
-const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const DECODE_FAILURE_HEX_PREVIEW_LEN: usize = 96;
 const TCP_READ_BUFFER_SIZE: usize = 16 * 1024;
 
@@ -174,19 +172,8 @@ impl TcpClient {
                 reconnect_backoff =
                     cmp::min(reconnect_backoff.saturating_mul(2), MAX_RECONNECT_BACKOFF);
 
-                loop {
-                    let mut tx_channel = tx_channel.lock().await;
-
-                    tokio::select! {
-                        biased;
-                        _ = context.cancel.cancelled() => {
-                            break 'outer;
-                        }
-                        _ = tokio::time::sleep_until(retry_at) => {
-                            break;
-                        }
-                        Some(_) = tx_channel.recv() => {}
-                    }
+                if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {
+                    break 'outer;
                 }
                 continue;
             }
@@ -196,7 +183,7 @@ impl TcpClient {
 
             let stream = stream.unwrap();
             set_tcp_sockopts(&stream);
-            reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
+            let connected_at = tokio::time::Instant::now();
             let (read_stream, write_stream) = stream.into_split();
 
             log::info!("tcp_client connected to <{}>", addr);
@@ -378,6 +365,23 @@ impl TcpClient {
             rx_task.await.unwrap();
 
             log::info!("tcp_client: disconnected from <{}>", addr);
+
+            // Reconnecting immediately after a dropped connection can turn
+            // accept-then-drop peers into a reconnect storm.  Apply the
+            // same 1s→30s exponential backoff used for failed connections,
+            // resetting it after a connection that stayed up long enough to
+            // be considered stable.
+            let delay = super::reconnect_backoff_after_drop(
+                connected_at,
+                &mut reconnect_backoff,
+                INITIAL_RECONNECT_BACKOFF,
+                MAX_RECONNECT_BACKOFF,
+            );
+            let retry_at = tokio::time::Instant::now() + delay;
+
+            if super::await_reconnect_delay(&context.cancel, &tx_channel, retry_at).await {
+                break 'outer;
+            }
         }
 
         iface_stop.cancel();
