@@ -3511,19 +3511,20 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
         // announce (`Transport.validate_announce()`) before rate-limiting it
         // inside `should_add`. Path responses are exempt from the rate limiter.
         if packet.context != PacketContext::PathResponse {
-            // A single announce emission carries the same hop-invariant packet
-            // hash on every interface it is heard on, so a duplicate copy of an
-            // emission that was already recorded in the path table is not a new
-            // announce from the destination. Skip the per-destination announce
-            // rate limiter for such copies; otherwise a legitimate destination
-            // heard on multiple interfaces would be falsely rate-limited.
-            let emission_known = handler
+            // Only rate-limit announces that would actually update or
+            // install a path, matching Python's `should_add` gating
+            // (Transport.py).  A duplicate copy of an emission already
+            // recorded on another interface does not change the path, so
+            // `would_update_path` also skips those — a legitimate
+            // destination heard on several interfaces is not falsely
+            // rate-limited.
+            let would_update = handler
                 .send_ctx
                 .path_table
                 .read()
                 .unwrap()
-                .knows_emission(&packet.destination, packet);
-            if !emission_known
+                .would_update_path(&packet);
+            if would_update
                 && let Some(blocked_until) = handler.announce_limits.check(&packet.destination)
             {
                 handler.announces_rate_limited += 1;

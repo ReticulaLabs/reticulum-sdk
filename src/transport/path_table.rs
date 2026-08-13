@@ -134,27 +134,12 @@ impl PathTable {
         iface: AddressHash,
         path_expiry: Duration,
     ) -> bool {
-        let hops = announce.header.hops;
-
-        let random_blob = announce_random_blob(announce);
-
-        if let Some(existing_entry) = self.map.get(&announce.destination) {
-            let should_install = match random_blob {
-                Some(blob) => existing_entry.should_accept(announce.destination, hops, blob),
-                None => {
-                    if hops > existing_entry.hops {
-                        false
-                    } else {
-                        self.reroute_eager || hops < existing_entry.hops
-                    }
-                }
-            };
-
-            if !should_install {
-                return false;
-            }
+        if !self.would_update_path(announce) {
+            return false;
         }
 
+        let hops = announce.header.hops;
+        let random_blob = announce_random_blob(announce);
         let received_from = transport_id.unwrap_or(announce.destination);
         let direct_announce = transport_id.is_none();
         let self_referential_transport = transport_id == Some(announce.destination);
@@ -204,18 +189,27 @@ self_referential_transport={}",
         true
     }
 
-    /// Whether the path table already records this announce emission
-    /// (same random blob) for the destination. Used to avoid re-applying
-    /// the announce rate limiter to duplicate copies of a single emission
-    /// heard on multiple interfaces.
-    pub fn knows_emission(&self, destination: &AddressHash, announce: &Packet) -> bool {
-        let Some(blob) = announce_random_blob(announce) else {
-            return false;
-        };
-        self.map
-            .get(destination)
-            .map(|entry| entry.random_blobs.contains(&blob))
-            .unwrap_or(false)
+    /// Whether an announce for this destination would update the installed
+    /// path (a fresh destination, or a strictly better / newer emission).
+    /// Non-mutating — used to gate the per-destination announce rate limiter
+    /// on announces that actually change the path, matching Python's
+    /// `should_add` gating (Transport.py).
+    pub fn would_update_path(&self, announce: &Packet) -> bool {
+        let hops = announce.header.hops;
+        let random_blob = announce_random_blob(announce);
+        match self.map.get(&announce.destination) {
+            None => true,
+            Some(entry) => match random_blob {
+                Some(blob) => entry.should_accept(announce.destination, hops, blob),
+                None => {
+                    if hops > entry.hops {
+                        false
+                    } else {
+                        self.reroute_eager || hops < entry.hops
+                    }
+                }
+            },
+        }
     }
 
     /// Remove a specific destination from the path table.
@@ -560,6 +554,45 @@ mod tests {
         );
         assert_eq!(forwarded.header.hops, 0);
         assert_eq!(forwarded.transport, None);
+    }
+
+    #[test]
+    fn would_update_path_matches_handle_announce_decision() {
+        let destination = AddressHash::new_from_slice(b"rate-limit-destination");
+        let iface = AddressHash::new_from_slice(b"rate-limit-iface");
+        let mut table = PathTable::new(false);
+
+        let announce = Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                hops: 1,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: Default::default(),
+        };
+
+        // Fresh destination: the announce would install a path.
+        assert!(table.would_update_path(&announce));
+
+        // After installation, an identical announce does not update the path.
+        assert!(table.handle_announce(&announce, None, iface, Duration::from_secs(3600)));
+        assert!(!table.would_update_path(&announce));
+
+        // A lower-hop announce would still update the path.
+        let mut better = announce.clone();
+        better.header.hops = 0;
+        assert!(table.would_update_path(&better));
+        assert!(table.handle_announce(&better, None, iface, Duration::from_secs(3600)));
+
+        // A higher-hop announce would not.
+        let mut worse = announce.clone();
+        worse.header.hops = 2;
+        assert!(!table.would_update_path(&worse));
     }
 
     #[test]

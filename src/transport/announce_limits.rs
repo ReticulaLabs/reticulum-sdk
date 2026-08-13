@@ -39,36 +39,47 @@ impl AnnounceLimitEntry {
     }
 
     pub fn handle_announce(&mut self) -> Option<Duration> {
-        let mut is_blocked = false;
         let now = Instant::now();
 
-        if let Some(ref rate_limit) = self.rate_limit {
-            if now < self.blocked_until {
-                self.blocked_until = now + rate_limit.target;
-                if let Some(penalty) = rate_limit.penalty {
-                    self.blocked_until += penalty;
-                }
-                is_blocked = true;
-            } else {
-                let next_allowed = self.last_announce + rate_limit.target;
-                if now < next_allowed {
-                    self.violations += 1;
-                    if self.violations >= rate_limit.grace {
-                        self.violations = 0;
-                        self.blocked_until = now + rate_limit.target;
-                        is_blocked = true;
-                    }
-                }
+        // No rate limit configured → never block.  Matches the Python
+        // reference, where the limiter is disabled unless an interface
+        // explicitly sets `announce_rate_target`.
+        let Some(rate_limit) = self.rate_limit.as_ref() else {
+            return None;
+        };
+
+        // While blocked, the block runs for a fixed duration anchored at
+        // block time and is NOT extended by further announces.  Python
+        // computes `blocked_until = last + target + penalty` once and only
+        // checks it against the current time (Transport.py should_add).
+        if now < self.blocked_until {
+            return Some(self.blocked_until.saturating_duration_since(now));
+        }
+
+        let next_allowed = self.last_announce + rate_limit.target;
+        if now < next_allowed {
+            // The announce arrived sooner than the target: count a
+            // violation and block once it exceeds the grace allowance.
+            self.violations += 1;
+            if self.violations > rate_limit.grace {
+                self.violations = 0;
+                let penalty = rate_limit.penalty.unwrap_or(Duration::ZERO);
+                // Anchor the block to the last accepted announce, exactly
+                // like Python (`rate_entry["last"] + target + penalty`),
+                // so it cannot be kept alive by the blocked node itself.
+                self.blocked_until = self.last_announce + rate_limit.target + penalty;
+                return Some(self.blocked_until.saturating_duration_since(now));
             }
-        }
-
-        self.last_announce = now;
-
-        if is_blocked {
-            Some(self.blocked_until - now)
+            // Within grace: accept and refresh the reference time.
+            self.last_announce = now;
         } else {
-            None
+            // Well-behaved (announcements spaced out): decay the violation
+            // counter toward zero and accept.
+            self.violations = self.violations.saturating_sub(1);
+            self.last_announce = now;
         }
+
+        None
     }
 }
 
@@ -92,10 +103,11 @@ impl AnnounceLimits {
             return entry.handle_announce();
         }
 
-        self.limits.insert(
-            destination.clone(),
-            AnnounceLimitEntry::new(Default::default()),
-        );
+        // Disabled by default: Python's `announce_rate_target` is `None`
+        // unless explicitly configured, and there is no configuration
+        // surface for it here yet.  Entries therefore never block unless a
+        // rate limit is supplied (currently only via tests).
+        self.limits.insert(destination.clone(), AnnounceLimitEntry::new(None));
 
         None
     }
@@ -117,5 +129,90 @@ impl AnnounceLimits {
         let mut entry = AnnounceLimitEntry::new(Some(AnnounceRateLimit::default()));
         entry.blocked_until = Instant::now() + duration;
         self.limits.insert(destination, entry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enabled_limit() -> AnnounceRateLimit {
+        AnnounceRateLimit {
+            target: Duration::from_secs(10),
+            grace: 2,
+            penalty: Some(Duration::from_secs(30)),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_by_default_never_blocks() {
+        let mut entry = AnnounceLimitEntry::new(None);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(entry.handle_announce().is_none());
+        assert_eq!(entry.violations, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn violations_decay_on_well_behaved_announces() {
+        let mut entry = AnnounceLimitEntry::new(Some(enabled_limit()));
+        // Model a destination that has been quiet for longer than the
+        // target: the first announce is well-spaced and accepted cleanly.
+        entry.last_announce = tokio::time::Instant::now() - Duration::from_secs(30);
+        assert!(entry.handle_announce().is_none());
+        assert_eq!(entry.violations, 0);
+
+        // Two announces within the 10s target: two violations, still within
+        // the grace of 2, so both accepted.
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(entry.handle_announce().is_none());
+        }
+        assert_eq!(entry.violations, 2);
+
+        // A well-spaced announce (> target) decays the counter toward zero
+        // instead of accumulating a permanent violation.
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(entry.handle_announce().is_none());
+        assert_eq!(entry.violations, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn block_anchored_to_last_accepted_and_includes_penalty() {
+        let mut entry = AnnounceLimitEntry::new(Some(enabled_limit()));
+        entry.last_announce = tokio::time::Instant::now() - Duration::from_secs(30);
+        assert!(entry.handle_announce().is_none());
+
+        // Two accepted announces within the target (grace is 2).
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(entry.handle_announce().is_none());
+        }
+
+        // The next within-target announce exceeds the grace of 2 and
+        // triggers a block anchored to the last ACCEPTED announce plus
+        // target + penalty (10s + 30s), exactly like Python.
+        let last_accepted = entry.last_announce;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let remaining = entry.handle_announce().expect("announce triggers block");
+        assert!(!remaining.is_zero());
+        assert_eq!(
+            entry.blocked_until - last_accepted,
+            Duration::from_secs(10) + Duration::from_secs(30),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn block_is_not_extended_by_further_announces() {
+        let mut entry = AnnounceLimitEntry::new(Some(enabled_limit()));
+        entry.blocked_until = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        let blocked_until = entry.blocked_until;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(entry.handle_announce().is_some(), "announce still blocked");
+        }
+
+        // The block expiry is fixed and must not creep forward.
+        assert_eq!(entry.blocked_until, blocked_until);
     }
 }
