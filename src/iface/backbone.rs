@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::OutputBuffer;
 use crate::error::RnsError;
 use crate::iface::{
-    decode_rx, encode_tx, set_tcp_sockopts, CONNECT_TIMEOUT, IfacConfig, Interface,
-    InterfaceContext, InterfaceMode, INITIAL_RECONNECT_BACKOFF, MAX_AUTOCONFIGURED_HW_MTU,
-    MAX_RECONNECT_BACKOFF, RxMessage, configured_bitrate,
+    decode_rx, encode_tx, set_tcp_sockopts, spawn_tx_drain_task, CONNECT_TIMEOUT, IfacConfig,
+    Interface, InterfaceContext, InterfaceMode, INITIAL_RECONNECT_BACKOFF,
+    MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage, configured_bitrate,
 };
 use crate::iface::reconnect_pacer::{ReconnectPacer, ReconnectPacerMetrics};
 use crate::packet::{Header, HeaderType, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE};
@@ -125,14 +125,32 @@ impl BackboneServer {
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let addr = { context.inner.lock().unwrap().addr.clone() };
+        let iface_stop = context.channel.stop.clone();
 
-        let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
-        let mut listener = { context.inner.lock().unwrap().listener.take() };
-        let bitrate = { context.inner.lock().unwrap().bitrate };
-        let hw_mtu = { context.inner.lock().unwrap().hw_mtu };
-        let ifac_netname = { context.inner.lock().unwrap().ifac_netname.clone() };
-        let ifac_netkey = { context.inner.lock().unwrap().ifac_netkey.clone() };
+        let (
+            addr,
+            iface_manager,
+            mut listener,
+            bitrate,
+            hw_mtu,
+            ifac_netname,
+            ifac_netkey,
+            reconnect_pacer,
+            mode,
+        ) = {
+            let mut inner = context.inner.lock().unwrap();
+            (
+                inner.addr.clone(),
+                inner.iface_manager.clone(),
+                inner.listener.take(),
+                inner.bitrate,
+                inner.hw_mtu,
+                inner.ifac_netname.clone(),
+                inner.ifac_netkey.clone(),
+                inner.reconnect_pacer.clone(),
+                inner.mode,
+            )
+        };
         // Derive the IFAC configuration from the access code once, so every
         // spawned client connection shares it (manager + interface side).
         let ifac_config = if ifac_netname.is_some() || ifac_netkey.is_some() {
@@ -144,11 +162,10 @@ impl BackboneServer {
         } else {
             None
         };
-        let reconnect_pacer = { context.inner.lock().unwrap().reconnect_pacer.clone() };
-        let mode = { context.inner.lock().unwrap().mode };
 
         // Register this pacer with the interface manager so it appears in
-        // transport metrics snapshots.
+        // transport metrics snapshots.  Unregistered again on exit so
+        // repeated start/stop cycles don't leak entries.
         iface_manager
             .lock()
             .await
@@ -187,27 +204,7 @@ impl BackboneServer {
 
             let listener = listener.unwrap();
 
-            let tx_task = {
-                let cancel = context.cancel.clone();
-                let tx_channel = tx_channel.clone();
-
-                tokio::spawn(async move {
-                    loop {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-
-                        let mut tx_channel = tx_channel.lock().await;
-
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                break;
-                            }
-                            _ = tx_channel.recv() => {}
-                        }
-                    }
-                })
-            };
+            let tx_task = spawn_tx_drain_task(context.cancel.clone(), tx_channel.clone());
 
             let cancel = context.cancel.clone();
 
@@ -221,47 +218,53 @@ impl BackboneServer {
                         break;
                     }
                     client = listener.accept() => {
-                        if let Ok(client) = client {
-                            let peer_ip = client.1.ip();
+                        match client {
+                            Ok(client) => {
+                                let peer_ip = client.1.ip();
 
-                            // Per-IP backoff: reject rapid reconnects from
-                            // the same source address before spawning a handler.
-                            {
-                                let mut pacer = reconnect_pacer.lock().unwrap();
-                                if !pacer.is_allowed(peer_ip) {
-                                    log::debug!(
-                                        "backbone_server: rejecting reconnect from <{}> (backoff active)",
-                                        client.1,
-                                    );
-                                    continue;
+                                // Per-IP backoff: reject rapid reconnects from
+                                // the same source address before spawning a handler.
+                                {
+                                    let mut pacer = reconnect_pacer.lock().unwrap();
+                                    if !pacer.is_allowed(peer_ip) {
+                                        log::debug!(
+                                            "backbone_server: rejecting reconnect from <{}> (backoff active)",
+                                            client.1,
+                                        );
+                                        continue;
+                                    }
+                                    pacer.record(peer_ip);
                                 }
-                                pacer.record(peer_ip);
+
+                                log::info!(
+                                    "backbone_server: new client <{}> connected to <{}>",
+                                    client.1,
+                                    addr,
+                                );
+
+                                let mut iface_manager = iface_manager.lock().await;
+
+                                let iface_addr = iface_manager.spawn_with_ifac_config(
+                                    BackboneClient::new_from_stream(client.1.to_string(), client.0)
+                                        .with_optional_bitrate(bitrate)
+                                        .with_hw_mtu(hw_mtu)
+                                        .with_ifac(ifac_netname.clone(), ifac_netkey.clone())
+                                        .with_interface_mode(mode),
+                                    |context| async move {
+                                        BackboneClient::spawn(context).await;
+                                    },
+                                    ifac_config.clone(),
+                                );
+
+                                // Track the parent-child relationship so the
+                                // transport can aggregate ingress burst state
+                                // and announce caps across the backbone group.
+                                iface_manager.set_parent_interface(&iface_addr, &server_address);
                             }
-
-                            log::info!(
-                                "backbone_server: new client <{}> connected to <{}>",
-                                client.1,
-                                addr,
-                            );
-
-                            let mut iface_manager = iface_manager.lock().await;
-
-                            let iface_addr = iface_manager.spawn_with_ifac_config(
-                                BackboneClient::new_from_stream(client.1.to_string(), client.0)
-                                    .with_optional_bitrate(bitrate)
-                                    .with_hw_mtu(hw_mtu)
-                                    .with_ifac(ifac_netname.clone(), ifac_netkey.clone())
-                                    .with_interface_mode(mode),
-                                |context| async move {
-                                    BackboneClient::spawn(context).await;
-                                },
-                                ifac_config.clone(),
-                            );
-
-                            // Track the parent-child relationship so the
-                            // transport can aggregate ingress burst state
-                            // and announce caps across the backbone group.
-                            iface_manager.set_parent_interface(&iface_addr, &server_address);
+                            Err(error) => {
+                                log::warn!("backbone_server: accept error: {}", error);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
                         }
                     }
                 }
@@ -269,6 +272,13 @@ impl BackboneServer {
 
             let _ = tokio::join!(tx_task);
         }
+
+        iface_stop.cancel();
+
+        iface_manager
+            .lock()
+            .await
+            .unregister_reconnect_pacer(&addr);
     }
 }
 

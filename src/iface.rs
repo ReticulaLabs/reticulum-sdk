@@ -236,6 +236,33 @@ pub(crate) fn set_tcp_sockopts(stream: &TcpStream) {
     }
 }
 
+/// Spawn a task that drains (and discards) outbound messages on a
+/// server-style interface whose inbound handling is provided by
+/// per-connection child interfaces (e.g. a TCP server that spawns a client
+/// per accepted connection).  Without this, outbound traffic would fill the
+/// bounded tx queue and stall the transport sender.
+pub(crate) fn spawn_tx_drain_task(
+    cancel: CancellationToken,
+    tx_channel: Arc<tokio::sync::Mutex<InterfaceTxReceiver>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            let mut tx_channel = tx_channel.lock().await;
+
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break;
+                }
+                _ = tx_channel.recv() => {}
+            }
+        }
+    })
+}
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TxMessageType {
     /// Broadcast to every interface, optionally excluding the given one.

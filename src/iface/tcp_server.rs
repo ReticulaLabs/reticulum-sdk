@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 
 use crate::error::RnsError;
-use crate::iface::{DEFAULT_HW_MTU, InterfaceMode, configured_bitrate};
+use crate::iface::{DEFAULT_HW_MTU, InterfaceMode, configured_bitrate, spawn_tx_drain_task};
 
 use super::tcp_client::TcpClient;
 use super::{Interface, InterfaceContext, InterfaceManager};
@@ -79,14 +79,20 @@ impl TcpServer {
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let addr = { context.inner.lock().unwrap().addr.clone() };
+        let iface_stop = context.channel.stop.clone();
 
-        let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
-        let mut listener = { context.inner.lock().unwrap().listener.take() };
-        let accept_trace_label = { context.inner.lock().unwrap().accept_trace_label.clone() };
-        let bitrate = { context.inner.lock().unwrap().bitrate };
-        let max_connections = { context.inner.lock().unwrap().max_connections };
-        let mode = { context.inner.lock().unwrap().mode };
+        let (addr, iface_manager, mut listener, accept_trace_label, bitrate, max_connections, mode) = {
+            let mut inner = context.inner.lock().unwrap();
+            (
+                inner.addr.clone(),
+                inner.iface_manager.clone(),
+                inner.listener.take(),
+                inner.accept_trace_label.clone(),
+                inner.bitrate,
+                inner.max_connections,
+                inner.mode,
+            )
+        };
 
         // Share the server's IFAC configuration with every spawned client
         // connection. Runtime changes via `set_ifac_config` therefore apply
@@ -126,28 +132,7 @@ impl TcpServer {
 
             let listener = listener.unwrap();
 
-            let tx_task = {
-                let cancel = context.cancel.clone();
-                let tx_channel = tx_channel.clone();
-
-                tokio::spawn(async move {
-                    loop {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-
-                        let mut tx_channel = tx_channel.lock().await;
-
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                break;
-                            }
-                            // Skip all tx messages
-                            _ = tx_channel.recv() => {}
-                        }
-                    }
-                })
-            };
+            let tx_task = spawn_tx_drain_task(context.cancel.clone(), tx_channel.clone());
 
             let cancel = context.cancel.clone();
             let active_connections = Arc::new(AtomicUsize::new(0));
@@ -174,35 +159,41 @@ impl TcpServer {
                     }
 
                     client = listener.accept() => {
-                        if let Ok(client) = client {
-                            if let Some(label) = &accept_trace_label {
-                                log::trace!(
-                                    "{}: client <{}> connected to <{}>",
-                                    label,
+                        match client {
+                            Ok(client) => {
+                                if let Some(label) = &accept_trace_label {
+                                    log::trace!(
+                                        "{}: client <{}> connected to <{}>",
+                                        label,
+                                        client.1,
+                                        addr
+                                    );
+                                }
+                                log::info!(
+                                    "tcp_server: new client <{}> connected to <{}>",
                                     client.1,
                                     addr
                                 );
+
+                                active_connections.fetch_add(1, Ordering::Relaxed);
+                                let connections = active_connections.clone();
+                                let mut iface_manager = iface_manager.lock().await;
+
+                                iface_manager.spawn_with_ifac_config(
+                                    TcpClient::new_from_stream(client.1.to_string(), client.0)
+                                        .with_optional_bitrate(bitrate)
+                                        .with_interface_mode(mode),
+                                    |context| async move {
+                                        TcpClient::spawn(context).await;
+                                        connections.fetch_sub(1, Ordering::Relaxed);
+                                    },
+                                    ifac_config.lock().unwrap().clone(),
+                                );
                             }
-                            log::info!(
-                                "tcp_server: new client <{}> connected to <{}>",
-                                client.1,
-                                addr
-                            );
-
-                            active_connections.fetch_add(1, Ordering::Relaxed);
-                            let connections = active_connections.clone();
-                            let mut iface_manager = iface_manager.lock().await;
-
-                            iface_manager.spawn_with_ifac_config(
-                                TcpClient::new_from_stream(client.1.to_string(), client.0)
-                                    .with_optional_bitrate(bitrate)
-                                    .with_interface_mode(mode),
-                                |context| async move {
-                                    TcpClient::spawn(context).await;
-                                    connections.fetch_sub(1, Ordering::Relaxed);
-                                },
-                                ifac_config.lock().unwrap().clone(),
-                            );
+                            Err(error) => {
+                                log::warn!("tcp_server: accept error: {}", error);
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
                         }
                     }
                 }
@@ -210,6 +201,8 @@ impl TcpServer {
 
             let _ = tokio::join!(tx_task);
         }
+
+        iface_stop.cancel();
     }
 }
 
