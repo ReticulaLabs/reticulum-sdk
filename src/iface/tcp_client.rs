@@ -394,7 +394,10 @@ fn minimum_decoded_packet_len(data: &[u8]) -> usize {
         Some(byte) if Header::from_meta(*byte).header_type == HeaderType::Type2 => {
             RETICULUM_MAX_HEADER_SIZE
         }
-        _ => RETICULUM_HEADER_MINSIZE + 1,
+        // Header-only packets (empty data) are valid; accept the full
+        // Type1 header size (matching the header-only Type2 floor above
+        // and the Python reference, which has no minimum at all).
+        _ => RETICULUM_HEADER_MINSIZE,
     }
 }
 

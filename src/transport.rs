@@ -1421,6 +1421,15 @@ impl Transport {
             .single_in_destinations
             .insert(address_hash, destination.clone());
 
+        // Register the destination as local so interface-mode announce
+        // filtering treats it as a local destination (matching Python's
+        // `destinations_map` used by the `local_destination` checks).
+        self.send_ctx
+            .iface_manager
+            .lock()
+            .await
+            .add_local_destination(address_hash);
+
         destination
     }
 

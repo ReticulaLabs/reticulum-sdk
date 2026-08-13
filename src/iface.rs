@@ -1779,8 +1779,10 @@ impl InterfaceManager {
                 continue;
             }
 
-            // Announces have their own dedicated pacer.
-            if AnnouncePacer::should_pace(message) {
+            // Announces have their own dedicated pacer and are never
+            // data-paced, including locally-emitted announces (Python:
+            // "announces originating locally are always allowed").
+            if message.packet.header.packet_type == PacketType::Announce {
                 continue;
             }
 
@@ -1845,8 +1847,11 @@ impl InterfaceManager {
 
             // Interface mode-based announce propagation filtering.
             // Matches Python RNS/Transport.py outbound() lines 1207-1264.
+            // Applied to ALL announces regardless of hop count: Python only
+            // gates the announce *pacing* on hops > 0, not the mode filters.
+            let is_announce = message.packet.header.packet_type == PacketType::Announce;
             let is_paced_announce = AnnouncePacer::should_pace(&message);
-            if is_paced_announce {
+            if is_announce {
                 // Path responses are solicited replies to client path
                 // requests.  They must cross all interface mode boundaries
                 // regardless of normal announce propagation rules,
@@ -2712,6 +2717,30 @@ mod tests {
             // Internal (source) must receive it back; AP must be blocked by
             // the mode filter; Full and Boundary are unaffected.
             let should = *lbl == "internal" || *lbl == "full" || *lbl == "boundary";
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                should,
+                "{lbl}",
+            );
+        }
+    }
+
+    /// Locally-originated announces (hops == 0) must still pass through the
+    /// interface-mode filters.  Python's `Transport.outbound()` blocks all
+    /// announces on AccessPoint interfaces regardless of hop count; the
+    /// filter must not be skipped just because the announce is local.
+    #[tokio::test]
+    async fn local_announce_still_blocked_on_access_point() {
+        let mut h = ModeTestHarness::new();
+
+        let mut msg = announce(0xcc, 0, &[]);
+        msg.tx_type = TxMessageType::Broadcast(None);
+        h.mgr.send_flush(msg).await;
+
+        for (lbl, _addr, rx) in &mut h.ifaces {
+            // AP blocks announces; Full, Boundary and Internal receive the
+            // locally-originated announce.
+            let should = *lbl != "ap";
             assert_eq!(
                 rx.try_recv().is_ok(),
                 should,
