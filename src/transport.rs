@@ -3437,33 +3437,11 @@ async fn handle_announce(
     }
 
     if packet.context != PacketContext::PathResponse {
-        // A single announce emission carries the same hop-invariant packet
-        // hash on every interface it is heard on, so a duplicate copy of an
-        // emission that was already recorded in the path table is not a new
-        // announce from the destination. Skip the per-destination announce
-        // rate limiter for such copies; otherwise a legitimate destination
-        // heard on multiple interfaces would be falsely rate-limited.
-        let emission_known = handler
-            .send_ctx
-            .path_table
-            .read()
-            .unwrap()
-            .knows_emission(&packet.destination, packet);
-        if !emission_known
-            && let Some(blocked_until) = handler.announce_limits.check(&packet.destination)
-        {
-            handler.announces_rate_limited += 1;
-            log::info!(
-                "tp({}): too many announces from {}, blocked for {} seconds",
-                handler.config.name,
-                &packet.destination,
-                blocked_until.as_secs(),
-            );
-            return;
-        }
-
         // Ingress burst limiting: drop announces that arrive faster than
         // the interface can reasonably process (default threshold ~10 Hz).
+        // Applied before signature validation, matching the Python reference
+        // (`Transport.should_ingress_limit()`), since it only throttles a
+        // single interface for a short burst.
         if handler.send_ctx.iface_manager.lock().await.ingress_record_announce(&iface) {
             log::trace!(
                 "tp({}): dropping announce from {} due to ingress burst limiting",
@@ -3516,6 +3494,39 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
         }
 
         let destination = Arc::new(Mutex::new(destination));
+
+        // Per-destination announce rate limiting. Deliberately applied after
+        // signature validation so that unauthenticated announces can never
+        // consume rate-limit state or extend a block for a victim destination
+        // hash. This matches the Python reference, which validates the
+        // announce (`Transport.validate_announce()`) before rate-limiting it
+        // inside `should_add`. Path responses are exempt from the rate limiter.
+        if packet.context != PacketContext::PathResponse {
+            // A single announce emission carries the same hop-invariant packet
+            // hash on every interface it is heard on, so a duplicate copy of an
+            // emission that was already recorded in the path table is not a new
+            // announce from the destination. Skip the per-destination announce
+            // rate limiter for such copies; otherwise a legitimate destination
+            // heard on multiple interfaces would be falsely rate-limited.
+            let emission_known = handler
+                .send_ctx
+                .path_table
+                .read()
+                .unwrap()
+                .knows_emission(&packet.destination, packet);
+            if !emission_known
+                && let Some(blocked_until) = handler.announce_limits.check(&packet.destination)
+            {
+                handler.announces_rate_limited += 1;
+                log::info!(
+                    "tp({}): too many announces from {}, blocked for {} seconds",
+                    handler.config.name,
+                    &packet.destination,
+                    blocked_until.as_secs(),
+                );
+                return;
+            }
+        }
 
         log::trace!(
             "tp({}): validated announce destination_hash={} identity_hash={} iface={} \
@@ -6112,6 +6123,76 @@ mod tests {
         assert_eq!(m.announces_rate_limited, 1);
         // The announnce should NOT have populated the path table
         assert_eq!(m.path_table_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_announces_cannot_extend_rate_limit_block() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+        let remote_destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "metrics.invalid"),
+        );
+        let announce = remote_destination
+            .announce(&mut rng, None)
+            .expect("valid announce");
+        let destination = announce.destination;
+        let iface = AddressHash::new_from_rand(&mut rng);
+
+        // Pre-block the destination, the state an attacker would try to keep
+        // permanently starved by flooding unauthenticated announces.
+        {
+            let mut guard = handler.lock().await;
+            guard
+                .announce_limits
+                .force_block(destination, Duration::from_secs(60));
+        }
+
+        // Corrupt the signature of announce copies so validation fails while
+        // the destination hash (the DoS target) is preserved.
+        let sig_offset = PUBLIC_KEY_LENGTH * 2
+            + crate::destination::NAME_HASH_LENGTH
+            + crate::destination::RAND_HASH_LENGTH;
+        let blocked_before = {
+            let guard = handler.lock().await;
+            guard
+                .announce_limits
+                .entries()
+                .find(|(hash, _)| **hash == destination)
+                .map(|(_, entry)| entry.blocked_until)
+                .expect("rate-limit entry exists")
+        };
+
+        for i in 0..8 {
+            let mut bogus = announce.clone();
+            let mut bytes = bogus.data.as_slice().to_vec();
+            bytes[sig_offset + i] ^= 0xff;
+            bogus.data = PacketDataBuffer::new_from_slice(&bytes);
+
+            let mut pending = PendingSends::new();
+            let mut h = handler.lock().await;
+            handle_announce(&bogus, &mut *h, &mut pending, iface, None, None).await;
+            drop(h);
+        }
+
+        let m = transport.metrics().await;
+        assert_eq!(m.announces_rate_limited, 0);
+        assert_eq!(m.path_table_entries, 0);
+
+        let blocked_after = {
+            let guard = handler.lock().await;
+            guard
+                .announce_limits
+                .entries()
+                .find(|(hash, _)| **hash == destination)
+                .map(|(_, entry)| entry.blocked_until)
+                .expect("rate-limit entry exists")
+        };
+        assert!(
+            blocked_after.saturating_duration_since(blocked_before) < Duration::from_secs(1),
+            "unauthenticated announces must not extend the victim's rate-limit block"
+        );
     }
 
     #[tokio::test]
