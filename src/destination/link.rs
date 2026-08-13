@@ -593,48 +593,14 @@ impl Link {
                     log::error!("link({}): can't decrypt channel packet", self.id);
                 }
             }
-            PacketContext::Resource | PacketContext::ResourceProof => {
-                // Resource parts and proofs are never encrypted at the packet
-                // layer (matching the Python reference): the resource takes
-                // care of its own encryption on the whole stream, and each
-                // part packet carries a raw slice of that encrypted stream.
-                // Resource proofs are likewise sent unencrypted. Advancing
-                // the link ratchet is handled by the other encrypted contexts.
-                log::trace!(
-                    "link({}): resource packet ctx={:?} {}B",
-                    self.id,
-                    packet.context,
-                    packet.data.len(),
-                );
-                self.request_time = Instant::now();
-                self.post_event(LinkEvent::Resource(LinkResourcePacket {
-                    context: packet.context,
-                    data: packet.data.as_slice().to_vec(),
-                    packet_hash: packet.hash(),
-                }));
-            }
-            PacketContext::ResourceAdvertisement
+            PacketContext::Resource
+            | PacketContext::ResourceProof
+            | PacketContext::ResourceAdvertisement
             | PacketContext::ResourceRequest
             | PacketContext::ResourceHashUpdate
             | PacketContext::ResourceInitiatorCancel
             | PacketContext::ResourceReceiverCancel => {
-                let mut buffer = vec![0u8; decrypt_buf_len];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
-                    log::trace!(
-                        "link({}): resource packet ctx={:?} {}B",
-                        self.id,
-                        packet.context,
-                        plain_text.len(),
-                    );
-                    self.request_time = Instant::now();
-                    self.post_event(LinkEvent::Resource(LinkResourcePacket {
-                        context: packet.context,
-                        data: plain_text.to_vec(),
-                        packet_hash: packet.hash(),
-                    }));
-                } else {
-                    log::error!("link({}): can't decrypt resource packet", self.id);
-                }
+                return self.handle_resource_packet(packet);
             }
             PacketContext::KeepAlive => {
                 if packet.data.len() >= 1 && packet.data.as_slice()[0] == 0xFF {
@@ -696,9 +662,70 @@ impl Link {
 
         match packet.header.packet_type {
             PacketType::Data => return self.handle_data_packet(packet, out_link),
-            PacketType::Proof => return self.handle_proof_packet(packet),
+            PacketType::Proof => {
+                // Resource proofs are PROOF packets with a RESOURCE_PRF context
+                // (matching the Python reference). Route them to the resource
+                // handler; link-request and message proofs stay in
+                // handle_proof_packet.
+                if packet.context == PacketContext::ResourceProof {
+                    return self.handle_resource_packet(packet);
+                }
+                return self.handle_proof_packet(packet);
+            }
             _ => return LinkHandleResult::None,
         }
+    }
+
+    fn handle_resource_packet(&mut self, packet: &Packet) -> LinkHandleResult {
+        match packet.context {
+            PacketContext::Resource | PacketContext::ResourceProof => {
+                // Resource parts and proofs are never encrypted at the packet
+                // layer (matching the Python reference): the resource takes
+                // care of its own encryption on the whole stream, and each
+                // part packet carries a raw slice of that encrypted stream.
+                // Resource proofs are likewise sent unencrypted. Advancing
+                // the link ratchet is handled by the other encrypted contexts.
+                log::trace!(
+                    "link({}): resource packet ctx={:?} {}B",
+                    self.id,
+                    packet.context,
+                    packet.data.len(),
+                );
+                self.request_time = Instant::now();
+                self.post_event(LinkEvent::Resource(LinkResourcePacket {
+                    context: packet.context,
+                    data: packet.data.as_slice().to_vec(),
+                    packet_hash: packet.hash(),
+                }));
+            }
+            PacketContext::ResourceAdvertisement
+            | PacketContext::ResourceRequest
+            | PacketContext::ResourceHashUpdate
+            | PacketContext::ResourceInitiatorCancel
+            | PacketContext::ResourceReceiverCancel => {
+                let decrypt_buf_len = self.mdu().max(PACKET_MDU);
+                let mut buffer = vec![0u8; decrypt_buf_len];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!(
+                        "link({}): resource packet ctx={:?} {}B",
+                        self.id,
+                        packet.context,
+                        plain_text.len(),
+                    );
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::Resource(LinkResourcePacket {
+                        context: packet.context,
+                        data: plain_text.to_vec(),
+                        packet_hash: packet.hash(),
+                    }));
+                } else {
+                    log::error!("link({}): can't decrypt resource packet", self.id);
+                }
+            }
+            _ => {}
+        }
+
+        LinkHandleResult::None
     }
 
     fn handle_proof_packet(&mut self, packet: &Packet) -> LinkHandleResult {
@@ -759,24 +786,25 @@ impl Link {
     /// each part carries a slice of that encrypted stream. The payload must
     /// fit within the link MDU.
     pub fn resource_part_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
-        self.raw_data_packet(data, PacketContext::Resource)
+        self.raw_data_packet(data, PacketContext::Resource, PacketType::Data)
     }
 
     /// Build a raw resource proof packet (matching the Python reference).
     ///
-    /// Resource proofs are sent unencrypted over the link. The payload must
-    /// fit within the link MDU.
+    /// Resource proofs are sent unencrypted over the link as PROOF packets
+    /// with a RESOURCE_PRF context. The payload must fit within the link MDU.
     pub fn resource_proof_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
-        self.raw_data_packet(data, PacketContext::ResourceProof)
+        self.raw_data_packet(data, PacketContext::ResourceProof, PacketType::Proof)
     }
 
-    /// Build an unencrypted data packet addressed to this link's peer.
+    /// Build an unencrypted packet addressed to this link's peer.
     /// Used for resource parts and proofs, which are never encrypted at the
     /// packet layer. The payload must fit within the link MDU.
     fn raw_data_packet(
         &self,
         data: &[u8],
         context: PacketContext,
+        packet_type: PacketType,
     ) -> Result<Packet, RnsError> {
         if self.status != LinkStatus::Active && self.status != LinkStatus::Stale {
             log::warn!("link: can't create data packet for closed link");
@@ -789,7 +817,7 @@ impl Link {
         Ok(Packet {
             header: Header {
                 destination_type: DestinationType::Link,
-                packet_type: PacketType::Data,
+                packet_type,
                 ..Default::default()
             },
             ifac: None,
@@ -1473,7 +1501,7 @@ mod tests {
 
     use super::{
         ChannelEnvelope, ChannelMessage, KEEPALIVE_INTERVAL, LINK_MTU_SIZE, Link, LinkEvent,
-        LinkHandleResult, LinkStatus,
+        LinkEventData, LinkHandleResult, LinkStatus,
     };
     use std::time::{Duration, Instant};
 
@@ -1995,5 +2023,37 @@ mod tests {
             link.request_retry_due(),
             "a restarted link should send a fresh request promptly"
         );
+    }
+
+    #[test]
+    fn resource_proof_is_proof_packet_and_routed_to_resource_handler() {
+        let (out_link, mut in_link, _, mut in_event_rx) = create_active_link_pair();
+
+        let proof_data = b"proof-blob".to_vec();
+        let proof = out_link
+            .resource_proof_packet(&proof_data)
+            .expect("resource proof packet");
+
+        // Matching the Python reference, resource proofs are PROOF packets
+        // with a RESOURCE_PRF context, sent unencrypted over the link.
+        assert_eq!(proof.header.packet_type, PacketType::Proof);
+        assert_eq!(proof.context, PacketContext::ResourceProof);
+        assert_eq!(proof.destination, out_link.id);
+        assert_eq!(proof.data.as_slice(), proof_data.as_slice());
+
+        let result = in_link.handle_packet(&proof, false);
+        assert!(matches!(result, LinkHandleResult::None));
+
+        let event_data = in_event_rx
+            .try_recv()
+            .expect("expected a resource event on the link");
+        match event_data.event {
+            LinkEvent::Resource(resource) => {
+                assert_eq!(resource.context, PacketContext::ResourceProof);
+                assert_eq!(resource.data, proof_data);
+                assert_eq!(resource.packet_hash, proof.hash());
+            }
+            other => panic!("expected resource event, got other event"),
+        }
     }
 }
