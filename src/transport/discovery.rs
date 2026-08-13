@@ -391,9 +391,14 @@ impl DiscoveredInterface {
         let ifac_netname = get_string(map, KEY_IFAC_NETNAME)?;
         let ifac_netkey = get_string(map, KEY_IFAC_NETKEY)?;
 
-        if transport_id != source.identity.address_hash {
-            return Err(RnsError::IncorrectHash);
-        }
+        // The announced transport identity is intentionally independent of
+        // the announce's source identity.  Python's `InterfaceAnnouncer`
+        // announces the discovery destination using the configured network
+        // identity while embedding `RNS.Transport.identity.hash` as the
+        // TRANSPORT_ID field (Discovery.py:55-58, 133); `InterfaceAnnounce
+        // Handler` stores the two as separate `transport_id`/`network_id`
+        // fields and never requires them to match.  Requiring equality here
+        // would reject legitimate Python peers, so no cross-check is applied.
 
         let frequency = get_u64(map, KEY_FREQUENCY)?;
         let bandwidth = get_f64(map, KEY_BANDWIDTH)?;
@@ -936,6 +941,29 @@ mod tests {
             DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
         assert_eq!(decoded.name, "Strong Stamp Node");
         assert!(decoded.stamp_value >= DEFAULT_STAMP_COST);
+    }
+
+    /// A discovery announce whose transport_id differs from the announced
+    /// source identity must still be accepted.  Python announces the
+    /// discovery destination under the network identity while embedding the
+    /// transport identity as TRANSPORT_ID; the two are independent fields
+    /// and must not be required to match.
+    #[test]
+    fn transport_id_independent_from_announce_identity() {
+        let identity = PrivateIdentity::new_from_name("discovery");
+        let source_desc = create_discovery_destination(identity).desc;
+        let transport_id = AddressHash::new([0x42; 16]);
+
+        let app_data = build_discovery_app_data_with_difficulty(
+            discovery_info(&transport_id, "Network Identity Node"),
+            16,
+        );
+
+        let decoded =
+            DiscoveredInterface::from_announce(source_desc, 1, app_data.as_slice()).unwrap();
+        assert_eq!(decoded.name, "Network Identity Node");
+        assert_eq!(decoded.transport_id, transport_id);
+        assert_ne!(decoded.transport_id, source_desc.identity.address_hash);
     }
 
     /// The required value is configurable: a stamp with difficulty 14 is
