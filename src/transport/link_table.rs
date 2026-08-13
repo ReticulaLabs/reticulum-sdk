@@ -182,20 +182,22 @@ impl LinkTable {
         }
 
         let outbound_iface = if entry.next_hop_iface == entry.received_from {
-            if entry.next_hop_iface == received_on {
-                log::trace!(
-                    "link_table: skipping forward link data {} to iface {} (same as received_on)",
-                    packet.destination,
-                    received_on,
-                );
-                None
-            } else if packet.header.hops == entry.remaining_hops
+            // The link is carried on a single shared medium, so the
+            // receiving and outbound interface are the same. Direction
+            // doesn't matter: simply repeat the packet on that interface,
+            // matching the Python reference (Transport.py "Link transport
+            // handling"). This also covers the common single-interface
+            // node, where `received_on` always equals the shared interface
+            // — packets must NOT be dropped just because they arrived on
+            // the very interface we would transmit them on (loop prevention
+            // is handled by the hop-count checks below).
+            if packet.header.hops == entry.remaining_hops
                 || packet.header.hops == entry.taken_hops
             {
                 Some(entry.next_hop_iface)
             } else {
                 log::trace!(
-                    "link_table: hop mismatch for link {} on iface {}: \
+                    "link_table: hop mismatch for link {} on shared iface {}: \
                      packet_hops={} remaining_hops={} taken_hops={}",
                     packet.destination,
                     received_on,
@@ -414,6 +416,45 @@ mod tests {
         assert_eq!(iface, request_iface);
         assert_eq!(forwarded.header.hops, 0);
         assert_eq!(forwarded.transport, None);
+    }
+
+    #[test]
+    fn forwards_link_data_on_single_shared_medium() {
+        // A node with a single shared-medium interface (e.g. one radio):
+        // next_hop and received_from are the same interface, and every
+        // inbound packet arrives on it. The link table must repeat link
+        // data back out that interface (hop-checked), not drop it just
+        // because the packet arrived on the same interface it would be
+        // transmitted on.
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let shared_iface = AddressHash::new_from_slice(b"shared-medium");
+        let request = link_request(destination);
+        let link_id = LinkId::from(&request);
+        let mut table = LinkTable::new();
+
+        table.add(&request, destination, shared_iface, shared_iface, 0);
+
+        let proof = link_data(link_id, 0);
+        table
+            .handle_proof(&proof)
+            .expect("link proof forwards")
+            .propagation;
+
+        // Data received on the shared interface with a matching hop count
+        // must be forwarded back out the same interface.
+        let forward = link_data(link_id, 0);
+        let (forwarded, iface) = table
+            .handle_packet(&forward, shared_iface)
+            .expect("link data forwards on the shared medium");
+        assert_eq!(iface, shared_iface);
+        assert_eq!(forwarded.header.hops, 0);
+
+        // Hop-count mismatch still prevents loops.
+        let mismatched = link_data(link_id, 1);
+        assert!(
+            table.handle_packet(&mismatched, shared_iface).is_none(),
+            "link data with mismatched hop count must not be forwarded"
+        );
     }
 
     #[test]
