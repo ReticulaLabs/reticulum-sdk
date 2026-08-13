@@ -1,6 +1,6 @@
 [package]
 name = "reticulum-sdk"
-version = "2.2.14"
+version = "2.2.15"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
@@ -41,15 +41,15 @@ sha2 = "0.10.8"
 bzip2 = "0.6"
 
 # Random Number generator
-rand_core = "0.10.0"
+rand_core = "0.10"
 
 # GPIO character device (Linux /dev/gpiochipN). v2 ABI; works on
 # mcp2221_gpio and any other modern GPIO driver.
 gpio-cdev = "0.6"
 
 # Async IO
-tokio = { version = "1.44.2", features = ["full"] }
-tokio-util = "0.7.15"
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = "0.7.19"
 tokio-serial = "5.4.5"
 libc = "0.2.172"
 
