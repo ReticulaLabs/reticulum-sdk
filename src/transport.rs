@@ -3812,6 +3812,34 @@ fn should_rebroadcast_inbound_packet(packet: &Packet) -> bool {
         && packet.header.hops == 1
 }
 
+/// Plan the redistribution of a first-hop plain broadcast, matching the
+/// Python reference (`Transport._process_incoming`): a broadcast received
+/// from a local-client (RPC instance) interface is relayed on all other
+/// attached interfaces, while a broadcast heard on a network interface is
+/// only relayed to attached local-client interfaces.  Returns the outbound
+/// messages to enqueue.
+fn plan_plain_broadcast_redistribution(
+    packet: &Packet,
+    ingress_iface: AddressHash,
+    from_local_client: bool,
+    local_clients: impl Iterator<Item = AddressHash>,
+) -> Vec<TxMessage> {
+    if from_local_client {
+        vec![TxMessage {
+            tx_type: TxMessageType::Broadcast(Some(ingress_iface)),
+            packet: packet.clone(),
+        }]
+    } else {
+        local_clients
+            .filter(|addr| *addr != ingress_iface)
+            .map(|local_iface| TxMessage {
+                tx_type: TxMessageType::Direct(local_iface),
+                packet: packet.clone(),
+            })
+            .collect()
+    }
+}
+
 async fn handle_link_request_as_destination(
     destination: Arc<Mutex<SingleInputDestination>>,
     packet: &Packet,
@@ -4551,12 +4579,25 @@ async fn manage_transport(
                     }
 
                     if handler.config.broadcast && should_rebroadcast_inbound_packet(&packet) {
-                        // Plain first-hop broadcasts are not inserted into transport. Repeat
-                        // them locally, and leave routed traffic to the path/link tables.
-                        pending.push(TxMessage {
-                            tx_type: TxMessageType::Broadcast(Some(message.address)),
-                            packet: packet.clone(),
-                        });
+                        // Plain first-hop broadcasts are not inserted into
+                        // transport.  Repeat them locally, matching the
+                        // Python reference: broadcasts from local-client
+                        // (RPC instance) interfaces are relayed on all other
+                        // interfaces, while broadcasts from network
+                        // interfaces are only relayed to attached local
+                        // clients.
+                        let mgr = handler.send_ctx.iface_manager.lock().await;
+                        let from_local_client = mgr.is_rpc_instance_client(&message.address);
+                        let redistribution = plan_plain_broadcast_redistribution(
+                            &packet,
+                            message.address,
+                            from_local_client,
+                            mgr.rpc_instance_clients_except(message.address).into_iter(),
+                        );
+                        drop(mgr);
+                        for msg in redistribution {
+                            pending.push(msg);
+                        }
                     }
 
                     let snr = message.snr;
@@ -5362,6 +5403,62 @@ mod tests {
         transported.header.propagation_type = PropagationType::Transport;
         transported.transport = Some(AddressHash::new_from_slice(b"next-hop"));
         assert!(!should_rebroadcast_inbound_packet(&transported));
+    }
+
+    #[test]
+    fn plain_broadcast_redistribution_matches_python() {
+        let packet = inbound_packet_for_rebroadcast();
+        let ingress = AddressHash::new([0x11; 16]);
+        let client_a = AddressHash::new([0x22; 16]);
+        let client_b = AddressHash::new([0x33; 16]);
+        let net_iface = AddressHash::new([0x44; 16]);
+
+        // Broadcast received from a local-client interface is relayed on all
+        // other interfaces: a single Broadcast(Some(ingress)), which
+        // send_flush expands to every interface except the ingress.
+        let msgs = plan_plain_broadcast_redistribution(
+            &packet,
+            ingress,
+            true,
+            vec![client_a, client_b, net_iface].into_iter(),
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].tx_type, TxMessageType::Broadcast(Some(ingress)));
+
+        // Broadcast heard on a network interface is relayed only to attached
+        // local-client interfaces, one Direct message per client. The
+        // ingress network interface is never a target.
+        let msgs = plan_plain_broadcast_redistribution(
+            &packet,
+            net_iface,
+            false,
+            vec![client_a, client_b].into_iter(),
+        );
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().all(|m| m.tx_type == TxMessageType::Direct(client_a)
+            || m.tx_type == TxMessageType::Direct(client_b)));
+        assert!(
+            msgs.iter()
+                .all(|m| m.tx_type != TxMessageType::Direct(net_iface))
+        );
+
+        // No local clients attached and a network-origin broadcast → the
+        // packet is not relayed anywhere.
+        let msgs =
+            plan_plain_broadcast_redistribution(&packet, net_iface, false, std::iter::empty());
+        assert!(msgs.is_empty());
+
+        // The ingress interface is excluded even if it appears in the
+        // local-client set (defensive; a non-client ingress cannot be a
+        // local client in practice).
+        let msgs = plan_plain_broadcast_redistribution(
+            &packet,
+            client_a,
+            false,
+            vec![client_a, client_b].into_iter(),
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].tx_type, TxMessageType::Direct(client_b));
     }
 
     #[test]

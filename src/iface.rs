@@ -1732,6 +1732,16 @@ impl InterfaceManager {
             .collect()
     }
 
+    /// Returns `true` if the interface at `address` is an RPC instance
+    /// client (Python's "local client interface").  Used to distinguish
+    /// plain broadcasts originating from local clients from those heard on
+    /// the wider network, which are redistributed differently.
+    pub fn is_rpc_instance_client(&self, address: &AddressHash) -> bool {
+        self.ifaces.iter().any(|iface| {
+            iface.address == *address && iface.rpc_instance_client && !iface.stop.is_cancelled()
+        })
+    }
+
     /// Return the hardware MTU registered for the interface at `address`,
     /// or `None` if the interface does not participate in MTU upgrades or
     /// is no longer active.
