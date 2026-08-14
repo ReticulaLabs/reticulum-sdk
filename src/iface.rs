@@ -305,6 +305,23 @@ fn packet_wire_len(packet: &Packet) -> usize {
     2 + transport_size + ADDRESS_HASH_SIZE + 1 + packet.data.len()
 }
 
+/// Sleep for a data-pacing delay. Sub-millisecond pacing waits are spun on
+/// rather than passed to `tokio::time::sleep`, whose timer wake-up overhead
+/// dominates tiny delays. At high packet rates a per-packet timer sleep
+/// (even for a few microseconds) throttles throughput far below the intended
+/// pacing rate on fast, reliable links.
+pub(crate) async fn sleep_pacing(wait: Duration) {
+    const SPIN_THRESHOLD: Duration = Duration::from_micros(1000);
+    if wait < SPIN_THRESHOLD {
+        let deadline = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+    } else {
+        time::sleep(wait).await;
+    }
+}
+
 /// Queue length snapshot for a single interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceQueueLength {
@@ -1756,7 +1773,7 @@ impl InterfaceManager {
     pub async fn send(&self, message: TxMessage) {
         let wait = self.send_pacing_delay(&message).await;
         if wait > Duration::ZERO {
-            time::sleep(wait).await;
+            sleep_pacing(wait).await;
         }
         self.send_flush(message).await;
     }

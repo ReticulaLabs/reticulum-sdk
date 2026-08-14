@@ -56,6 +56,7 @@ use crate::identity::{PUBLIC_KEY_LENGTH, PrivateIdentity};
 use crate::iface::InterfaceManager;
 use crate::iface::InterfaceMode;
 use crate::iface::InterfaceQueueLengths;
+use crate::iface::sleep_pacing;
 use crate::iface::InterfaceRxReceiver;
 use crate::iface::NamedReconnectPacerMetrics;
 use crate::iface::RxMessage;
@@ -406,7 +407,7 @@ impl SendCtx {
             mgr.send_pacing_delay(&message).await
         };
         if wait > Duration::ZERO {
-            time::sleep(wait).await;
+            sleep_pacing(wait).await;
         }
         self.iface_manager.lock().await.send_flush(message).await;
     }
@@ -419,7 +420,7 @@ impl SendCtx {
             mgr.send_pacing_delay(&message).await
         };
         if wait > Duration::ZERO {
-            time::sleep(wait).await;
+            sleep_pacing(wait).await;
         }
         self.iface_manager.lock().await.send_flush(message).await;
     }
