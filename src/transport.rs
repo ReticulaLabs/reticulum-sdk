@@ -338,37 +338,66 @@ struct SendCtx {
     path_table: std::sync::RwLock<PathTable>,
     packet_cache: std::sync::Mutex<PacketCache>,
     iface_manager: Arc<Mutex<InterfaceManager>>,
+    /// Maps the hash of each established link to the interface the link is
+    /// carried on. Link data packets are addressed to the ephemeral link
+    /// hash, which is never announced and therefore never present in the
+    /// path table; this mirrors Python's `Link.attached_interface` and lets
+    /// outbound link packets be sent directly on that interface instead of
+    /// being broadcast on every interface.
+    link_ifaces: std::sync::RwLock<HashMap<AddressHash, AddressHash>>,
 }
 
 impl SendCtx {
-    async fn send_packet(&self, name: &str, packet: Packet) {
-        let message = {
-            let destination = packet.destination;
-            let pt = self.path_table.read().unwrap();
-            let (packet, maybe_iface) = pt.handle_packet(packet);
-            let tx_type = if let Some(iface) = maybe_iface {
-                drop(pt);
-                self.path_table.write().unwrap().refresh(&destination);
-                log::trace!(
-                    "tp({name}): outbound packet dst={} ctx={:?} over iface={}",
-                    packet.destination,
-                    packet.context,
-                    iface,
-                );
-                TxMessageType::Direct(iface)
-            } else {
-                log::trace!(
-                    "tp({name}): outbound broadcast dst={} ctx={:?} type={:?}",
-                    packet.destination,
-                    packet.context,
-                    packet.header.packet_type,
-                );
-                TxMessageType::Broadcast(None)
+    /// Build the transmit message for a packet. Link-addressed packets are
+    /// routed directly to the interface the link is attached to; all other
+    /// packets are routed through the path table.
+    fn prepare(&self, packet: Packet) -> TxMessage {
+        let destination = packet.destination;
+
+        if packet.header.destination_type == DestinationType::Link {
+            let tx_type = match self.link_ifaces.read().unwrap().get(&destination).copied() {
+                Some(iface) => TxMessageType::Direct(iface),
+                None => TxMessageType::Broadcast(None),
             };
             let message = TxMessage { tx_type, packet };
             self.packet_cache.lock().unwrap().update(&message.packet);
-            message
+            return message;
+        }
+
+        let pt = self.path_table.read().unwrap();
+        let (packet, maybe_iface) = pt.handle_packet(packet);
+        let tx_type = if let Some(iface) = maybe_iface {
+            drop(pt);
+            self.path_table.write().unwrap().refresh(&destination);
+            TxMessageType::Direct(iface)
+        } else {
+            TxMessageType::Broadcast(None)
         };
+        let message = TxMessage { tx_type, packet };
+        self.packet_cache.lock().unwrap().update(&message.packet);
+        message
+    }
+
+    async fn send_packet(&self, name: &str, packet: Packet) {
+        let message = self.prepare(packet);
+        match message.tx_type {
+            TxMessageType::Direct(iface) => {
+                log::trace!(
+                    "tp({name}): outbound packet dst={} ctx={:?} over iface={}",
+                    message.packet.destination,
+                    message.packet.context,
+                    iface,
+                );
+            }
+            _ => {
+                log::trace!(
+                    "tp({name}): outbound broadcast dst={} ctx={:?} type={:?}",
+                    message.packet.destination,
+                    message.packet.context,
+                    message.packet.header.packet_type,
+                );
+            }
+        }
 
         // Compute pacing delay before locking so the sleep does not
         // block the InterfaceManager for other interfaces.
@@ -396,19 +425,7 @@ impl SendCtx {
     }
 
     fn prepare_send_packet(&self, packet: Packet) -> TxMessage {
-        let destination = packet.destination;
-        let pt = self.path_table.read().unwrap();
-        let (packet, maybe_iface) = pt.handle_packet(packet);
-        let tx_type = if let Some(iface) = maybe_iface {
-            drop(pt);
-            self.path_table.write().unwrap().refresh(&destination);
-            TxMessageType::Direct(iface)
-        } else {
-            TxMessageType::Broadcast(None)
-        };
-        let message = TxMessage { tx_type, packet };
-        self.packet_cache.lock().unwrap().update(&message.packet);
-        message
+        self.prepare(packet)
     }
 }
 
@@ -822,6 +839,7 @@ impl Transport {
             path_table: std::sync::RwLock::new(PathTable::new(config.reroute_eager)),
             packet_cache: std::sync::Mutex::new(PacketCache::new()),
             iface_manager: iface_manager.clone(),
+            link_ifaces: std::sync::RwLock::new(HashMap::new()),
         });
         let handler = Arc::new(Mutex::new(TransportHandler {
             config,
@@ -3012,6 +3030,15 @@ async fn handle_proof(
                     handler.config.name,
                     link.id(),
                 );
+                // The link is now established: record which interface it is
+                // carried on so outbound link packets route directly rather
+                // than falling back to broadcast.
+                handler
+                    .send_ctx
+                    .link_ifaces
+                    .write()
+                    .unwrap()
+                    .insert(packet.destination, iface);
                 let rtt_packet = link.create_rtt();
                 pending.push(handler.send_ctx.prepare_send_packet(rtt_packet));
 
@@ -3909,16 +3936,27 @@ async fn handle_link_request_as_destination(
                 let prove_packet = link.prove();
                 pending.push(handler.send_ctx.prepare_send_packet(prove_packet));
 
+                let link_id = *link.id();
                 log::debug!(
                     "tp({}): save input link {} for destination {}",
                     handler.config.name,
-                    link.id(),
+                    link_id,
                     link.destination().address_hash
                 );
 
+                // Record which interface the link arrived on so outbound
+                // link packets (proofs, etc.) route directly instead of
+                // falling back to broadcast.
+                handler
+                    .send_ctx
+                    .link_ifaces
+                    .write()
+                    .unwrap()
+                    .insert(link_id, iface);
+
                 handler
                     .in_links
-                    .insert(*link.id(), Arc::new(Mutex::new(link)));
+                    .insert(link_id, Arc::new(Mutex::new(link)));
             }
         }
         DestinationHandleStatus::None => {}
@@ -4192,6 +4230,7 @@ async fn handle_check_links(
 
     for addr in &links_to_remove {
         handler.in_links.remove(&addr);
+        handler.send_ctx.link_ifaces.write().unwrap().remove(addr);
     }
 
     links_to_remove.clear();
@@ -4356,6 +4395,7 @@ async fn handle_check_links(
     }
     for link_id in &out_link_ids_to_remove {
         handler.out_links_by_link_id.remove(&link_id);
+        handler.send_ctx.link_ifaces.write().unwrap().remove(link_id);
     }
 
     for (dest, blocked_if) in &rediscover_destinations {
@@ -6110,6 +6150,73 @@ mod tests {
         );
         assert_eq!(sent.packet.destination, destination);
         assert_eq!(sent.packet.transport, Some(next_hop));
+    }
+
+    #[tokio::test]
+    async fn send_packet_routes_link_packets_via_attached_interface() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let (iface, mut tx) = {
+            let iface_manager = transport.iface_manager();
+            let mut iface_manager = iface_manager.lock().await;
+            let channel = iface_manager.new_channel(4);
+            (*channel.address(), channel.tx_channel)
+        };
+        let link_id = AddressHash::new_from_slice(b"link-route-test");
+
+        // An established link records the interface it is attached to.
+        {
+            let mut h = handler.lock().await;
+            h.send_ctx
+                .link_ifaces
+                .write()
+                .unwrap()
+                .insert(link_id, iface);
+        }
+
+        let mut packet: Packet = Default::default();
+        packet.header.destination_type = DestinationType::Link;
+        packet.header.packet_type = PacketType::Data;
+        packet.destination = link_id;
+        packet.data = PacketDataBuffer::new_from_slice(b"payload");
+
+        transport.send_packet(packet).await;
+
+        let sent = time::timeout(Duration::from_secs(1), tx.recv())
+            .await
+            .expect("routed link packet")
+            .expect("routed link packet message");
+        assert_eq!(sent.tx_type, TxMessageType::Direct(iface));
+        assert_eq!(sent.packet.destination, link_id);
+    }
+
+    #[tokio::test]
+    async fn send_packet_broadcasts_link_packet_without_attached_interface() {
+        let transport = Transport::new(Default::default());
+        let (iface, mut tx) = {
+            let iface_manager = transport.iface_manager();
+            let mut iface_manager = iface_manager.lock().await;
+            let channel = iface_manager.new_channel(4);
+            (*channel.address(), channel.tx_channel)
+        };
+        let link_id = AddressHash::new_from_slice(b"unattached-link");
+
+        let mut packet: Packet = Default::default();
+        packet.header.destination_type = DestinationType::Link;
+        packet.header.packet_type = PacketType::Data;
+        packet.destination = link_id;
+        packet.data = PacketDataBuffer::new_from_slice(b"payload");
+
+        // No attached interface recorded: fall back to broadcast, matching
+        // the behaviour for links whose interface is not yet known.
+        transport.send_packet(packet).await;
+
+        let sent = time::timeout(Duration::from_secs(1), tx.recv())
+            .await
+            .expect("broadcast link packet")
+            .expect("broadcast link packet message");
+        assert_eq!(sent.tx_type, TxMessageType::Broadcast(None));
+        let _ = iface;
     }
 
     #[tokio::test]
