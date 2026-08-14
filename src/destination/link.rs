@@ -590,20 +590,27 @@ impl Link {
             PacketContext::Channel => {
                 let mut buffer = vec![0u8; decrypt_buf_len];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    // Channel messages are only proven when the link opts in
+                    // via `prove_messages`, mirroring Python's
+                    // `Destination.proof_strategy` gating. Per-packet proofs
+                    // double the link's packet rate and add an Ed25519
+                    // signature per message, which dominates the receive
+                    // path cost on high-throughput links.
+                    let proof = if self.proves_messages {
+                        Some(self.message_proof(packet.hash()))
+                    } else {
+                        None
+                    };
                     if let Some(ref tx) = self.channel_tx {
                         let _ = tx.send(plain_text.to_vec());
                         self.request_time = Instant::now();
-                        return LinkHandleResult::MessageReceived(Some(
-                            self.message_proof(packet.hash()),
-                        ));
+                        return LinkHandleResult::MessageReceived(proof);
                     }
                     match ChannelEnvelope::unpack(plain_text) {
                         Ok(envelope) => {
                             self.request_time = Instant::now();
                             self.handle_channel_envelope(envelope);
-                            return LinkHandleResult::MessageReceived(Some(
-                                self.message_proof(packet.hash()),
-                            ));
+                            return LinkHandleResult::MessageReceived(proof);
                         }
                         Err(err) => {
                             log::warn!("link({}): invalid channel packet: {err:?}", self.id);
@@ -1846,6 +1853,8 @@ mod tests {
     #[test]
     fn channel_packet_uses_channel_context_and_sequence() {
         let (mut out_link, mut in_link, _out_events, mut in_events) = create_active_link_pair();
+        // Opt in to per-message proofs so the proof header is verified.
+        in_link.prove_messages(true);
         let message = TestChannelMessage(b"hello".to_vec());
         let packet = out_link.channel_packet(&message).expect("channel packet");
 
@@ -1933,13 +1942,13 @@ mod tests {
 
         assert!(matches!(
             in_link.handle_packet(&second, false),
-            LinkHandleResult::MessageReceived(Some(_))
+            LinkHandleResult::MessageReceived(_)
         ));
         assert!(in_events.try_recv().is_err());
 
         assert!(matches!(
             in_link.handle_packet(&first, false),
-            LinkHandleResult::MessageReceived(Some(_))
+            LinkHandleResult::MessageReceived(_)
         ));
 
         let event = in_events.try_recv().expect("first channel event");
@@ -1993,7 +2002,7 @@ mod tests {
         for packet in packets[1..].iter().rev() {
             assert!(matches!(
                 in_link.handle_packet(packet, false),
-                LinkHandleResult::MessageReceived(Some(_))
+                LinkHandleResult::MessageReceived(_)
             ));
         }
         assert!(in_events.try_recv().is_err());
@@ -2001,7 +2010,7 @@ mod tests {
         // The head (sequence 0) fills the gap and the whole burst flushes.
         assert!(matches!(
             in_link.handle_packet(&packets[0], false),
-            LinkHandleResult::MessageReceived(Some(_))
+            LinkHandleResult::MessageReceived(_)
         ));
         let mut seen = Vec::new();
         while let Ok(ev) = in_events.try_recv() {
@@ -2031,7 +2040,7 @@ mod tests {
         for packet in &packets[1..6] {
             assert!(matches!(
                 in_link.handle_packet(packet, false),
-                LinkHandleResult::MessageReceived(Some(_))
+                LinkHandleResult::MessageReceived(_)
             ));
         }
         assert!(in_events.try_recv().is_err());
@@ -2044,7 +2053,7 @@ mod tests {
         );
         assert!(matches!(
             in_link.handle_packet(&packets[6], false),
-            LinkHandleResult::MessageReceived(Some(_))
+            LinkHandleResult::MessageReceived(_)
         ));
 
         let mut seen = Vec::new();
@@ -2072,7 +2081,7 @@ mod tests {
         // link resynchronises instead of discarding the stream.
         assert!(matches!(
             in_link.handle_packet(&packet, false),
-            LinkHandleResult::MessageReceived(Some(_))
+            LinkHandleResult::MessageReceived(_)
         ));
         let event = in_events.try_recv().expect("resync channel event");
         match event.event {
@@ -2097,7 +2106,7 @@ mod tests {
                 .expect("channel packet");
             assert!(matches!(
                 in_link.handle_packet(&packet, false),
-                LinkHandleResult::MessageReceived(Some(_))
+                LinkHandleResult::MessageReceived(_)
             ));
             let event = in_events.try_recv().expect("channel event");
             match event.event {
