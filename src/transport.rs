@@ -4576,8 +4576,19 @@ async fn manage_transport(
                     break;
                 };
 
-                warn_if_event_channel_full(&iface_messages_tx, event_channel_capacity, "iface_messages", &tp_name);
-                let _ = iface_messages_tx.send(message.clone());
+                // Mirror the packet to attached RPC/management clients. This
+                // is only useful while at least one client is subscribed, so
+                // skip the per-packet clone+broadcast otherwise (it would
+                // otherwise cost a full packet copy on every hop).
+                if iface_messages_tx.receiver_count() > 0 {
+                    warn_if_event_channel_full(
+                        &iface_messages_tx,
+                        event_channel_capacity,
+                        "iface_messages",
+                        &tp_name,
+                    );
+                    let _ = iface_messages_tx.send(message.clone());
+                }
 
                 let mut packet = message.packet;
                 packet.header.hops = packet.header.hops.saturating_add(1);

@@ -470,9 +470,17 @@ impl BackboneClient {
                                     Ok(n) => {
                                         frame_buffer.extend_from_slice(&tcp_buffer[..n]);
 
-                                        while let Some(frame) = Hdlc::find(&frame_buffer[..]) {
-                                            let frame_bytes = frame_buffer[frame.0..frame.1 + 1].to_vec();
-                                            frame_buffer.drain(..frame.1 + 1);
+                                        // Process each HDLC frame in place, tracking
+                                        // `consumed` bytes and compacting the buffer once
+                                        // per TCP read. Draining per frame is O(n) each
+                                        // (and Hdlc::find re-scans), which becomes O(n²)
+                                        // per read at high packet rates.
+                                        let mut consumed = 0;
+                                        while let Some(frame) = Hdlc::find(&frame_buffer[consumed..]) {
+                                            let start = consumed + frame.0;
+                                            let end = consumed + frame.1;
+                                            let frame_bytes = frame_buffer[start..end + 1].to_vec();
+                                            consumed = end + 1;
 
                                             hdlc_rx_buffer.resize(frame_bytes.len(), 0);
                                             let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
@@ -543,6 +551,11 @@ impl BackboneClient {
                                             }
                                         }
 
+                                        // Compact the buffer once per read, keeping any
+                                        // trailing partial frame for the next read.
+                                        if consumed > 0 {
+                                            frame_buffer.drain(..consumed);
+                                        }
                                         if frame_buffer.len() > MAX_AUTOCONFIGURED_HW_MTU {
                                             log::warn!(
                                                 "backbone_client: dropping oversized partial hdlc frame iface={} peer=<{}> buffered_len={} max_len={}",
