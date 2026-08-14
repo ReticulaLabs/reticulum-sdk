@@ -1,6 +1,7 @@
 use ed25519_dalek::{SIGNATURE_LENGTH, Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::error::RnsError;
 use crate::packet::{Header, IfacFlag, Packet, PacketIfac};
@@ -193,7 +194,7 @@ impl IfacConfig {
         let expected_bytes = expected.to_bytes();
         let expected_truncated = &expected_bytes[SIGNATURE_LENGTH - self.ifac_len..];
 
-        if expected_truncated == ifac {
+        if bool::from(expected_truncated.ct_eq(ifac)) {
             Ok(clean)
         } else {
             Err(RnsError::IncorrectSignature)
@@ -244,7 +245,7 @@ impl IfacConfig {
             let expected = self.sign_key.sign(signed_data);
             let expected_bytes = expected.to_bytes();
             let expected_truncated = &expected_bytes[SIGNATURE_LENGTH - ifac_bytes.len()..];
-            if expected_truncated == ifac_bytes {
+            if bool::from(expected_truncated.ct_eq(ifac_bytes)) {
                 Ok(())
             } else {
                 Err(RnsError::IncorrectSignature)
