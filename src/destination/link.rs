@@ -25,7 +25,20 @@ pub(crate) const LINK_MODE_AES256_CBC: u8 = 0x01;
 const CHANNEL_HEADER_SIZE: usize = 6;
 const CHANNEL_SEQUENCE_MAX: u16 = u16::MAX;
 const CHANNEL_SEQUENCE_MODULUS: u32 = CHANNEL_SEQUENCE_MAX as u32 + 1;
-const CHANNEL_WINDOW_MAX: u16 = 48;
+/// Maximum number of channel sequences the receiver will buffer while
+/// waiting for an out-of-order head. Sized to absorb the burst and queue
+/// reordering that high-throughput links (up to 5-10 Gbps) can produce:
+/// at ~500-byte packets this covers ~8 MiB of reordered data. Must stay
+/// well below half the 16-bit sequence modulus (32768) so that forward
+/// and backward sequence distances remain unambiguous.
+const CHANNEL_WINDOW_MAX: u16 = 16384;
+
+/// How long the channel receiver will wait for a missing sequence while
+/// holding buffered packets before concluding the packet was lost and
+/// flushing the reorder buffer so the stream keeps making progress.
+/// Without this, a single lost packet stalls delivery of every subsequent
+/// channel message indefinitely.
+const CHANNEL_REORDER_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Keepalive interval for active links. Matches Python's `Link.KEEPALIVE`
 /// (360 seconds): a keepalive is only sent when the link has been quiet
@@ -308,6 +321,11 @@ pub struct Link {
     next_channel_sequence: u16,
     next_rx_channel_sequence: u16,
     channel_rx_ring: Vec<ChannelEnvelope>,
+    /// When the receiver started waiting for a missing sequence while
+    /// holding buffered packets. Set when a gap is first observed and
+    /// reset whenever delivery makes progress or the buffer empties. Used
+    /// to trigger loss recovery via `CHANNEL_REORDER_TIMEOUT`.
+    channel_rx_stall_since: Option<Instant>,
     channel_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 }
 
@@ -336,6 +354,7 @@ impl Link {
             next_channel_sequence: 0,
             next_rx_channel_sequence: 0,
             channel_rx_ring: Vec::new(),
+            channel_rx_stall_since: None,
             channel_tx: None,
         }
     }
@@ -396,6 +415,7 @@ impl Link {
             next_channel_sequence: 0,
             next_rx_channel_sequence: 0,
             channel_rx_ring: Vec::new(),
+            channel_rx_stall_since: None,
             channel_tx: None,
         };
 
@@ -915,19 +935,94 @@ impl Link {
     }
 
     fn handle_channel_envelope(&mut self, envelope: ChannelEnvelope) {
-        if !self.channel_sequence_in_window(envelope.sequence) {
+        let mut distance =
+            channel_sequence_distance(self.next_rx_channel_sequence, envelope.sequence);
+
+        // Stale or very late packets behind the expected position can never
+        // be delivered in order; drop them rather than feeding them back
+        // into the reorder logic (or worse, into the loss-recovery flush).
+        if distance >= CHANNEL_SEQUENCE_MODULUS / 2 {
             log::trace!(
-                "link({}): invalid channel sequence {}",
+                "link({}): late channel sequence {} (expected {})",
                 self.id,
-                envelope.sequence
+                envelope.sequence,
+                self.next_rx_channel_sequence
             );
             return;
         }
 
-        if self
-            .channel_rx_ring
-            .iter()
-            .any(|existing| existing.sequence == envelope.sequence)
+        let stall_expired = self
+            .channel_rx_stall_since
+            .is_some_and(|since| since.elapsed() >= CHANNEL_REORDER_TIMEOUT);
+
+        // Loss recovery for a stalled reorder buffer. Fires when there is
+        // buffered data waiting on a missing head AND either:
+        //   * the head has been missing for longer than
+        //     CHANNEL_REORDER_TIMEOUT (slow trickle / genuine loss), or
+        //   * the incoming packet falls outside the reorder window (the
+        //     buffer filled up in milliseconds under a high-rate burst).
+        // In both cases the missing head is treated as lost: the buffered
+        // packets are delivered (in order, gaps skipped) so the stream
+        // keeps making progress instead of stalling forever.
+        if !self.channel_rx_ring.is_empty()
+            && (stall_expired || distance >= CHANNEL_WINDOW_MAX as u32)
+        {
+            log::debug!(
+                "link({}): channel reorder recovery (expected sequence {}, {} buffered, \
+                 stall={}ms, gap={}) flushing to recover from loss",
+                self.id,
+                self.next_rx_channel_sequence,
+                self.channel_rx_ring.len(),
+                self.channel_rx_stall_since
+                    .map_or(0, |since| since.elapsed().as_millis()),
+                distance,
+            );
+            self.flush_channel_rx_ring();
+            distance = channel_sequence_distance(self.next_rx_channel_sequence, envelope.sequence);
+            // After the flush the incoming packet may be a duplicate of an
+            // already-delivered sequence; drop it if it is now behind.
+            if distance >= CHANNEL_SEQUENCE_MODULUS / 2 {
+                log::trace!(
+                    "link({}): late channel sequence {} after recovery",
+                    self.id,
+                    envelope.sequence
+                );
+                return;
+            }
+        }
+
+        if distance >= CHANNEL_WINDOW_MAX as u32 {
+            if self.channel_rx_ring.is_empty() {
+                // The expected position is stale and nothing is buffered:
+                // the stream jumped far ahead (e.g. after a long outage or
+                // heavy loss). Resynchronise to the incoming sequence so
+                // the channel does not discard every subsequent packet.
+                log::debug!(
+                    "link({}): channel stream resynchronised at sequence {}",
+                    self.id,
+                    envelope.sequence
+                );
+                self.next_rx_channel_sequence = envelope.sequence.wrapping_add(1);
+                self.post_event(LinkEvent::Channel(envelope));
+            } else {
+                log::trace!(
+                    "link({}): invalid channel sequence {}",
+                    self.id,
+                    envelope.sequence
+                );
+            }
+            return;
+        }
+
+        // Binary-search the insertion point to keep the buffer ordered by
+        // sequence distance from the expected position. This stays correct
+        // as `next_rx_channel_sequence` advances: every buffered sequence
+        // shares the same offset, so their relative order is invariant.
+        let pos = self.channel_rx_ring.partition_point(|existing| {
+            channel_sequence_distance(self.next_rx_channel_sequence, existing.sequence) < distance
+        });
+        if pos < self.channel_rx_ring.len()
+            && self.channel_rx_ring[pos].sequence == envelope.sequence
         {
             log::trace!(
                 "link({}): duplicate channel sequence {}",
@@ -937,25 +1032,49 @@ impl Link {
             return;
         }
 
-        self.channel_rx_ring.push(envelope);
-        self.channel_rx_ring.sort_by_key(|envelope| {
-            channel_sequence_distance(self.next_rx_channel_sequence, envelope.sequence)
-        });
+        self.channel_rx_ring.insert(pos, envelope);
 
-        while let Some(index) = self
-            .channel_rx_ring
-            .iter()
-            .position(|envelope| envelope.sequence == self.next_rx_channel_sequence)
-        {
-            let envelope = self.channel_rx_ring.remove(index);
-            self.next_rx_channel_sequence = self.next_rx_channel_sequence.wrapping_add(1);
-            self.post_event(LinkEvent::Channel(envelope));
+        let delivered = self.deliver_contiguous_channel_rx();
+        if self.channel_rx_ring.is_empty() {
+            self.channel_rx_stall_since = None;
+        } else if delivered || self.channel_rx_stall_since.is_none() {
+            // Delivery advanced the expected sequence (a new head is now
+            // missing) or we started buffering behind a gap. Restart the
+            // stall clock so loss recovery stays bounded.
+            self.channel_rx_stall_since = Some(Instant::now());
         }
     }
 
-    fn channel_sequence_in_window(&self, sequence: u16) -> bool {
-        channel_sequence_distance(self.next_rx_channel_sequence, sequence)
-            < CHANNEL_WINDOW_MAX as u32
+    /// Deliver every buffered envelope in sequence order, advancing the
+    /// expected sequence past any gaps. Used to recover from lost packets
+    /// after the reorder stall has been exceeded.
+    fn flush_channel_rx_ring(&mut self) {
+        let envelopes: Vec<_> = self.channel_rx_ring.drain(..).collect();
+        for envelope in envelopes {
+            self.next_rx_channel_sequence = envelope.sequence.wrapping_add(1);
+            self.post_event(LinkEvent::Channel(envelope));
+        }
+        self.channel_rx_stall_since = None;
+    }
+
+    /// Deliver the contiguous run of buffered envelopes starting at the
+    /// expected sequence, returning whether any were delivered.
+    fn deliver_contiguous_channel_rx(&mut self) -> bool {
+        let mut count = 0;
+        while count < self.channel_rx_ring.len()
+            && self.channel_rx_ring[count].sequence == self.next_rx_channel_sequence
+        {
+            self.next_rx_channel_sequence = self.next_rx_channel_sequence.wrapping_add(1);
+            count += 1;
+        }
+        if count == 0 {
+            return false;
+        }
+        let envelopes: Vec<_> = self.channel_rx_ring.drain(0..count).collect();
+        for envelope in envelopes {
+            self.post_event(LinkEvent::Channel(envelope));
+        }
+        true
     }
 
     pub fn identify_packet(&self, identity: &PrivateIdentity) -> Result<Packet, RnsError> {
@@ -1558,13 +1677,24 @@ mod tests {
         tokio::sync::broadcast::Receiver<super::LinkEventData>,
         tokio::sync::broadcast::Receiver<super::LinkEventData>,
     ) {
+        create_active_link_pair_with_capacity(8)
+    }
+
+    fn create_active_link_pair_with_capacity(
+        capacity: usize,
+    ) -> (
+        Link,
+        Link,
+        tokio::sync::broadcast::Receiver<super::LinkEventData>,
+        tokio::sync::broadcast::Receiver<super::LinkEventData>,
+    ) {
         let identity = PrivateIdentity::new_from_name("link owner");
         let destination = SingleInputDestination::new(
             identity,
             DestinationName::new("example_utilities", "link.requests"),
         );
-        let (out_event_tx, mut out_event_rx) = tokio::sync::broadcast::channel(8);
-        let (in_event_tx, mut in_event_rx) = tokio::sync::broadcast::channel(8);
+        let (out_event_tx, mut out_event_rx) = tokio::sync::broadcast::channel(capacity);
+        let (in_event_tx, mut in_event_rx) = tokio::sync::broadcast::channel(capacity);
 
         let mut out_link = Link::new(destination.desc, out_event_tx);
         let link_request = out_link.request(None);
@@ -1839,6 +1969,143 @@ mod tests {
             .expect("system channel packet");
 
         assert_eq!(packet.context, PacketContext::Channel);
+    }
+
+    #[test]
+    fn channel_receive_buffers_large_out_of_order_burst_and_delivers_in_order() {
+        // A burst larger than the old 48-packet window must be buffered and
+        // then delivered in sequence order once the heads arrive.
+        let (mut out_link, mut in_link, _out_events, mut in_events) =
+            create_active_link_pair_with_capacity(super::CHANNEL_WINDOW_MAX as usize + 8);
+        // A modest burst that still exceeds the old 48-packet window by a
+        // wide margin, but completes quickly enough that the 500 ms stall
+        // recovery does not interfere.
+        let count: usize = 512;
+        let packets: Vec<_> = (0..count)
+            .map(|i| {
+                out_link
+                    .channel_raw_packet(0x1234, &i.to_be_bytes())
+                    .expect("channel packet")
+            })
+            .collect();
+
+        // Deliver all but the first in reverse order; nothing may be emitted.
+        for packet in packets[1..].iter().rev() {
+            assert!(matches!(
+                in_link.handle_packet(packet, false),
+                LinkHandleResult::MessageReceived(Some(_))
+            ));
+        }
+        assert!(in_events.try_recv().is_err());
+
+        // The head (sequence 0) fills the gap and the whole burst flushes.
+        assert!(matches!(
+            in_link.handle_packet(&packets[0], false),
+            LinkHandleResult::MessageReceived(Some(_))
+        ));
+        let mut seen = Vec::new();
+        while let Ok(ev) = in_events.try_recv() {
+            match ev.event {
+                LinkEvent::Channel(envelope) => seen.push(envelope.sequence),
+                _ => unreachable!("unexpected link event"),
+            }
+        }
+        assert_eq!(seen, (0..count as u16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn channel_receive_recovers_from_lost_sequence_after_stall_timeout() {
+        // Sequence 0 is lost. Everything after it is buffered, and once the
+        // stall exceeds CHANNEL_REORDER_TIMEOUT the buffer is flushed (gaps
+        // skipped) so the stream keeps making progress.
+        let (mut out_link, mut in_link, _out_events, mut in_events) = create_active_link_pair();
+        let packets: Vec<_> = (0..7)
+            .map(|i| {
+                out_link
+                    .channel_raw_packet(0x1234, &[i])
+                    .expect("channel packet")
+            })
+            .collect();
+
+        // Feed 1..=5; sequence 0 is missing.
+        for packet in &packets[1..6] {
+            assert!(matches!(
+                in_link.handle_packet(packet, false),
+                LinkHandleResult::MessageReceived(Some(_))
+            ));
+        }
+        assert!(in_events.try_recv().is_err());
+        assert!(in_link.channel_rx_stall_since.is_some());
+
+        // Force the stall to have expired, then a subsequent arrival
+        // triggers recovery and flushes the buffered packets.
+        in_link.channel_rx_stall_since = Some(
+            Instant::now() - super::CHANNEL_REORDER_TIMEOUT - Duration::from_secs(1),
+        );
+        assert!(matches!(
+            in_link.handle_packet(&packets[6], false),
+            LinkHandleResult::MessageReceived(Some(_))
+        ));
+
+        let mut seen = Vec::new();
+        while let Ok(ev) = in_events.try_recv() {
+            match ev.event {
+                LinkEvent::Channel(envelope) => seen.push(envelope.sequence),
+                _ => unreachable!("unexpected link event"),
+            }
+        }
+        // 0 was lost; 1..=6 are delivered in order and the stream advances.
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(in_link.next_rx_channel_sequence, 7);
+        assert!(in_link.channel_rx_stall_since.is_none());
+    }
+
+    #[test]
+    fn channel_receive_resynchronises_when_stream_jumps_ahead() {
+        let (mut out_link, mut in_link, _out_events, mut in_events) = create_active_link_pair();
+        out_link.next_channel_sequence = 20000;
+        let packet = out_link
+            .channel_raw_packet(0x1234, b"jump")
+            .expect("channel packet");
+
+        // Nothing buffered and the sequence is far outside the window: the
+        // link resynchronises instead of discarding the stream.
+        assert!(matches!(
+            in_link.handle_packet(&packet, false),
+            LinkHandleResult::MessageReceived(Some(_))
+        ));
+        let event = in_events.try_recv().expect("resync channel event");
+        match event.event {
+            LinkEvent::Channel(envelope) => {
+                assert_eq!(envelope.sequence, 20000);
+                assert_eq!(envelope.payload, b"jump");
+            }
+            _ => unreachable!("unexpected link event"),
+        }
+        assert_eq!(in_link.next_rx_channel_sequence, 20001);
+    }
+
+    #[test]
+    fn channel_receive_handles_sequence_wraparound() {
+        let (mut out_link, mut in_link, _out_events, mut in_events) = create_active_link_pair();
+        in_link.next_rx_channel_sequence = u16::MAX - 1;
+        out_link.next_channel_sequence = u16::MAX - 1;
+
+        for expected in [u16::MAX - 1, u16::MAX, 0, 1] {
+            let packet = out_link
+                .channel_raw_packet(0x1234, &expected.to_be_bytes())
+                .expect("channel packet");
+            assert!(matches!(
+                in_link.handle_packet(&packet, false),
+                LinkHandleResult::MessageReceived(Some(_))
+            ));
+            let event = in_events.try_recv().expect("channel event");
+            match event.event {
+                LinkEvent::Channel(envelope) => assert_eq!(envelope.sequence, expected),
+                _ => unreachable!("unexpected link event"),
+            }
+        }
+        assert_eq!(in_link.next_rx_channel_sequence, 2);
     }
 
     fn keepalive_test_link() -> Link {
