@@ -2911,6 +2911,7 @@ impl TransportHandler {
         on_iface: Option<AddressHash>,
         log_destination: &AddressHash,
         log_label: &str,
+        search_mode_filter: Option<&'static [InterfaceMode]>,
     ) -> bool {
         let ifaces = {
             let mgr = self.send_ctx.iface_manager.lock().await;
@@ -2921,6 +2922,13 @@ impl TransportHandler {
         for iface_addr in &ifaces {
             if let Some(ref on) = on_iface {
                 if iface_addr == on {
+                    continue;
+                }
+            }
+
+            if let Some(filter) = search_mode_filter {
+                let mgr = self.send_ctx.iface_manager.lock().await;
+                if !filter.contains(&mgr.interface_mode(iface_addr)) {
                     continue;
                 }
             }
@@ -2974,7 +2982,7 @@ impl TransportHandler {
         // interfaces whose outgoing PR rate is below the threshold
         // (EGRESS_PR_FREQ, default 5 Hz).
         let sent_any = self
-            .forward_via_non_hot_ifaces(&packet, pending, on_iface, address, "path request")
+            .forward_via_non_hot_ifaces(&packet, pending, on_iface, address, "path request", None)
             .await;
 
         // Fallback: if no interface accepted the PR (e.g. all were hot
@@ -3793,11 +3801,21 @@ async fn handle_path_request(
             // Python: only forward recursive path requests when the
             // requesting interface has `recursive_prs` enabled, or its
             // mode is in DISCOVER_PATHS_FOR (AccessPoint, Gateway,
-            // Roaming, Internal).
-            let should_search = {
+            // Roaming, Internal), or it is a Boundary interface. In the
+            // Boundary case the search is restricted to Boundary and
+            // Gateway interfaces (BOUNDARY_SEARCH_MODES).
+            let (should_search, search_mode_filter) = {
                 let mgr = handler.send_ctx.iface_manager.lock().await;
-                mgr.recursive_prs_for_iface(&iface)
-                    || InterfaceMode::DISCOVER_PATHS_FOR.contains(&mgr.interface_mode(&iface))
+                let mode = mgr.interface_mode(&iface);
+                if mgr.recursive_prs_for_iface(&iface) {
+                    (true, None)
+                } else if InterfaceMode::DISCOVER_PATHS_FOR.contains(&mode) {
+                    (true, None)
+                } else if mode == InterfaceMode::Boundary {
+                    (true, Some(InterfaceMode::BOUNDARY_SEARCH_MODES))
+                } else {
+                    (false, None)
+                }
             };
 
             if should_search {
@@ -3813,6 +3831,7 @@ async fn handle_path_request(
                         Some(iface),
                         &request.destination,
                         "recursive PR",
+                        search_mode_filter,
                     )
                     .await;
 

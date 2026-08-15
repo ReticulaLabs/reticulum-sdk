@@ -525,6 +525,14 @@ impl InterfaceMode {
         InterfaceMode::Internal,
     ];
 
+    /// Which interface modes a recursive path request received on a
+    /// `Boundary` interface may be forwarded to (matching Python's
+    /// `BOUNDARY_SEARCH_MODES`).
+    pub const BOUNDARY_SEARCH_MODES: &'static [InterfaceMode] = &[
+        InterfaceMode::Boundary,
+        InterfaceMode::Gateway,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             InterfaceMode::Full => "full",
