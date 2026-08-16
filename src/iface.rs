@@ -1520,32 +1520,14 @@ impl InterfaceManager {
             return false;
         }
 
-        let dropped = ingress_record_impl(
+        ingress_record_impl(
             &iface.ia_freq_deque,
             &iface.ingress_burst_active,
             &iface.ingress_burst_activated,
             iface.ingress_created_at,
             INGRESS_BURST_FREQ_NEW,
             INGRESS_BURST_FREQ,
-        );
-
-        // Aggregated ingress burst control: if any sibling (same parent)
-        // is in burst state, treat this interface as burst-active too.
-        // Uses AtomicBool::load to avoid per-sibling lock acquisitions.
-        if !dropped {
-            if let Some(parent) = iface.parent_interface {
-                for sibling in &self.ifaces {
-                    if sibling.address != *address
-                        && sibling.parent_interface == Some(parent)
-                        && sibling.ingress_burst_active.load(Ordering::Relaxed)
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        dropped
+        )
     }
 
     /// Record an incoming path request on an interface and return `true`
@@ -1560,29 +1542,14 @@ impl InterfaceManager {
             return false;
         }
 
-        let dropped = ingress_record_impl(
+        ingress_record_impl(
             &iface.ip_freq_deque,
             &iface.ingress_pr_burst_active,
             &iface.ingress_pr_burst_activated,
             iface.ingress_created_at,
             INGRESS_PR_BURST_FREQ_NEW,
             INGRESS_PR_BURST_FREQ,
-        );
-
-        if !dropped {
-            if let Some(parent) = iface.parent_interface {
-                for sibling in &self.ifaces {
-                    if sibling.address != *address
-                        && sibling.parent_interface == Some(parent)
-                        && sibling.ingress_pr_burst_active.load(Ordering::Relaxed)
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        dropped
+        )
     }
 
     /// Evaluate and update ingress burst state for all interfaces.
