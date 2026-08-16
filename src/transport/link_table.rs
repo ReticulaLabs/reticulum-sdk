@@ -262,25 +262,94 @@ impl LinkTable {
     /// Process an incoming proof packet for a relayed link.
     ///
     /// Returns `Some(HandleProofOutcome)` if a link entry exists for the
-    /// proof's destination. The outcome contains the packet/iface to forward
-    /// the proof to, and (only for LRPROOF context, only if the entry has
-    /// not already been rebalanced) an optional rebalance request describing
-    /// the authoritative hop count learned from the proof.
-    pub fn handle_proof(&mut self, proof: &Packet) -> Option<HandleProofOutcome> {
+    /// proof's destination AND the proof arrives on the correct interface
+    /// with a matching hop count for its direction.  The outbound interface
+    /// is chosen with the same directional logic as `handle_packet`,
+    /// matching Python's link-transport handling (Transport.py:1704-1739):
+    /// a proof received on the destination-side interface (`next_hop_iface`)
+    /// with `hops == remaining_hops` is forwarded toward the initiator
+    /// (`received_from`), and a proof received on the initiator-side
+    /// interface with `hops == taken_hops` is forwarded toward the
+    /// destination.  Only link-request proofs (`LRPROOF`) mark the entry
+    /// validated and update `remaining_hops`; ordinary message proofs are
+    /// routed without mutating the entry's state.
+    pub fn handle_proof(
+        &mut self,
+        proof: &Packet,
+        received_on: AddressHash,
+    ) -> Option<HandleProofOutcome> {
         let entry = self.0.get_mut(&proof.destination)?;
+        let is_lrproof = proof.context == PacketContext::LinkRequestProof;
 
-        log::trace!(
-            "link_table: forward proof for link {} ({} hops, ctx={:?}) to {}",
-            proof.destination,
-            proof.header.hops,
-            proof.context,
-            entry.received_from,
-        );
+        let outbound_iface = if entry.next_hop_iface == entry.received_from {
+            // The link is carried on a single shared medium: direction
+            // doesn't matter, just repeat the proof there if the hop count
+            // matches one of the expected values (LRPROOFs are tolerated on
+            // any hop count — the proof is authoritative and rebalances).
+            if proof.header.hops == entry.remaining_hops
+                || proof.header.hops == entry.taken_hops
+                || is_lrproof
+            {
+                Some(entry.next_hop_iface)
+            } else {
+                log::trace!(
+                    "link_table: proof hop mismatch for link {} on shared iface {}: \
+                     packet_hops={} remaining_hops={} taken_hops={}",
+                    proof.destination,
+                    received_on,
+                    proof.header.hops,
+                    entry.remaining_hops,
+                    entry.taken_hops,
+                );
+                None
+            }
+        } else if received_on == entry.next_hop_iface {
+            // Destination side: an LRPROOF is authoritative and rebalances
+            // (its hop count overrides the stored remaining_hops), so it is
+            // always forwarded toward the initiator.  Message proofs must
+            // match the destination-side hop count.
+            if is_lrproof || proof.header.hops == entry.remaining_hops {
+                Some(entry.received_from)
+            } else {
+                log::trace!(
+                    "link_table: proof hop mismatch for link {} from next-hop iface {}: \
+                     packet_hops={} remaining_hops={}",
+                    proof.destination,
+                    received_on,
+                    proof.header.hops,
+                    entry.remaining_hops,
+                );
+                None
+            }
+        } else if received_on == entry.received_from {
+            if proof.header.hops == entry.taken_hops {
+                Some(entry.next_hop_iface)
+            } else {
+                log::trace!(
+                    "link_table: proof hop mismatch for link {} from received-from iface {}: \
+                     packet_hops={} taken_hops={}",
+                    proof.destination,
+                    received_on,
+                    proof.header.hops,
+                    entry.taken_hops,
+                );
+                None
+            }
+        } else {
+            log::trace!(
+                "link_table: no matching interface for proof of link {} (received_on={}, \
+                 next_hop={}, received_from={})",
+                proof.destination,
+                received_on,
+                entry.next_hop_iface,
+                entry.received_from,
+            );
+            None
+        };
 
-        entry.remaining_hops = proof.header.hops;
-        entry.validated = true;
+        let outbound_iface = outbound_iface?;
 
-        let rebalance = if proof.context == PacketContext::LinkRequestProof && !entry.rebalanced {
+        let rebalance = if is_lrproof && !entry.rebalanced {
             entry.rebalanced = true;
             Some(RebalanceInfo {
                 destination: entry.original_destination,
@@ -290,8 +359,26 @@ impl LinkTable {
             None
         };
 
+        // Only a validated link-request proof establishes/updates the entry.
+        // Ordinary message proofs are routed without mutating the entry.
+        if is_lrproof {
+            entry.remaining_hops = proof.header.hops;
+            entry.validated = true;
+        }
+
+        entry.timestamp = Instant::now();
+        entry.forward_count += 1;
+
+        log::trace!(
+            "link_table: forward proof for link {} ({} hops, ctx={:?}) to {}",
+            proof.destination,
+            proof.header.hops,
+            proof.context,
+            outbound_iface,
+        );
+
         Some(HandleProofOutcome {
-            propagation: propagate(proof, entry.received_from),
+            propagation: propagate(proof, outbound_iface),
             rebalance,
         })
     }
@@ -384,6 +471,22 @@ mod tests {
         }
     }
 
+    fn link_proof(link_id: LinkId, hops: u8) -> Packet {
+        Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+                hops,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::LinkRequestProof,
+            data: Default::default(),
+        }
+    }
+
     #[test]
     fn forwards_validated_link_packets_in_both_directions() {
         let destination = AddressHash::new_from_slice(b"link-destination");
@@ -395,9 +498,10 @@ mod tests {
 
         table.add(&request, destination, request_iface, destination_iface, 0);
 
-        let proof = link_data(link_id, 0);
+        // A link-request proof establishes (validates) the relayed link.
+        let proof = link_proof(link_id, 0);
         table
-            .handle_proof(&proof)
+            .handle_proof(&proof, destination_iface)
             .expect("link proof forwards")
             .propagation;
 
@@ -434,9 +538,9 @@ mod tests {
 
         table.add(&request, destination, shared_iface, shared_iface, 0);
 
-        let proof = link_data(link_id, 0);
+        let proof = link_proof(link_id, 0);
         table
-            .handle_proof(&proof)
+            .handle_proof(&proof, shared_iface)
             .expect("link proof forwards")
             .propagation;
 
@@ -468,9 +572,9 @@ mod tests {
 
         table.add(&request, destination, request_iface, destination_iface, 0);
 
-        let proof = link_data(link_id, 0);
+        let proof = link_proof(link_id, 0);
         table
-            .handle_proof(&proof)
+            .handle_proof(&proof, destination_iface)
             .expect("link proof forwards")
             .propagation;
 
@@ -527,7 +631,7 @@ mod tests {
         };
 
         let (propagated, _iface) = table
-            .handle_proof(&proof)
+            .handle_proof(&proof, destination_iface)
             .expect("proof should be forwarded")
             .propagation;
 
@@ -577,7 +681,7 @@ mod tests {
         };
 
         let outcome = table
-            .handle_proof(&lrproof)
+            .handle_proof(&lrproof, destination_iface)
             .expect("lrproof should be forwarded");
 
         let rebalance = outcome
@@ -589,7 +693,7 @@ mod tests {
 
         // Second LRPROOF for the same link must NOT signal another rebalance.
         let outcome2 = table
-            .handle_proof(&lrproof)
+            .handle_proof(&lrproof, destination_iface)
             .expect("lrproof forwards on second receipt");
         assert!(
             outcome2.rebalance.is_none(),
@@ -625,11 +729,101 @@ mod tests {
         };
 
         let outcome = table
-            .handle_proof(&regular_proof)
+            .handle_proof(&regular_proof, destination_iface)
             .expect("regular proof should forward");
         assert!(
             outcome.rebalance.is_none(),
             "non-LRPROOF context must never signal a rebalance"
+        );
+    }
+
+    #[test]
+    fn message_proofs_forward_directionally_without_mutating_entry() {
+        // A relayed link carried on two distinct interfaces: the initiator is
+        // reached via `request_iface` (taken_hops=1) and the destination via
+        // `destination_iface` (remaining_hops=2).  Ordinary message proofs
+        // must be routed in the direction indicated by the interface + hop
+        // count and must NOT mutate the entry's hop counts or validated flag.
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let request_iface = AddressHash::new_from_slice(b"request-iface");
+        let destination_iface = AddressHash::new_from_slice(b"destination-iface");
+        let mut request = link_request(destination);
+        request.header.hops = 1;
+        let link_id = LinkId::from(&request);
+        let mut table = LinkTable::new();
+
+        table.add(&request, destination, request_iface, destination_iface, 2);
+
+        // A proof coming back from the destination side (hops == remaining).
+        let dest_side = Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+                hops: 2,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::None,
+            data: Default::default(),
+        };
+        let (_, iface) = table
+            .handle_proof(&dest_side, destination_iface)
+            .expect("destination-side proof forwards toward initiator")
+            .propagation;
+        assert_eq!(iface, request_iface);
+
+        // A proof from the initiator side (hops == taken) goes to the
+        // destination side.
+        let init_side = Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+                hops: 1,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::None,
+            data: Default::default(),
+        };
+        let (_, iface) = table
+            .handle_proof(&init_side, request_iface)
+            .expect("initiator-side proof forwards toward destination")
+            .propagation;
+        assert_eq!(iface, destination_iface);
+
+        // Message proofs must not have validated the entry or changed the
+        // hop counts (only an LRPROOF does that).
+        let entry = table.0.get(&link_id).unwrap();
+        assert!(!entry.validated, "message proof must not validate the entry");
+        assert_eq!(entry.taken_hops, 1);
+        assert_eq!(entry.remaining_hops, 2);
+
+        // A proof arriving on the wrong interface must be dropped.
+        assert!(
+            table.handle_proof(&dest_side, request_iface).is_none(),
+            "proof received on the wrong interface must be dropped"
+        );
+        // And a hop-count mismatch for the direction must be dropped too.
+        let bad_hops = Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+                hops: 5,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: link_id,
+            transport: None,
+            context: PacketContext::None,
+            data: Default::default(),
+        };
+        assert!(
+            table.handle_proof(&bad_hops, destination_iface).is_none(),
+            "proof with mismatched hop count for its direction must be dropped"
         );
     }
 

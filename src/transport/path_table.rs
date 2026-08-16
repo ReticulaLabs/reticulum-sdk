@@ -34,6 +34,11 @@ pub struct PathEntry {
     path_expiry: Duration,
     random_blobs: Vec<RandomBlob>,
     state: PathState,
+    /// The announce packet that installed this path.  Cached so the node can
+    /// answer onward path requests for destinations it learned about via a
+    /// path response (or whose announce has left the announce retransmit
+    /// table), matching Python's `IDX_PT_PACKET` (Transport.py).
+    announce: Option<Packet>,
 }
 
 pub struct PathTable {
@@ -92,6 +97,13 @@ impl PathTable {
         self.map
             .get(destination)
             .map(|entry| (entry.received_from, entry.iface, entry.hops))
+    }
+
+    /// The announce packet that installed the path for `destination`, if any.
+    /// Used to answer onward path requests even when the announce has already
+    /// left the announce retransmit table.
+    pub fn path_announce(&self, destination: &AddressHash) -> Option<Packet> {
+        self.map.get(destination).and_then(|e| e.announce.clone())
     }
 
     pub fn next_hop_iface(&self, destination: &AddressHash) -> Option<AddressHash> {
@@ -175,6 +187,7 @@ self_referential_transport={}",
                 .map(|entry| entry.updated_random_blobs(random_blob))
                 .unwrap_or_else(|| random_blob.into_iter().collect()),
             state: PathState::Unknown,
+            announce: Some(announce.clone()),
         };
 
         self.map.insert(announce.destination, new_entry);

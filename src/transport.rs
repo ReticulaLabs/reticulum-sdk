@@ -3078,7 +3078,7 @@ async fn handle_proof(
         let _ = handler.receipt_tx.send(receipt);
     }
 
-    let outcome = handler.link_table.handle_proof(packet);
+    let outcome = handler.link_table.handle_proof(packet, iface);
 
     if let Some(outcome) = outcome {
         if let Some(rebalance) = outcome.rebalance
@@ -3481,21 +3481,14 @@ async fn handle_announce(
         return;
     }
 
-    if packet.context != PacketContext::PathResponse {
-        // Ingress burst limiting: drop announces that arrive faster than
-        // the interface can reasonably process (default threshold ~10 Hz).
-        // Applied before signature validation, matching the Python reference
-        // (`Transport.should_ingress_limit()`), since it only throttles a
-        // single interface for a short burst.
-        if handler.send_ctx.iface_manager.lock().await.ingress_record_announce(&iface) {
-            log::trace!(
-                "tp({}): dropping announce from {} due to ingress burst limiting",
-                handler.config.name,
-                packet.destination,
-            );
-            return;
-        }
-    }
+    // The announce's ingress burst-limiting state is recorded inside
+    // `handle_announce` after signature validation, mirroring the Python
+    // reference (Transport.py:1749-1765): only validated announces count
+    // toward the burst budget, and the limiter is only consulted for
+    // destinations that are not already known.  Re-announces of known
+    // destinations that refresh an existing path must never be dropped by
+    // the ingress limiter (they are governed by normal announce rate
+    // limiting instead).
 
     if log::log_enabled!(log::Level::Trace) {
         let hash = packet.hash();
@@ -3536,6 +3529,38 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
                 identity_hash,
             );
             return;
+        }
+
+        // Ingress burst limiting only applies to destinations that are not
+        // yet known, and only after signature validation (matching Python
+        // Transport.py:1749-1765).  Re-announces of known destinations
+        // always refresh the path.  For an unknown destination during an
+        // ingress announce burst we drop the announce rather than risk a
+        // loop; the destination will re-announce on its normal cycle.
+        if packet.context != PacketContext::PathResponse {
+            let announce_burst_limited = handler
+                .send_ctx
+                .iface_manager
+                .lock()
+                .await
+                .ingress_record_announce(&iface);
+            if announce_burst_limited {
+                let is_known = handler
+                    .send_ctx
+                    .path_table
+                    .read()
+                    .unwrap()
+                    .get(&packet.destination)
+                    .is_some();
+                if !is_known {
+                    log::trace!(
+                        "tp({}): dropping announce from {} due to ingress burst limiting (unknown destination)",
+                        handler.config.name,
+                        packet.destination,
+                    );
+                    return;
+                }
+            }
         }
 
         let destination = Arc::new(Mutex::new(destination));
@@ -3739,15 +3764,16 @@ async fn handle_path_request(
     pending: &mut PendingSends,
     iface: AddressHash,
 ) {
-    // Ingress burst limiting for path requests
-    if handler.send_ctx.iface_manager.lock().await.ingress_record_pr(&iface) {
-        log::trace!(
-            "tp({}): dropping path request from {} due to ingress PR burst limiting",
-            handler.config.name,
-            packet.destination,
-        );
-        return;
-    }
+    // Record the path request for ingress PR burst limiting.  Mirroring
+    // Python (Transport.py:3005, 3115), the burst limiter only gates the
+    // *recursive* discovery search; local and known-path responses are
+    // still served so peers can resolve paths even during a PR burst.
+    let pr_burst_limited = handler
+        .send_ctx
+        .iface_manager
+        .lock()
+        .await
+        .ingress_record_pr(&iface);
 
     if let Some(request) = handler.path_requests.decode(packet.data.as_slice()) {
         if let Some(dest) = handler.single_in_destinations.get(&request.destination) {
@@ -3814,6 +3840,49 @@ async fn handle_path_request(
                     return;
                 }
 
+                // The announce for this destination is no longer in the
+                // announce retransmit table (or was never added, e.g. a path
+                // learned from a path response).  Fall back to answering from
+                // the announce packet cached alongside the path table entry,
+                // matching Python's `get_cached_packet(path_table[dst]
+                // [IDX_PT_PACKET])` (Transport.py:3037).
+                if let Some(announce) = handler
+                    .send_ctx
+                    .path_table
+                    .read()
+                    .unwrap()
+                    .path_announce(&request.destination)
+                {
+                    log::trace!(
+                        "tp({}): answering path request for {} from cached announce ({} hops)",
+                        handler.config.name,
+                        request.destination,
+                        hops,
+                    );
+                    let transport_id = handler.config.identity.address_hash().clone();
+                    let response = Packet {
+                        header: Header {
+                            ifac_flag: IfacFlag::Open,
+                            header_type: HeaderType::Type2,
+                            context_flag: announce.header.context_flag,
+                            propagation_type: PropagationType::Transport,
+                            destination_type: DestinationType::Single,
+                            packet_type: PacketType::Announce,
+                            hops,
+                        },
+                        ifac: None,
+                        destination: request.destination,
+                        transport: Some(transport_id),
+                        context: PacketContext::PathResponse,
+                        data: announce.data,
+                    };
+                    pending.push(TxMessage {
+                        tx_type: TxMessageType::Direct(iface),
+                        packet: response,
+                    });
+                    return;
+                }
+
                 log::trace!(
                     "tp({}): announce for {} not cached, falling back to recursive forwarding",
                     handler.config.name,
@@ -3842,6 +3911,16 @@ async fn handle_path_request(
             };
 
             if should_search {
+                // Abort the recursive search if the requesting interface is
+                // ingress PR-burst-limited (Python Transport.py:3115).
+                if pr_burst_limited {
+                    log::trace!(
+                        "tp({}): not sending recursive path request for {} due to ingress PR burst limiting",
+                        handler.config.name,
+                        request.destination,
+                    );
+                    return;
+                }
                 if let Some(packet) = handler.path_requests.generate_recursive(
                 &request.destination,
                 iface,
@@ -4170,15 +4249,11 @@ async fn handle_link_request(
     handler: &mut TransportHandler,
     pending: &mut PendingSends,
 ) {
-    // Ingress burst limiting for link requests (which carry path requests)
-    if handler.send_ctx.iface_manager.lock().await.ingress_record_pr(&iface) {
-        log::trace!(
-            "tp({}): dropping link request from {} due to ingress PR burst limiting",
-            handler.config.name,
-            packet.destination,
-        );
-        return;
-    }
+    // Note: unlike the Python reference, we do NOT apply ingress PR burst
+    // limiting to link requests. Python never limits link requests by the
+    // path-request burst limiter (Transport.py:1598-1744 has no such
+    // gate), so doing so here could drop legitimate link establishment
+    // attempts during a path-request burst on an interface.
 
     if let Some(destination) = handler
         .single_in_destinations
