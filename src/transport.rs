@@ -3628,15 +3628,28 @@ is_path_response={}",
             }
         } else {
             // Python: only insert into the announce retransmit table
-            // announces that would update the path (`should_add`), and
-            // skip path responses entirely (`packet.context !=
-            // PATH_RESPONSE`).  This keeps a solicited path response from
-            // being re-broadcast by transport nodes and feeding an
-            // announce loop.
+            // announces that would update the path (`should_add`), skip
+            // path responses entirely (`packet.context != PATH_RESPONSE`),
+            // and only relay announces on transport nodes or from
+            // local-client (RPC) interfaces (`transport_enabled() or
+            // is_from_local_client`, Transport.py:1945).  A non-transport
+            // node relays its own (and its shared-instance clients')
+            // announcements but never forwards network announcements it
+            // received.  Gating on `would_update_path` also prevents
+            // circulating announces from re-arming the announce table and
+            // looping endlessly with inflated hop counts.
             if packet.context != PacketContext::PathResponse && would_update {
-                handler
-                    .announce_table
-                    .add(packet, packet.destination, iface);
+                let from_local_client = handler
+                    .send_ctx
+                    .iface_manager
+                    .lock()
+                    .await
+                    .is_rpc_instance_client(&iface);
+                if handler.config.retransmit || from_local_client {
+                    handler
+                        .announce_table
+                        .add(packet, packet.destination, iface);
+                }
             }
         }
 
@@ -4562,11 +4575,10 @@ async fn manage_transport(
     rx_receiver: Arc<Mutex<InterfaceRxReceiver>>,
     iface_messages_tx: broadcast::Sender<RxMessage>,
 ) {
-    let (cancel, retransmit, announce_forever, tp_name, event_channel_capacity) = {
+    let (cancel, announce_forever, tp_name, event_channel_capacity) = {
         let h = handler.lock().await;
         (
             h.cancel.clone(),
-            h.config.retransmit,
             h.config.announce_forever,
             h.config.name.clone(),
             h.config.event_channel_capacity,
@@ -4994,7 +5006,14 @@ async fn manage_transport(
         });
     }
 
-    if retransmit {
+    // Announce retransmission runs for every instance, transport node or
+    // not.  What actually enters the announce table is gated in
+    // `handle_announce` on `(retransmit || from_local_client)`, matching
+    // Python's `(transport_enabled() or is_from_local_client)` gate: a
+    // non-transport node still relays its own (and shared-instance/RPC
+    // clients') announcements to the network, but never forwards network
+    // announcements it received.
+    {
         let handler = handler.clone();
         let send_ctx = send_ctx.clone();
         let cancel = cancel.clone();
@@ -6303,7 +6322,9 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_snapshot_reflects_transport_state() {
-        let transport = Transport::new(Default::default());
+        let mut config = TransportConfig::default();
+        config.set_retransmit(true);
+        let transport = Transport::new(config);
         let handler = transport.get_handler();
         let mut rng = UnwrapErr(SysRng);
         let remote_destination = SingleInputDestination::new(
