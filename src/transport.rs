@@ -3546,20 +3546,22 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
         // hash. This matches the Python reference, which validates the
         // announce (`Transport.validate_announce()`) before rate-limiting it
         // inside `should_add`. Path responses are exempt from the rate limiter.
+        // Only re-insert announces into the retransmit table when they
+        // would actually update or install a path, matching Python's
+        // `should_add` gating (Transport.py:1802-1892).  A duplicate copy
+        // of an emission already recorded does not change the path, so
+        // gating on `would_update_path` prevents circulating announces
+        // from re-arming the announce retransmit table and looping
+        // endlessly with inflated hop counts.
+        let would_update = handler
+            .send_ctx
+            .path_table
+            .read()
+            .unwrap()
+            .would_update_path(&packet);
+
+        // Path responses are exempt from the rate limiter.
         if packet.context != PacketContext::PathResponse {
-            // Only rate-limit announces that would actually update or
-            // install a path, matching Python's `should_add` gating
-            // (Transport.py).  A duplicate copy of an emission already
-            // recorded on another interface does not change the path, so
-            // `would_update_path` also skips those — a legitimate
-            // destination heard on several interfaces is not falsely
-            // rate-limited.
-            let would_update = handler
-                .send_ctx
-                .path_table
-                .read()
-                .unwrap()
-                .would_update_path(&packet);
             if would_update
                 && let Some(blocked_until) = handler.announce_limits.check(&packet.destination)
             {
@@ -3625,9 +3627,17 @@ is_path_response={}",
                 );
             }
         } else {
-            handler
-                .announce_table
-                .add(packet, packet.destination, iface);
+            // Python: only insert into the announce retransmit table
+            // announces that would update the path (`should_add`), and
+            // skip path responses entirely (`packet.context !=
+            // PATH_RESPONSE`).  This keeps a solicited path response from
+            // being re-broadcast by transport nodes and feeding an
+            // announce loop.
+            if packet.context != PacketContext::PathResponse && would_update {
+                handler
+                    .announce_table
+                    .add(packet, packet.destination, iface);
+            }
         }
 
         let path_expiry = handler
@@ -7024,6 +7034,10 @@ mod tests {
         };
 
         // A fresh direct emission from the destination itself (transport=None).
+        // Wait for the next second so the emission carries a newer announce
+        // timestamp than e1; otherwise `would_update_path` correctly treats
+        // it as a non-improving duplicate (matching Python's `should_add`).
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let e2 = remote.announce(&mut rng, None).expect("valid announce");
         assert_ne!(
             e1.data.as_slice(),
