@@ -122,9 +122,18 @@ impl LinkTable {
         let now = Instant::now();
         let taken_hops = link_request.header.hops;
 
+        // Unvalidated link entries expire shortly after the establishment
+        // window, matching Python's
+        // `proof_timeout = now + ESTABLISHMENT_TIMEOUT_PER_HOP * max(1,
+        // remaining_hops)` (Transport.py:1643-1644).  The previous hardcoded
+        // 600s kept stale entries around for ~10 minutes, re-forwarding link
+        // request retries long after the destination stopped responding.
+        let proof_timeout =
+            now + Duration::from_secs(super::DEFAULT_PER_HOP_TIMEOUT_SECS * remaining_hops.max(1) as u64);
+
         let entry = LinkEntry {
             timestamp: now,
-            proof_timeout: now + Duration::from_secs(600), // TODO
+            proof_timeout,
             next_hop_iface: iface,
             received_from,
             original_destination: destination,

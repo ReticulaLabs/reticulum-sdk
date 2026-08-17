@@ -84,8 +84,12 @@ const INGRESS_PR_BURST_FREQ: f64 = 8.0;
 const INGRESS_BURST_HOLD_S: u64 = 15;
 /// Min samples before frequency can be computed.
 const INGRESS_DEQUE_MIN_SAMPLE: usize = 2;
-/// Min samples before burst can be deactivated.
-const INGRESS_BURST_MIN_SAMPLES: usize = 6;
+/// Frequency decay window: samples older than this are dropped from the
+/// frequency calculation, matching Python's `AR_FREQ_DECAY` / `PR_FREQ_DECAY`
+/// (10 seconds).  Without it, a slow-trickle interface's deque would grow to
+/// hold every historical sample and the computed frequency would no longer
+/// reflect the current rate.
+const INGRESS_FREQ_DECAY_S: u64 = 10;
 /// Egress path-request frequency threshold (Hz). When an interface's
 /// outgoing PR rate exceeds this, a warning is logged.
 const EGRESS_PR_FREQ: f64 = 5.0;
@@ -645,13 +649,19 @@ pub(crate) fn configured_bitrate(bitrate: f64) -> Option<f64> {
 }
 
 /// Compute the frequency (Hz) of events from a deque of timestamps.
-fn ingress_freq(deque: &VecDeque<Instant>, now: Instant) -> f64 {
+/// Samples older than the decay window are dropped, matching Python's
+/// `incoming_announce_frequency`/`incoming_pr_frequency`.
+fn ingress_freq(deque: &mut VecDeque<Instant>, now: Instant) -> f64 {
     let n = deque.len();
     if n < INGRESS_DEQUE_MIN_SAMPLE {
         return 0.0;
     }
     let oldest = deque.front().copied().unwrap_or(now);
     let span = now.duration_since(oldest);
+    if span > Duration::from_secs(INGRESS_FREQ_DECAY_S) {
+        deque.pop_front();
+        return ingress_freq(deque, now);
+    }
     let span_s = span.as_secs_f64();
     if span_s <= 0.0 {
         return 0.0;
@@ -689,7 +699,7 @@ fn ingress_record_impl(
         deque.pop_front();
     }
 
-    let freq = ingress_freq(&deque, now);
+    let freq = ingress_freq(&mut deque, now);
     let threshold = ingress_threshold(created_at, new_threshold, mature_threshold);
     let deque_len = deque.len();
     drop(deque);
@@ -699,7 +709,7 @@ fn ingress_record_impl(
     if burst_active.load(Ordering::Relaxed) {
         if freq < threshold
             && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
-            && deque_len >= INGRESS_BURST_MIN_SAMPLES
+            && deque_len >= INGRESS_DEQUE_MIN_SAMPLE
         {
             burst_active.store(false, Ordering::Relaxed);
             return false;
@@ -725,8 +735,8 @@ fn ingress_evaluate_impl(
     mature_threshold: f64,
 ) {
     let now = Instant::now();
-    let deque = freq_deque.lock().unwrap();
-    let freq = ingress_freq(&deque, now);
+    let mut deque = freq_deque.lock().unwrap();
+    let freq = ingress_freq(&mut deque, now);
     let threshold = ingress_threshold(created_at, new_threshold, mature_threshold);
     let deque_len = deque.len();
     drop(deque);
@@ -736,7 +746,7 @@ fn ingress_evaluate_impl(
     if burst_active.load(Ordering::Relaxed) {
         if freq < threshold
             && now.duration_since(*burst_activated) > Duration::from_secs(INGRESS_BURST_HOLD_S)
-            && deque_len >= INGRESS_BURST_MIN_SAMPLES
+            && deque_len >= INGRESS_DEQUE_MIN_SAMPLE
         {
             burst_active.store(false, Ordering::Relaxed);
         }
@@ -1600,8 +1610,8 @@ impl InterfaceManager {
         }
 
         let freq = {
-            let deque = iface.op_freq_deque.lock().unwrap();
-            ingress_freq(&deque, now)
+            let mut deque = iface.op_freq_deque.lock().unwrap();
+            ingress_freq(&mut deque, now)
         };
 
         freq > EGRESS_PR_FREQ
