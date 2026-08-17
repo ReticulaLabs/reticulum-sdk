@@ -19,6 +19,7 @@ pub struct TcpServer {
     bitrate: Option<f64>,
     max_connections: Option<usize>,
     mode: InterfaceMode,
+    gravity: i64,
 }
 
 impl TcpServer {
@@ -34,6 +35,7 @@ impl TcpServer {
             bitrate: None,
             max_connections: Some(128),
             mode: InterfaceMode::Full,
+            gravity: 0,
         }
     }
 
@@ -50,6 +52,7 @@ impl TcpServer {
             bitrate: None,
             max_connections: Some(128),
             mode: InterfaceMode::Full,
+            gravity: 0,
         }
     }
 
@@ -78,10 +81,15 @@ impl TcpServer {
         self
     }
 
+    pub fn with_gravity(mut self, gravity: i64) -> Self {
+        self.gravity = gravity;
+        self
+    }
+
     pub async fn spawn(context: InterfaceContext<Self>) {
         let iface_stop = context.channel.stop.clone();
 
-        let (addr, iface_manager, mut listener, accept_trace_label, bitrate, max_connections, mode) = {
+        let (addr, iface_manager, mut listener, accept_trace_label, bitrate, max_connections, mode, gravity) = {
             let mut inner = context.inner.lock().unwrap();
             (
                 inner.addr.clone(),
@@ -91,6 +99,7 @@ impl TcpServer {
                 inner.bitrate,
                 inner.max_connections,
                 inner.mode,
+                inner.gravity,
             )
         };
 
@@ -182,7 +191,8 @@ impl TcpServer {
                                 iface_manager.spawn_with_ifac_config(
                                     TcpClient::new_from_stream(client.1.to_string(), client.0)
                                         .with_optional_bitrate(bitrate)
-                                        .with_interface_mode(mode),
+                                        .with_interface_mode(mode)
+                                        .with_gravity(gravity),
                                     |context| async move {
                                         TcpClient::spawn(context).await;
                                         connections.fetch_sub(1, Ordering::Relaxed);
@@ -221,6 +231,10 @@ impl Interface for TcpServer {
 
     fn autoconfigure_mtu(&self) -> bool {
         true
+    }
+
+    fn gravity(&self) -> i64 {
+        self.gravity
     }
 
     fn interface_mode(&self) -> InterfaceMode {

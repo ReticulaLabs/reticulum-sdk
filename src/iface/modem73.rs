@@ -79,6 +79,7 @@ pub struct Modem73Interface {
     current_mtu: Arc<AtomicUsize>,
     fragmentation_target: Arc<AtomicBool>,
     mode: InterfaceMode,
+    gravity: i64,
 }
 
 impl Default for Modem73Interface {
@@ -98,6 +99,7 @@ impl Modem73Interface {
             current_mtu: Arc::new(AtomicUsize::new(RETICULUM_BASE_MTU)),
             fragmentation_target: Arc::new(AtomicBool::new(false)),
             mode: InterfaceMode::Full,
+            gravity: 0,
         }
     }
 
@@ -122,6 +124,11 @@ impl Modem73Interface {
 
     pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_gravity(mut self, gravity: i64) -> Self {
+        self.gravity = gravity;
         self
     }
 
@@ -297,6 +304,10 @@ impl Interface for Modem73Interface {
 
     fn hw_mtu_source(&self) -> Option<Arc<AtomicUsize>> {
         Some(self.current_mtu.clone())
+    }
+
+    fn gravity(&self) -> i64 {
+        self.gravity
     }
 
     fn interface_mode(&self) -> InterfaceMode {

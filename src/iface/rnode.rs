@@ -211,6 +211,7 @@ fn validate_airtime_limit(limit: f32, name: &'static str) -> Result<(), RNodeCon
 pub struct RNodeInterface {
     config: RNodeConfig,
     mode: InterfaceMode,
+    gravity: i64,
 }
 
 impl RNodeInterface {
@@ -218,11 +219,17 @@ impl RNodeInterface {
         Self {
             config,
             mode: InterfaceMode::Full,
+            gravity: 0,
         }
     }
 
     pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_gravity(mut self, gravity: i64) -> Self {
+        self.gravity = gravity;
         self
     }
 
@@ -370,6 +377,10 @@ impl Interface for RNodeInterface {
         }
 
         Some(sf * ((4.0 / cr) / (2.0_f64.powf(sf) / (bandwidth / 1000.0))) * 1000.0)
+    }
+
+    fn gravity(&self) -> i64 {
+        self.gravity
     }
 
     fn interface_mode(&self) -> InterfaceMode {

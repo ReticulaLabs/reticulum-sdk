@@ -34,6 +34,13 @@ pub struct PathEntry {
     path_expiry: Duration,
     random_blobs: Vec<RandomBlob>,
     state: PathState,
+    /// Gravity of the interface this path was received on.  Used to prefer
+    /// higher-gravity interfaces when the same announce is heard at the same
+    /// hop count (matching Python's `Interface.gravity`).
+    iface_gravity: i64,
+    /// Effective bitrate (bps) of the interface this path was received on.
+    /// Tie-breaker when gravity is equal.
+    iface_bitrate: Option<f64>,
     /// The announce packet that installed this path.  Cached so the node can
     /// answer onward path requests for destinations it learned about via a
     /// path response (or whose announce has left the announce retransmit
@@ -145,8 +152,10 @@ impl PathTable {
         transport_id: Option<AddressHash>,
         iface: AddressHash,
         path_expiry: Duration,
+        iface_gravity: i64,
+        iface_bitrate: Option<f64>,
     ) -> bool {
-        if !self.would_update_path(announce) {
+        if !self.would_update_path(announce, iface_gravity, iface_bitrate) {
             return false;
         }
 
@@ -187,6 +196,8 @@ self_referential_transport={}",
                 .map(|entry| entry.updated_random_blobs(random_blob))
                 .unwrap_or_else(|| random_blob.into_iter().collect()),
             state: PathState::Unknown,
+            iface_gravity,
+            iface_bitrate,
             announce: Some(announce.clone()),
         };
 
@@ -207,13 +218,20 @@ self_referential_transport={}",
     /// Non-mutating — used to gate the per-destination announce rate limiter
     /// on announces that actually change the path, matching Python's
     /// `should_add` gating (Transport.py).
-    pub fn would_update_path(&self, announce: &Packet) -> bool {
+    pub fn would_update_path(
+        &self,
+        announce: &Packet,
+        incoming_gravity: i64,
+        incoming_bitrate: Option<f64>,
+    ) -> bool {
         let hops = announce.header.hops;
         let random_blob = announce_random_blob(announce);
         match self.map.get(&announce.destination) {
             None => true,
             Some(entry) => match random_blob {
-                Some(blob) => entry.should_accept(announce.destination, hops, blob),
+                Some(blob) => {
+                    entry.should_accept(announce.destination, hops, blob, incoming_gravity, incoming_bitrate)
+                }
                 None => {
                     if hops > entry.hops {
                         false
@@ -399,23 +417,55 @@ self_referential_transport={}",
 }
 
 impl PathEntry {
-    fn should_accept(&self, destination: AddressHash, hops: u8, random_blob: RandomBlob) -> bool {
+    fn should_accept(
+        &self,
+        destination: AddressHash,
+        hops: u8,
+        random_blob: RandomBlob,
+        incoming_gravity: i64,
+        incoming_bitrate: Option<f64>,
+    ) -> bool {
         let announce_emitted = timebase_from_random_blob(random_blob);
         let path_timebase = self.timebase();
 
+        // For an announce at the same hop count as the installed path,
+        // prefer the interface with higher gravity (matching Python
+        // Transport.py:1836-1845); when gravity is equal, prefer the
+        // interface with the higher bitrate.
+        let prefers_interface = || {
+            if incoming_gravity != self.iface_gravity {
+                incoming_gravity > self.iface_gravity
+            } else {
+                match (incoming_bitrate, self.iface_bitrate) {
+                    (Some(a), Some(b)) => a > b,
+                    (Some(_), None) => true,
+                    _ => false,
+                }
+            }
+        };
+
         if self.random_blobs.contains(&random_blob) {
             // The same announce emission was already recorded. Accept it
-            // only if it now arrives via a strictly closer (fewer-hop)
-            // path, so a multi-interface node converges on the best route
-            // for a single emission. This mirrors the Python reference,
-            // which updates the path when the same announce is received
-            // on an interface with higher gravity (Transport.py:1836-1845).
+            // if it arrives via a strictly closer (fewer-hop) path, or via
+            // a preferred (higher-gravity, then higher-bitrate) interface at
+            // the same hop count. This mirrors the Python reference, which
+            // updates the path when the same announce is received on an
+            // interface with higher gravity (Transport.py:1836-1845).
             if hops < self.hops {
                 log::trace!(
                     "path_table accept same-emission announce for {} via closer path ({} < {} hops)",
                     destination,
                     hops,
                     self.hops,
+                );
+                return true;
+            }
+            if hops == self.hops && prefers_interface() {
+                log::trace!(
+                    "path_table accept same-emission announce for {} via preferred interface (gravity {} bitrate {:?})",
+                    destination,
+                    incoming_gravity,
+                    incoming_bitrate,
                 );
                 return true;
             }
@@ -429,6 +479,19 @@ impl PathEntry {
 
         if hops <= self.hops {
             if announce_emitted > path_timebase {
+                return true;
+            }
+
+            // Same emission time: Python only updates the path for a
+            // higher-gravity interface (Transport.py:1836-1845); extend that
+            // with a bitrate tie-break when gravity is equal.
+            if announce_emitted == path_timebase && prefers_interface() {
+                log::trace!(
+                    "path_table accept announce for {} via preferred interface (gravity {} bitrate {:?})",
+                    destination,
+                    incoming_gravity,
+                    incoming_bitrate,
+                );
                 return true;
             }
 
@@ -541,7 +604,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         let original = Packet {
             header: Header {
@@ -590,22 +653,22 @@ mod tests {
         };
 
         // Fresh destination: the announce would install a path.
-        assert!(table.would_update_path(&announce));
+        assert!(table.would_update_path(&announce, 0, None));
 
         // After installation, an identical announce does not update the path.
-        assert!(table.handle_announce(&announce, None, iface, Duration::from_secs(3600)));
-        assert!(!table.would_update_path(&announce));
+        assert!(table.handle_announce(&announce, None, iface, Duration::from_secs(3600), 0, None));
+        assert!(!table.would_update_path(&announce, 0, None));
 
         // A lower-hop announce would still update the path.
         let mut better = announce.clone();
         better.header.hops = 0;
-        assert!(table.would_update_path(&better));
-        assert!(table.handle_announce(&better, None, iface, Duration::from_secs(3600)));
+        assert!(table.would_update_path(&better, 0, None));
+        assert!(table.handle_announce(&better, None, iface, Duration::from_secs(3600), 0, None));
 
         // A higher-hop announce would not.
         let mut worse = announce.clone();
         worse.header.hops = 2;
-        assert!(!table.would_update_path(&worse));
+        assert!(!table.would_update_path(&worse, 0, None));
     }
 
     #[test]
@@ -629,7 +692,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, Some(transport), iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, Some(transport), iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         let original = Packet {
             header: Header {
@@ -676,7 +739,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         let original = Packet {
             header: Header {
@@ -717,7 +780,7 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
         table.map.get_mut(&destination).unwrap().expires = Instant::now();
 
         assert_eq!(table.remove_stale(|_| true), 1);
@@ -743,7 +806,7 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         assert_eq!(table.remove_stale(|_| false), 1);
         assert_eq!(table.len(), 0);
@@ -768,7 +831,7 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
         table.map.get_mut(&destination).unwrap().expires = Instant::now();
         table.refresh(&destination);
 
@@ -820,14 +883,12 @@ mod tests {
             &announce_with_random_blob(destination, 2, blob),
             None,
             first_iface,
-            Duration::from_secs(60 * 60 * 24 * 7),
-        );
+            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
         table.handle_announce(
             &announce_with_random_blob(destination, 1, blob),
             None,
             second_iface,
-            Duration::from_secs(60 * 60 * 24 * 7),
-        );
+            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         // The same emission arriving via a strictly closer (fewer-hop)
         // path must replace the existing route, so a multi-interface node
@@ -848,14 +909,12 @@ mod tests {
             &announce_with_random_blob(destination, 2, random_blob(1, 100)),
             None,
             first_iface,
-            Duration::from_secs(60 * 60 * 24 * 7),
-        );
+            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
         table.handle_announce(
             &announce_with_random_blob(destination, 1, random_blob(2, 99)),
             None,
             second_iface,
-            Duration::from_secs(60 * 60 * 24 * 7),
-        );
+            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
         assert_eq!(iface, first_iface);
@@ -873,15 +932,101 @@ mod tests {
             &announce_with_random_blob(destination, 1, random_blob(1, 100)),
             None,
             first_iface,
-            Duration::from_secs(60 * 60 * 24 * 7),
-        );
+            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
         table.handle_announce(
             &announce_with_random_blob(destination, 1, random_blob(2, 101)),
             None,
             second_iface,
+            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+
+        let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
+        assert_eq!(iface, second_iface);
+        assert_eq!(hops, 1);
+    }
+
+    #[test]
+    fn same_emission_prefers_higher_gravity_then_higher_bitrate() {
+        let destination = AddressHash::new_from_slice(b"gravity-destination");
+        let low_iface = AddressHash::new_from_slice(b"low-iface");
+        let high_iface = AddressHash::new_from_slice(b"high-iface");
+        let mut table = PathTable::new(false);
+
+        // Same emission (same random blob), same hop count on two interfaces.
+        let blob = random_blob(7, 100);
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, blob),
+            None,
+            low_iface,
             Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            Some(1_000_000.0),
         );
 
+        // Same gravity (0), lower bitrate on the second interface: no switch.
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, blob),
+            None,
+            high_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            Some(100_000.0),
+        );
+        let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
+        assert_eq!(iface, low_iface, "lower-bitrate tie must not win");
+        assert_eq!(hops, 1);
+
+        // Same gravity, higher bitrate on the second interface: switch.
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, blob),
+            None,
+            high_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            Some(10_000_000.0),
+        );
+        let (_, iface, _) = table.next_hop_route(&destination).unwrap();
+        assert_eq!(iface, high_iface, "higher-bitrate tie must win");
+
+        // Higher gravity always wins, regardless of bitrate.
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, blob),
+            None,
+            low_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            5,
+            Some(1_000_000.0),
+        );
+        let (_, iface, _) = table.next_hop_route(&destination).unwrap();
+        assert_eq!(iface, low_iface, "higher gravity must win");
+    }
+
+    #[test]
+    fn different_emission_same_timebase_prefers_higher_gravity() {
+        let destination = AddressHash::new_from_slice(b"gravity-dest-2");
+        let first_iface = AddressHash::new_from_slice(b"first-iface");
+        let second_iface = AddressHash::new_from_slice(b"second-iface");
+        let mut table = PathTable::new(false);
+
+        // First emission at timebase 100 on a low-gravity interface.
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, random_blob(1, 100)),
+            None,
+            first_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
+
+        // A different blob with the same timebase on a higher-gravity
+        // interface: the path switches (matching Python's gravity logic).
+        table.handle_announce(
+            &announce_with_random_blob(destination, 1, random_blob(2, 100)),
+            None,
+            second_iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            3,
+            None,
+        );
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
         assert_eq!(iface, second_iface);
         assert_eq!(hops, 1);
@@ -906,7 +1051,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         let packet = Packet {
             header: Header {
@@ -955,7 +1100,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, Some(next_hop), iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, Some(next_hop), iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         let packet = Packet {
             header: Header {
@@ -1062,8 +1207,7 @@ mod tests {
             },
             Some(next_hop),
             iface,
-            Duration::from_secs(60 * 60 * 24 * 7),
-        );
+            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
 
         let packet = Packet {
             header: Header {
@@ -1176,7 +1320,7 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7));
+        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
     }
 
     #[test]

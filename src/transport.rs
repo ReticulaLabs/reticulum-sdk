@@ -3578,12 +3578,20 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
         // gating on `would_update_path` prevents circulating announces
         // from re-arming the announce retransmit table and looping
         // endlessly with inflated hop counts.
+        let (iface_gravity, iface_bitrate) = {
+            let mgr = handler.send_ctx.iface_manager.lock().await;
+            (
+                mgr.interface_gravity(&iface),
+                mgr.interface_bitrate(&iface),
+            )
+        };
+
         let would_update = handler
             .send_ctx
             .path_table
             .read()
             .unwrap()
-            .would_update_path(&packet);
+            .would_update_path(&packet, iface_gravity, iface_bitrate);
 
         // Path responses are exempt from the rate limiter.
         if packet.context != PacketContext::PathResponse {
@@ -3689,7 +3697,7 @@ is_path_response={}",
             .path_table
             .write()
             .unwrap()
-            .handle_announce(packet, packet.transport, iface, path_expiry);
+            .handle_announce(packet, packet.transport, iface, path_expiry, iface_gravity, iface_bitrate);
 
         if let Some(response_iface) = handler.path_requests.take_discovery(&packet.destination) {
             let transport_id = handler.config.identity.address_hash().clone();

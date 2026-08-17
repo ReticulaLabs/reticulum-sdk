@@ -46,6 +46,7 @@ pub struct BackboneServer {
     ifac_netname: Option<String>,
     ifac_netkey: Option<String>,
     mode: InterfaceMode,
+    gravity: i64,
     reconnect_pacer: Arc<Mutex<ReconnectPacer>>,
 }
 
@@ -63,6 +64,7 @@ impl BackboneServer {
             ifac_netname: None,
             ifac_netkey: None,
             mode: InterfaceMode::Full,
+            gravity: 0,
             reconnect_pacer: Arc::new(Mutex::new(ReconnectPacer::new(
                 INITIAL_RECONNECT_BACKOFF,
                 MAX_RECONNECT_BACKOFF,
@@ -85,6 +87,7 @@ impl BackboneServer {
             ifac_netname: None,
             ifac_netkey: None,
             mode: InterfaceMode::Full,
+            gravity: 0,
             reconnect_pacer: Arc::new(Mutex::new(ReconnectPacer::new(
                 INITIAL_RECONNECT_BACKOFF,
                 MAX_RECONNECT_BACKOFF,
@@ -114,6 +117,11 @@ impl BackboneServer {
         self
     }
 
+    pub fn with_gravity(mut self, gravity: i64) -> Self {
+        self.gravity = gravity;
+        self
+    }
+
     /// Returns a snapshot of current reconnect-pacer metrics.
     ///
     /// The reconnect pacer tracks per-source-IP reconnection frequency
@@ -137,6 +145,7 @@ impl BackboneServer {
             ifac_netkey,
             reconnect_pacer,
             mode,
+            gravity,
         ) = {
             let mut inner = context.inner.lock().unwrap();
             (
@@ -149,6 +158,7 @@ impl BackboneServer {
                 inner.ifac_netkey.clone(),
                 inner.reconnect_pacer.clone(),
                 inner.mode,
+                inner.gravity,
             )
         };
         // Derive the IFAC configuration from the access code once, so every
@@ -249,7 +259,8 @@ impl BackboneServer {
                                         .with_optional_bitrate(bitrate)
                                         .with_hw_mtu(hw_mtu)
                                         .with_ifac(ifac_netname.clone(), ifac_netkey.clone())
-                                        .with_interface_mode(mode),
+                                        .with_interface_mode(mode)
+                                        .with_gravity(gravity),
                                     |context| async move {
                                         BackboneClient::spawn(context).await;
                                     },
@@ -299,6 +310,10 @@ impl Interface for BackboneServer {
         true
     }
 
+    fn gravity(&self) -> i64 {
+        self.gravity
+    }
+
     fn interface_mode(&self) -> InterfaceMode {
         self.mode
     }
@@ -314,6 +329,7 @@ pub struct BackboneClient {
     ifac_netname: Option<String>,
     ifac_netkey: Option<String>,
     mode: InterfaceMode,
+    gravity: i64,
 }
 
 impl BackboneClient {
@@ -326,6 +342,7 @@ impl BackboneClient {
             ifac_netname: None,
             ifac_netkey: None,
             mode: InterfaceMode::Full,
+            gravity: 0,
         }
     }
 
@@ -338,6 +355,7 @@ impl BackboneClient {
             ifac_netname: None,
             ifac_netkey: None,
             mode: InterfaceMode::Full,
+            gravity: 0,
         }
     }
 
@@ -364,6 +382,11 @@ impl BackboneClient {
 
     pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_gravity(mut self, gravity: i64) -> Self {
+        self.gravity = gravity;
         self
     }
 
@@ -671,6 +694,10 @@ impl Interface for BackboneClient {
 
     fn autoconfigure_mtu(&self) -> bool {
         true
+    }
+
+    fn gravity(&self) -> i64 {
+        self.gravity
     }
 
     fn interface_mode(&self) -> InterfaceMode {

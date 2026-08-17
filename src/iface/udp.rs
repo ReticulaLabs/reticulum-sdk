@@ -17,6 +17,7 @@ pub struct UdpInterface {
     forward_addr: Option<String>,
     bitrate: Option<f64>,
     mode: InterfaceMode,
+    gravity: i64,
 }
 
 impl UdpInterface {
@@ -26,6 +27,7 @@ impl UdpInterface {
             forward_addr: forward_addr.map(Into::into),
             bitrate: None,
             mode: InterfaceMode::Full,
+            gravity: 0,
         }
     }
 
@@ -36,6 +38,11 @@ impl UdpInterface {
 
     pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn with_gravity(mut self, gravity: i64) -> Self {
+        self.gravity = gravity;
         self
     }
 
@@ -176,6 +183,10 @@ impl Interface for UdpInterface {
 
     fn bitrate(&self) -> Option<f64> {
         self.bitrate
+    }
+
+    fn gravity(&self) -> i64 {
+        self.gravity
     }
 
     fn interface_mode(&self) -> InterfaceMode {
