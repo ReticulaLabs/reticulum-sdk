@@ -323,13 +323,25 @@ impl TcpClient {
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
 
                                     if let Ok(_) = Hdlc::encode(&tx_buffer[..len], &mut hdlc_output) {
-                                        if let Err(_) = stream.write_all(hdlc_output.as_slice()).await {
-                                            stop.cancel();
-                                            break;
+                                        // The write must observe cancellation: a peer that stops
+                                        // reading (or vanishes mid-write) can leave `write_all`
+                                        // blocked on a full socket buffer indefinitely.  If that
+                                        // write runs outside the select and never returns, the
+                                        // task can't observe `stop`, so `iface_stop.cancel()` below
+                                        // never runs and the interface leaks with a full tx queue.
+                                        tokio::select! {
+                                            _ = cancel.cancelled() => { stop.cancel(); break; }
+                                            _ = stop.cancelled() => { break; }
+                                            result = stream.write_all(hdlc_output.as_slice()) => {
+                                                if result.is_err() { stop.cancel(); break; }
+                                            }
                                         }
-                                        if let Err(_) = stream.flush().await {
-                                            stop.cancel();
-                                            break;
+                                        tokio::select! {
+                                            _ = cancel.cancelled() => { stop.cancel(); break; }
+                                            _ = stop.cancelled() => { break; }
+                                            result = stream.flush() => {
+                                                if result.is_err() { stop.cancel(); break; }
+                                            }
                                         }
                                     }
                                 }
