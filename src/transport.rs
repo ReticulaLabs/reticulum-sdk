@@ -4571,7 +4571,22 @@ async fn handle_keep_links(
 async fn handle_cleanup(
     handler: &mut TransportHandler,
 ) {
+    // Grace period (10 minutes) before a transient per-connection interface
+    // with no data activity is reclaimed by the inactivity sweep.  Longer
+    // than the path-table expiry so a path that is still being refreshed
+    // (which implies data flowing) keeps its interface alive.
+    const IFACE_INACTIVE_RECLAIM_GRACE: Duration = Duration::from_secs(10 * 60);
+
     let mut mgr = handler.send_ctx.iface_manager.lock().await;
+    let reclaimed = mgr.cleanup_inactive(IFACE_INACTIVE_RECLAIM_GRACE);
+    if reclaimed > 0 {
+        log::warn!(
+            "tp({}): reclaimed {} inactive transient interface{}",
+            handler.config.name,
+            reclaimed,
+            if reclaimed == 1 { "" } else { "s" },
+        );
+    }
     mgr.cleanup();
     mgr.ingress_evaluate_all();
     mgr.egress_evaluate_all();
@@ -4677,6 +4692,7 @@ async fn manage_transport(
     let _packet_task = {
         let handler = handler.clone();
         let cancel = cancel.clone();
+        let send_ctx = send_ctx.clone();
 
         log::trace!("tp({}): start packet task", tp_name);
 
@@ -4699,6 +4715,14 @@ async fn manage_transport(
                 let Some(message) = message else {
                     break;
                 };
+
+                // Mark the receiving interface as active so the inactivity
+                // sweep does not reclaim a transient per-connection interface
+                // that is still exchanging data (see `cleanup_inactive`).
+                {
+                    let mgr = send_ctx.iface_manager.lock().await;
+                    mgr.record_interface_activity(&message.address);
+                }
 
                 // Mirror the packet to attached RPC/management clients. This
                 // is only useful while at least one client is subscribed, so

@@ -839,6 +839,19 @@ struct LocalInterface {
     // --- Egress path-request tracking ---
     /// Timestamps of recently sent path requests for frequency tracking.
     op_freq_deque: std::sync::Mutex<VecDeque<Instant>>,
+
+    // --- Inactivity reclamation ---
+    /// Whether this interface is permanent (a configured/spawned interface)
+    /// and must never be reclaimed by the inactivity sweep.  Transient
+    /// per-connection child interfaces (e.g. per-connection TcpClient /
+    /// BackboneClient) are `false` and are reclaimed when idle for
+    /// `cleanup_inactive`'s grace period.
+    permanent: bool,
+    /// Timestamp of the last inbound or outbound data activity on this
+    /// interface.  Updated on outbound send (`send_flush`) and inbound
+    /// receive (`record_interface_activity`).  Used by the inactivity
+    /// sweep to decide whether a transient interface is still alive.
+    last_activity: Mutex<Instant>,
 }
 
 impl LocalInterface {
@@ -1231,7 +1244,7 @@ impl InterfaceManager {
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
-        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, None, InterfaceMode::Full, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new())
+        self.new_channel_with_pacer(tx_cap, None, false, None, None, None, None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new())
     }
 
     fn new_channel_with_pacer(
@@ -1247,6 +1260,7 @@ impl InterfaceManager {
         gravity: i64,
         announces_from_internal: bool,
         recursive_prs: bool,
+        permanent: bool,
         channel_load: Arc<Mutex<f64>>,
         bytes_tx: Arc<AtomicU64>,
         name: String,
@@ -1306,6 +1320,8 @@ impl InterfaceManager {
             ingress_pr_burst_active: AtomicBool::new(false),
             ingress_pr_burst_activated: std::sync::Mutex::new(Instant::now()),
             op_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
+            permanent,
+            last_activity: Mutex::new(Instant::now()),
         });
 
         self.iface_index.insert(address, self.ifaces.len() - 1);
@@ -1321,7 +1337,7 @@ impl InterfaceManager {
     }
 
     pub fn new_context<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
-        self.new_context_with_options(inner, false, None)
+        self.new_context_with_options(inner, false, None, true)
     }
 
     fn new_context_with_options<T: Interface>(
@@ -1329,6 +1345,7 @@ impl InterfaceManager {
         inner: T,
         rpc_instance_client: bool,
         ifac_config: Option<IfacConfig>,
+        permanent: bool,
     ) -> InterfaceContext<T> {
         let bitrate = inner.bitrate();
         let bitrate_source = inner.bitrate_source();
@@ -1365,6 +1382,7 @@ impl InterfaceManager {
             gravity,
             announces_from_internal,
             recursive_prs,
+            permanent,
             channel_load.clone(),
             bytes_tx.clone(),
             iface_name,
@@ -1431,7 +1449,7 @@ impl InterfaceManager {
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context_with_options(inner, false, ifac_config);
+        let context = self.new_context_with_options(inner, false, ifac_config, false);
         let address = context.channel.address().clone();
 
         task::spawn(worker(context));
@@ -1449,7 +1467,7 @@ impl InterfaceManager {
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context_with_options(inner, true, None);
+        let context = self.new_context_with_options(inner, true, None, false);
         let address = context.channel.address().clone();
 
         task::spawn(worker(context));
@@ -1502,6 +1520,50 @@ impl InterfaceManager {
         for (idx, iface) in self.ifaces.iter().enumerate() {
             self.iface_index.insert(iface.address, idx);
         }
+    }
+
+    /// Record inbound data activity on an interface (called from the transport
+    /// main RX loop whenever a packet is received on the interface).  This
+    /// keeps the interface's `last_activity` fresh so the inactivity sweep
+    /// does not reclaim a transient interface that is still exchanging data.
+    pub fn record_interface_activity(&self, address: &AddressHash) {
+        let Some(iface) = self.iface_by_address(address) else {
+            return;
+        };
+        *iface.last_activity.lock().unwrap() = Instant::now();
+    }
+
+    /// Reclaim transient (non-permanent) interfaces that have had no data
+    /// activity for at least `grace`, even if their `stop` token was never
+    /// cancelled (e.g. a peer that vanished without a clean disconnect).
+    ///
+    /// - `permanent` interfaces (configured/spawned) are never touched.
+    /// - Interfaces whose `stop` is already cancelled are left for `cleanup`.
+    /// - Active (recently trafficked) transient interfaces are left alone so
+    ///   idle-but-alive peers survive; they are only reclaimed after `grace`
+    ///   of genuine inactivity.
+    ///
+    /// Returns the number of interfaces reclaimed.
+    pub fn cleanup_inactive(&mut self, grace: Duration) -> usize {
+        let now = Instant::now();
+        let before = self.ifaces.len();
+        self.ifaces.retain(|iface| {
+            if iface.permanent || iface.stop.is_cancelled() {
+                return true;
+            }
+            let idle = now.duration_since(*iface.last_activity.lock().unwrap());
+            if idle >= grace {
+                iface.stop.cancel();
+                false
+            } else {
+                true
+            }
+        });
+        self.iface_index.clear();
+        for (idx, iface) in self.ifaces.iter().enumerate() {
+            self.iface_index.insert(iface.address, idx);
+        }
+        before - self.ifaces.len()
     }
 
     /// Register a reconnect pacer for a backbone server.
@@ -2046,6 +2108,7 @@ impl InterfaceManager {
 
             iface.packets_tx.fetch_add(1, Ordering::Relaxed);
             iface.bytes_tx.fetch_add(packet_len, Ordering::Relaxed);
+            *iface.last_activity.lock().unwrap() = Instant::now();
         }
     }
 
@@ -2164,7 +2227,7 @@ mod tests {
         // 1 kbps link – realistic for LoRa at SF11/BW250
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -2211,7 +2274,7 @@ mod tests {
         // 10 Mbps – typical fast link, no meaningful pacing needed.
         let bitrate = 10_000_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
         );
         let iface = channel.address;
         let mut receiver = channel.tx_channel;
@@ -2238,7 +2301,7 @@ mod tests {
         let mut manager = InterfaceManager::new(4);
         let bitrate = 1_000.0;
         let channel = manager.new_channel_with_pacer(
-            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            4, None, false, None, None, Some(bitrate), None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
         );
         let iface = channel.address;
 
@@ -2298,7 +2361,7 @@ mod tests {
     async fn local_announces_bypass_announce_pacer() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 0, &[1])).await;
@@ -2486,7 +2549,7 @@ mod tests {
     async fn forwarded_announces_are_paced_on_bitrate_limited_interfaces() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[1])).await;
@@ -2511,7 +2574,7 @@ mod tests {
     async fn queued_announces_keep_only_latest_packet_for_destination() {
         let mut manager = InterfaceManager::new(1);
         let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
-        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
         let mut receiver = channel.tx_channel;
 
         manager.send(announce(1, 1, &[0])).await;
@@ -2604,7 +2667,7 @@ mod tests {
             ] {
                 let ch = mgr.new_channel_with_pacer(
                     4, None, false, None, None, Some(1_000_000.0),
-                    None, *mode, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
+                    None, *mode, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
                     String::new(), String::new(),
                 );
                 ifaces.push((*label, ch.address, ch.tx_channel));
@@ -2939,7 +3002,7 @@ mod tests {
         let mut h = ModeTestHarness::new();
         let roaming_ch = h.mgr.new_channel_with_pacer(
             4, None, false, None, None, Some(1_000_000.0),
-            None, InterfaceMode::Roaming, 0, true, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
+            None, InterfaceMode::Roaming, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)),
             String::new(), String::new(),
         );
 
@@ -3055,5 +3118,85 @@ mod tests {
             assert!(jittered >= short);
             assert!(jittered <= short * 2);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactive_transient_interfaces_are_reclaimed_but_permanent_and_active_are_not() {
+        let mut manager = InterfaceManager::new(4);
+
+        // Permanent interface: configured/spawned, must never be swept.
+        let permanent_addr = manager
+            .new_channel_with_pacer(
+                4, None, false, None, None, None, None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            )
+            .address;
+
+        // Transient interface (per-connection child): sweep-eligible.
+        let transient_addr = manager
+            .new_channel_with_pacer(
+                4, None, false, None, None, None, None, InterfaceMode::Full, 0, true, false, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            )
+            .address;
+
+        // Another transient interface that stays active (data flowing).
+        let active_transient_addr = manager
+            .new_channel_with_pacer(
+                4, None, false, None, None, None, None, InterfaceMode::Full, 0, true, false, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            )
+            .address;
+
+        assert_eq!(manager.ifaces.len(), 3);
+
+        // Wait past the grace period so the inactive transient interface is idle.
+        let grace = Duration::from_secs(600);
+        time::advance(grace + Duration::from_secs(1)).await;
+        task::yield_now().await;
+
+        // Keep `active_transient_addr` alive with inbound activity.
+        manager.record_interface_activity(&active_transient_addr);
+
+        let reclaimed = manager.cleanup_inactive(grace);
+        assert_eq!(reclaimed, 1, "only the idle transient interface should be reclaimed");
+
+        // The idle transient interface is gone and its stop was cancelled.
+        assert!(
+            manager.iface_by_address(&transient_addr).is_none(),
+            "idle transient interface should have been removed"
+        );
+
+        // Permanent and active transient interfaces survive.
+        assert!(manager.iface_by_address(&permanent_addr).is_some());
+        assert!(manager.iface_by_address(&active_transient_addr).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_transient_interface_survives_inactivity_sweep() {
+        let mut manager = InterfaceManager::new(4);
+
+        let addr = manager
+            .new_channel_with_pacer(
+                4, None, false, None, None, None, None, InterfaceMode::Full, 0, true, false, false, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new(),
+            )
+            .address;
+
+        let grace = Duration::from_secs(600);
+
+        // Activity within the grace period keeps the interface alive.
+        manager.record_interface_activity(&addr);
+        time::advance(grace - Duration::from_secs(1)).await;
+        task::yield_now().await;
+        manager.record_interface_activity(&addr);
+        time::advance(grace - Duration::from_secs(1)).await;
+        task::yield_now().await;
+
+        assert_eq!(manager.cleanup_inactive(grace), 0);
+        assert!(manager.iface_by_address(&addr).is_some());
+
+        // Once activity stops for >= grace, the interface is reclaimed.
+        time::advance(grace + Duration::from_secs(1)).await;
+        task::yield_now().await;
+
+        assert_eq!(manager.cleanup_inactive(grace), 1);
+        assert!(manager.iface_by_address(&addr).is_none());
     }
 }
