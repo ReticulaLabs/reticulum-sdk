@@ -327,6 +327,11 @@ pub struct Link {
     /// to trigger loss recovery via `CHANNEL_REORDER_TIMEOUT`.
     channel_rx_stall_since: Option<Instant>,
     channel_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    /// Reusable plaintext scratch buffer for decrypting received link
+    /// packets. Sized to the negotiated MDU once and reused so the receive
+    /// path does not perform a fresh zeroed heap allocation (up to the MDU)
+    /// on every packet, which dominates throughput on high-speed links.
+    decrypt_buffer: Vec<u8>,
 }
 
 impl Link {
@@ -356,6 +361,7 @@ impl Link {
             channel_rx_ring: Vec::new(),
             channel_rx_stall_since: None,
             channel_tx: None,
+            decrypt_buffer: Vec::new(),
         }
     }
 
@@ -417,6 +423,7 @@ impl Link {
             channel_rx_ring: Vec::new(),
             channel_rx_stall_since: None,
             channel_tx: None,
+            decrypt_buffer: Vec::new(),
         };
 
         link.handshake(peer_identity);
@@ -510,15 +517,13 @@ impl Link {
             log::warn!("link({}): handling data packet in inactive state", self.id);
         }
 
-        let decrypt_buf_len = self.mdu().max(PACKET_MDU);
         match packet.context {
             PacketContext::None => {
-                let mut buffer = vec![0u8; decrypt_buf_len];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
-                    self.post_event(LinkEvent::Data(Box::new(LinkPayload::new_from_slice(
-                        plain_text,
+                    self.post_event(LinkEvent::Data(Box::new(LinkPayload::new_from_vec(
+                        &plain_text,
                     ))));
 
                     let proof = if self.proves_messages {
@@ -534,9 +539,8 @@ impl Link {
             }
             PacketContext::LinkIdentify => {
                 if !out_link {
-                    let mut buffer = vec![0u8; decrypt_buf_len];
-                    if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
-                        match self.validate_link_identify(plain_text) {
+                    if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
+                        match self.validate_link_identify(&plain_text) {
                             Ok(identity) => {
                                 self.request_time = Instant::now();
                                 self.post_event(LinkEvent::RemoteIdentified(identity));
@@ -554,11 +558,10 @@ impl Link {
                 }
             }
             PacketContext::Request => {
-                let mut buffer = vec![0u8; decrypt_buf_len];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
                     let request_id = AddressHash::new_from_hash(&packet.hash());
                     let request_id_raw = python_request_id(packet);
-                    match decode_link_request(plain_text, request_id, request_id_raw) {
+                    match decode_link_request(&plain_text, request_id, request_id_raw) {
                         Ok(request) => {
                             self.request_time = Instant::now();
                             self.post_event(LinkEvent::Request(request));
@@ -572,9 +575,8 @@ impl Link {
                 }
             }
             PacketContext::Response => {
-                let mut buffer = vec![0u8; decrypt_buf_len];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
-                    match decode_link_response(plain_text) {
+                if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
+                    match decode_link_response(&plain_text) {
                         Ok(response) => {
                             self.request_time = Instant::now();
                             self.post_event(LinkEvent::Response(response));
@@ -588,8 +590,7 @@ impl Link {
                 }
             }
             PacketContext::Channel => {
-                let mut buffer = vec![0u8; decrypt_buf_len];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
                     // Channel messages are only proven when the link opts in
                     // via `prove_messages`, mirroring Python's
                     // `Destination.proof_strategy` gating. Per-packet proofs
@@ -602,11 +603,11 @@ impl Link {
                         None
                     };
                     if let Some(ref tx) = self.channel_tx {
-                        let _ = tx.send(plain_text.to_vec());
+                        let _ = tx.send(plain_text.clone());
                         self.request_time = Instant::now();
                         return LinkHandleResult::MessageReceived(proof);
                     }
-                    match ChannelEnvelope::unpack(plain_text) {
+                    match ChannelEnvelope::unpack(&plain_text) {
                         Ok(envelope) => {
                             self.request_time = Instant::now();
                             self.handle_channel_envelope(envelope);
@@ -643,8 +644,7 @@ impl Link {
             }
             PacketContext::LinkRTT => {
                 if !out_link {
-                    let mut buffer = vec![0u8; decrypt_buf_len];
-                    if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
                         if let Ok(rtt) = rmp::decode::read_f64(&mut &plain_text[..]) {
                             self.rtt = Duration::from_secs_f64(rtt);
                         } else {
@@ -656,8 +656,7 @@ impl Link {
                 }
             }
             PacketContext::LinkClose => {
-                let mut buffer = vec![0u8; decrypt_buf_len];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
                     match plain_text[..].try_into() {
                         Err(err) => {
                             log::error!(
@@ -730,9 +729,7 @@ impl Link {
             | PacketContext::ResourceHashUpdate
             | PacketContext::ResourceInitiatorCancel
             | PacketContext::ResourceReceiverCancel => {
-                let decrypt_buf_len = self.mdu().max(PACKET_MDU);
-                let mut buffer = vec![0u8; decrypt_buf_len];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
                     log::trace!(
                         "link({}): resource packet ctx={:?} {}B",
                         self.id,
@@ -742,7 +739,7 @@ impl Link {
                     self.request_time = Instant::now();
                     self.post_event(LinkEvent::Resource(LinkResourcePacket {
                         context: packet.context,
-                        data: plain_text.to_vec(),
+                        data: plain_text,
                         packet_hash: packet.hash(),
                     }));
                 } else {
@@ -1212,6 +1209,26 @@ impl Link {
         let mut rng = UnwrapErr(SysRng);
         self.priv_identity
             .decrypt(&mut rng, text, &self.derived_key, out_buf)
+    }
+
+    /// Decrypt `text` into a reusable scratch buffer and return an owned
+    /// copy of the plaintext. Reusing a single buffer avoids a fresh
+    /// zeroed heap allocation (up to the negotiated MDU) on every received
+    /// packet, which is the dominant receive-path cost on high-throughput
+    /// links. Field-level borrowing keeps `priv_identity`/`derived_key`
+    /// (read) disjoint from the mutable scratch buffer so `decrypt` can be
+    /// called without aliasing `self`.
+    fn decrypt_into_owned(&mut self, text: &[u8]) -> Result<Vec<u8>, RnsError> {
+        let decrypt_buf_len = self.mdu().max(PACKET_MDU);
+        if self.decrypt_buffer.len() < decrypt_buf_len {
+            self.decrypt_buffer.resize(decrypt_buf_len, 0);
+        }
+        let mut rng = UnwrapErr(SysRng);
+        let priv_identity = &self.priv_identity;
+        let derived_key = &self.derived_key;
+        let buffer = &mut self.decrypt_buffer;
+        let plain = priv_identity.decrypt(&mut rng, text, derived_key, buffer)?;
+        Ok(plain.to_vec())
     }
 
     pub fn destination(&self) -> &DestinationDesc {
