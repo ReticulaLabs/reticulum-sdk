@@ -20,6 +20,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task;
+use tokio::io::AsyncWriteExt;
 use tokio::time::{self, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -264,6 +265,80 @@ pub(crate) fn spawn_tx_drain_task(
             }
         }
     })
+}
+
+/// Deadline for a single socket write/flush in a peer-facing TX drain task.
+///
+/// A connected peer that stops reading will fill its kernel socket buffer;
+/// `write_all` then blocks with zero progress for as long as the connection
+/// stays up (TCP keepalive defaults are hours).  Without a deadline that
+/// write pins the drain task — and keeps its TX queue saturated — forever,
+/// which previously contributed to transport head-of-line blocking.  This
+/// bounds the stall so the transport reclaims the interface instead.
+pub(crate) const TX_WRITE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Write a pre-encoded frame to a peer stream with a deadline.
+///
+/// Returns `true` if the interface should be torn down: the write or flush
+/// failed, timed out, or the task was cancelled.  Returns `false` once the
+/// frame has been fully written.  The caller must `stop.cancel()` and break
+/// out of its drain loop when this returns `true`.
+///
+/// The timeout is only reached when the kernel socket buffer stays full for
+/// the whole deadline (i.e. the peer is not reading at all), so it will not
+/// false-positive on slow-but-progressing links: `write_all` returns as soon
+/// as the kernel has accepted the bytes.
+pub(crate) async fn write_frame_with_deadline<W>(
+    stream: &mut W,
+    frame: &[u8],
+    who: &str,
+    stop: &CancellationToken,
+    cancel: &CancellationToken,
+) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let write = time::timeout(TX_WRITE_DEADLINE, stream.write_all(frame));
+    tokio::select! {
+        _ = cancel.cancelled() => return true,
+        _ = stop.cancelled() => return true,
+        result = write => {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    log::debug!("{who}: tx write failed: {err}");
+                    return true;
+                }
+                Err(_) => {
+                    log::warn!(
+                        "{who}: tx write timed out after {TX_WRITE_DEADLINE:?} (peer not reading); tearing down",
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+
+    let flush = time::timeout(TX_WRITE_DEADLINE, stream.flush());
+    tokio::select! {
+        _ = cancel.cancelled() => return true,
+        _ = stop.cancelled() => return true,
+        result = flush => {
+            match result {
+                Ok(Ok(())) => false,
+                Ok(Err(err)) => {
+                    log::debug!("{who}: tx flush failed: {err}");
+                    true
+                }
+                Err(_) => {
+                    log::warn!(
+                        "{who}: tx flush timed out after {TX_WRITE_DEADLINE:?} (peer not reading); tearing down",
+                    );
+                    true
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -2461,6 +2536,117 @@ mod tests {
             started.elapsed() < Duration::from_millis(50),
             "send_flush took {:?} with all target queues saturated",
             started.elapsed(),
+        );
+    }
+
+    /// A writer whose `poll_write` never makes progress, simulating a peer
+    /// that is connected but not reading (kernel socket buffer full).
+    struct StalledWriter;
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A writer that always accepts the full buffer, simulating a healthy
+    /// peer that is reading normally.
+    struct HealthyWriter;
+
+    impl tokio::io::AsyncWrite for HealthyWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_frame_with_deadline_tears_down_stalled_peer() {
+        let stop = CancellationToken::new();
+        let cancel = CancellationToken::new();
+
+        let mut stream = StalledWriter;
+        let teardown = tokio::spawn(async move {
+            super::write_frame_with_deadline(&mut stream, &[0u8; 10], "test", &stop, &cancel).await
+        });
+
+        // The stalled peer's write never progresses; once the deadline passes
+        // the helper must signal teardown so the interface is reclaimed.
+        time::advance(TX_WRITE_DEADLINE + Duration::from_millis(1)).await;
+        assert!(
+            teardown.await.unwrap(),
+            "stalled peer write must time out and tear down the interface",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_frame_with_deadline_succeeds_on_healthy_stream() {
+        let stop = CancellationToken::new();
+        let cancel = CancellationToken::new();
+
+        let mut stream = HealthyWriter;
+        let teardown =
+            super::write_frame_with_deadline(&mut stream, &[0u8; 10], "test", &stop, &cancel).await;
+        assert!(
+            !teardown,
+            "healthy peer write must complete without tearing down the interface",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_frame_with_deadline_aborts_on_cancel() {
+        let stop = CancellationToken::new();
+        let cancel = CancellationToken::new();
+        let cancel_in_task = cancel.clone();
+
+        let mut stream = StalledWriter;
+        let teardown = tokio::spawn(async move {
+            super::write_frame_with_deadline(
+                &mut stream,
+                &[0u8; 10],
+                "test",
+                &stop,
+                &cancel_in_task,
+            )
+            .await
+        });
+
+        cancel.cancel();
+        task::yield_now().await;
+        assert!(
+            teardown.await.unwrap(),
+            "cancelled write must tear down the interface",
         );
     }
 

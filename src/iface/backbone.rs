@@ -3,7 +3,6 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
@@ -634,24 +633,26 @@ impl BackboneClient {
                                 if let Ok(len) = encode_tx(ifac_config.as_ref(), &packet, &mut tx_buffer[..]) {
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
                                     if let Ok(_) = Hdlc::encode(&tx_buffer[..len], &mut hdlc_output) {
-                                    // See tcp_client.rs: the write must observe cancellation so a
-                                    // blocked write (peer not reading / vanished mid-write) cannot
-                                    // prevent `iface_stop.cancel()` and leak the interface.
-                                    tokio::select! {
-                                        _ = cancel.cancelled() => { stop.cancel(); break; }
-                                        _ = stop.cancelled() => { break; }
-                                        result = stream.write_all(hdlc_output.as_slice()) => {
-                                            if result.is_err() { stop.cancel(); break; }
+                                        // The write must observe cancellation and a deadline: a peer
+                                        // that stops reading (or vanishes mid-write) can leave
+                                        // `write_all` blocked on a full socket buffer indefinitely.
+                                        // If that write never returns, the task can't observe `stop`
+                                        // or `cancel`, so the interface leaks with a permanently
+                                        // saturated TX queue.  The deadline bounds the stall so the
+                                        // transport reclaims the interface instead.
+                                        if super::write_frame_with_deadline(
+                                            &mut stream,
+                                            hdlc_output.as_slice(),
+                                            "backbone_client",
+                                            &stop,
+                                            &cancel,
+                                        )
+                                        .await
+                                        {
+                                            stop.cancel();
+                                            break;
                                         }
                                     }
-                                    tokio::select! {
-                                        _ = cancel.cancelled() => { stop.cancel(); break; }
-                                        _ = stop.cancelled() => { break; }
-                                        result = stream.flush() => {
-                                            if result.is_err() { stop.cancel(); break; }
-                                        }
-                                    }
-                                }
                                 }
                             }
                         }
