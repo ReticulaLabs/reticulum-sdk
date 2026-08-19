@@ -95,3 +95,7 @@ path = "examples/testnet_client.rs"
 [[example]]
 name = "multihop"
 path = "examples/multihop.rs"
+
+[[example]]
+name = "link_rx_bench"
+path = "examples/link_rx_bench.rs"
