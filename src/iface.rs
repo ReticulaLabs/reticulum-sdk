@@ -58,7 +58,6 @@ pub const MAX_AUTOCONFIGURED_HW_MTU: usize = 524_288;
 pub(crate) const DEFAULT_ANNOUNCE_CAP: f64 = 0.06;
 const DEFAULT_INTERFACE_TX_QUEUE_CAP: usize = 16_384;
 const MAX_QUEUED_ANNOUNCES: usize = 16_384;
-const INTERFACE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 // Channel load thresholds to reduce non-essential traffic such as announcements.
 // Low == "announce at announce_cap"
@@ -1132,6 +1131,13 @@ async fn process_announce_queue(
     }
 }
 
+/// Enqueue a message on an interface's TX queue, dropping it immediately if
+/// the queue is full.  This must never block: the transport main loop and the
+/// announce pacer call this from the transport's critical path, and blocking
+/// here (even briefly) on a saturated interface would stall the entire
+/// transport (head-of-line blocking).  A queue that is full at `try_send`
+/// time is not going to free up within a bounded wait, so the packet is
+/// dropped immediately and the drop is logged.
 async fn send_or_drop(
     tx_send: &InterfaceTxSender,
     message: TxMessage,
@@ -1141,18 +1147,13 @@ async fn send_or_drop(
         Ok(()) => {}
         Err(TrySendError::Full(message)) => {
             let tx_type = message.tx_type;
-            if time::timeout(INTERFACE_SEND_TIMEOUT, tx_send.send(message))
-                .await
-                .is_err()
-            {
-                if let Some(logger) = saturated_queue_logger {
-                    logger.warn_drop(tx_type).await;
-                } else {
-                    log::warn!(
-                        "iface: dropping outbound packet for saturated interface queue tx_type={:?}",
-                        tx_type
-                    );
-                }
+            if let Some(logger) = saturated_queue_logger {
+                logger.warn_drop(tx_type).await;
+            } else {
+                log::warn!(
+                    "iface: dropping outbound packet for saturated interface queue tx_type={:?}",
+                    tx_type
+                );
             }
         }
         Err(TrySendError::Closed(_)) => {
@@ -2400,6 +2401,67 @@ mod tests {
         )
         .await
         .expect("send blocked behind a saturated interface queue");
+    }
+
+    /// Regression test for transport head-of-line blocking: a broadcast
+    /// fanned out to many saturated interfaces must not block the transport
+    /// loop.  Previously `send_or_drop` waited up to 100ms per saturated
+    /// interface (N×100ms per broadcast), which stalled the entire transport.
+    /// The flush must now return immediately even when every target queue is
+    /// full.
+    #[tokio::test]
+    async fn send_flush_does_not_block_on_saturated_queues() {
+        const SATURATED: usize = 5;
+        let mut manager = InterfaceManager::new(1);
+
+        let mut addresses = Vec::new();
+        let mut _receivers = Vec::new();
+        for _ in 0..SATURATED {
+            let channel = manager.new_channel(1);
+            addresses.push(channel.address);
+            // Keep the receiver alive but never drain it so each TX queue
+            // becomes full (not closed) — simulating a peer that is
+            // connected but not reading.
+            _receivers.push(channel.tx_channel);
+        }
+
+        // Fill every interface's TX queue so the broadcast below is dropped.
+        for addr in &addresses {
+            manager.send(data_tx(*addr, 100)).await;
+        }
+
+        // Broadcast that must be delivered to every interface.
+        let broadcast = TxMessage {
+            tx_type: TxMessageType::Broadcast(None),
+            packet: Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type1,
+                    context_flag: ContextFlag::Unset,
+                    propagation_type: PropagationType::Broadcast,
+                    destination_type: DestinationType::Single,
+                    packet_type: PacketType::Data,
+                    hops: 0,
+                },
+                ifac: None,
+                destination: AddressHash::new([9; 16]),
+                transport: None,
+                context: PacketContext::None,
+                data: PacketDataBuffer::new_from_slice(&[0u8; 100]),
+            },
+        };
+
+        // With the old 100ms-per-saturated-interface timeout this takes
+        // 5×100ms; the non-blocking path must complete far sooner.
+        let started = Instant::now();
+        time::timeout(Duration::from_millis(100), manager.send(broadcast))
+            .await
+            .expect("send_flush must not block on saturated interface queues");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "send_flush took {:?} with all target queues saturated",
+            started.elapsed(),
+        );
     }
 
     #[tokio::test]
