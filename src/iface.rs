@@ -37,7 +37,7 @@ use crate::hash::AddressHash;
 use crate::hash::Hash;
 use crate::iface::ifac::IfacConfig;
 use crate::iface::reconnect_pacer::ReconnectPacer;
-use crate::packet::{HeaderType, Packet, PacketContext, PacketType};
+use crate::packet::{HeaderType, Packet, PacketContext, PacketType, RETICULUM_MAX_HEADER_SIZE};
 use crate::serde::Serialize;
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
@@ -385,9 +385,11 @@ fn packet_wire_len(packet: &Packet) -> usize {
 
 /// Reserve added to an interface's negotiated `hw_mtu` to guarantee a
 /// serialized packet of the largest permitted payload always fits in the
-/// transmit buffer, even with the maximum Type2 header, transport hash,
-/// packet-type/hops bytes and a small safety margin.
-const MAX_PACKET_FRAME_RESERVE: usize = 128;
+/// transmit buffer.  A serialized packet is `RETICULUM_MAX_HEADER_SIZE`
+/// (header) + MDU, where the MDU is derived from the MTU after subtracting
+/// the minimum header/token overhead — so the serialized length is always
+/// below `hw_mtu`, and this header-sized reserve is more than sufficient.
+const MAX_PACKET_FRAME_RESERVE: usize = RETICULUM_MAX_HEADER_SIZE;
 
 /// HDLC framing overhead: one leading flag and one trailing flag.
 const HDLC_FLAG_OVERHEAD: usize = 2;
