@@ -383,6 +383,54 @@ fn packet_wire_len(packet: &Packet) -> usize {
     2 + transport_size + ADDRESS_HASH_SIZE + 1 + packet.data.len()
 }
 
+/// Reserve added to an interface's negotiated `hw_mtu` to guarantee a
+/// serialized packet of the largest permitted payload always fits in the
+/// transmit buffer, even with the maximum Type2 header, transport hash,
+/// packet-type/hops bytes and a small safety margin.
+const MAX_PACKET_FRAME_RESERVE: usize = 128;
+
+/// HDLC framing overhead: one leading flag and one trailing flag.
+const HDLC_FLAG_OVERHEAD: usize = 2;
+
+/// Compute the TX buffer sizes (in bytes) needed for an interface whose
+/// negotiated hardware MTU is `hw_mtu`.
+///
+/// Returns `(serialized_capacity, hdlc_capacity)`:
+/// - `serialized_capacity` is the size of the buffer that holds the
+///   serialized (pre-HDLC) packet.  It must fit any packet up to the
+///   interface's maximum MTU.
+/// - `hdlc_capacity` is the size of the buffer that holds the HDLC-encoded
+///   frame.  HDLC escaping can double the frame in the worst case, plus the
+///   two flag bytes, so it is sized from the serialized capacity with full
+///   escape headroom.  Sizing it to the raw MTU (as a single
+///   `MAX_AUTOCONFIGURED_HW_MTU + 2`) would silently overflow (and truncate)
+///   frames whose escaped length exceeds the buffer.
+///
+/// This is driven by the connection's *actual* `hw_mtu` so the buffers scale
+/// to every possible incoming packet MTU for that connection while not
+/// wasting a full 512 KiB per connection on interfaces that negotiate a
+/// smaller MTU.
+pub(crate) fn tx_frame_buffer_sizes(hw_mtu: usize) -> (usize, usize) {
+    let serialized = hw_mtu.saturating_add(MAX_PACKET_FRAME_RESERVE);
+    let hdlc = serialized
+        .saturating_mul(2)
+        .saturating_add(HDLC_FLAG_OVERHEAD);
+    (serialized, hdlc)
+}
+
+/// Compute the RX frame-buffer capacity (in bytes) needed to accumulate an
+/// incoming HDLC frame of up to `hw_mtu` payload bytes.
+///
+/// Incoming bytes are the *encoded* HDLC frame, so in the worst case every
+/// payload byte is escaped (doubling the frame) plus the two flag bytes.
+/// The buffer must be large enough to hold the largest possible incoming
+/// frame for the connection's negotiated MTU without truncating it.
+pub(crate) fn rx_frame_capacity(hw_mtu: usize) -> usize {
+    hw_mtu
+        .saturating_mul(2)
+        .saturating_add(HDLC_FLAG_OVERHEAD)
+}
+
 /// Sleep for a data-pacing delay. Sub-millisecond pacing waits are spun on
 /// rather than passed to `tokio::time::sleep`, whose timer wake-up overhead
 /// dominates tiny delays. At high packet rates a per-packet timer sleep
@@ -2647,6 +2695,48 @@ mod tests {
         assert!(
             teardown.await.unwrap(),
             "cancelled write must tear down the interface",
+        );
+    }
+
+    #[test]
+    fn tx_frame_buffer_sizes_scale_with_mtu_and_cover_hdlc_escaping() {
+        // Small interface (e.g. TCP client @ 2 KiB): buffers are modest and
+        // driven by the actual MTU rather than a fixed 512 KiB allocation.
+        let (serialized, hdlc) = tx_frame_buffer_sizes(DEFAULT_HW_MTU);
+        assert_eq!(serialized, DEFAULT_HW_MTU + MAX_PACKET_FRAME_RESERVE);
+        assert_eq!(
+            hdlc,
+            (DEFAULT_HW_MTU + MAX_PACKET_FRAME_RESERVE) * 2 + HDLC_FLAG_OVERHEAD
+        );
+
+        // Worst-case HDLC escaping of a full serialized packet must fit.
+        let worst_hdlc = serialized * 2 + HDLC_FLAG_OVERHEAD;
+        assert!(
+            hdlc >= worst_hdlc,
+            "hdlc buffer {hdlc} must hold worst-case escaped frame {worst_hdlc}",
+        );
+
+        // Large interface (e.g. backbone @ 1 MiB): buffers must grow to cover
+        // the full MTU so a maximum-sized packet is never truncated.
+        let backbone_mtu = 1_048_576usize;
+        let (serialized_big, hdlc_big) = tx_frame_buffer_sizes(backbone_mtu);
+        assert!(serialized_big > backbone_mtu, "tx buffer must exceed the MTU");
+        assert!(
+            hdlc_big >= (backbone_mtu + MAX_PACKET_FRAME_RESERVE) * 2 + HDLC_FLAG_OVERHEAD,
+            "hdlc buffer must cover worst-case escaping at large MTU",
+        );
+    }
+
+    #[test]
+    fn rx_frame_capacity_covers_worst_case_hdlc_frame() {
+        // An incoming frame is HDLC-encoded, so in the worst case every byte
+        // is escaped (doubled) plus two flag bytes.
+        let mtu = 1_048_576usize;
+        let cap = rx_frame_capacity(mtu);
+        assert_eq!(cap, mtu * 2 + HDLC_FLAG_OVERHEAD);
+        assert!(
+            cap >= mtu * 2 + HDLC_FLAG_OVERHEAD,
+            "rx capacity must hold worst-case escaped incoming frame",
         );
     }
 

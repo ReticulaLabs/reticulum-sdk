@@ -8,9 +8,9 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::OutputBuffer;
 use crate::error::RnsError;
 use crate::iface::{
-    decode_rx, encode_tx, CONNECT_TIMEOUT, DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF, Interface,
-    InterfaceContext, InterfaceMode, MAX_AUTOCONFIGURED_HW_MTU, MAX_RECONNECT_BACKOFF, RxMessage,
-    configured_bitrate, set_tcp_sockopts,
+    decode_rx, encode_tx, rx_frame_capacity, set_tcp_sockopts, tx_frame_buffer_sizes, CONNECT_TIMEOUT,
+    DEFAULT_HW_MTU, INITIAL_RECONNECT_BACKOFF, Interface, InterfaceContext, InterfaceMode,
+    MAX_RECONNECT_BACKOFF, RxMessage, configured_bitrate,
 };
 use crate::packet::{Header, HeaderType, RETICULUM_HEADER_MINSIZE, RETICULUM_MAX_HEADER_SIZE};
 
@@ -85,6 +85,13 @@ impl TcpClient {
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
         let mut reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
 
+        // Size the TX/RX buffers from the interface's MTU so they can carry
+        // frames of every possible size up to that MTU (including worst-case
+        // HDLC escaping) without a fixed maximum-size allocation.
+        let hw_mtu = { context.inner.lock().unwrap().hw_mtu() };
+        let (tx_capacity, hdlc_capacity) = tx_frame_buffer_sizes(hw_mtu);
+        let rx_capacity = rx_frame_capacity(hw_mtu);
+
         let mut running = true;
         'outer: loop {
             if !running || context.cancel.is_cancelled() {
@@ -156,7 +163,7 @@ impl TcpClient {
                 let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
-                    let mut frame_buffer = Vec::with_capacity(DEFAULT_HW_MTU);
+                    let mut frame_buffer = Vec::with_capacity(rx_capacity);
                     let mut hdlc_rx_buffer = Vec::new();
                     let mut tcp_buffer = [0u8; TCP_READ_BUFFER_SIZE];
 
@@ -264,13 +271,13 @@ impl TcpClient {
                                             if consumed > 0 {
                                                 frame_buffer.drain(..consumed);
                                             }
-                                            if frame_buffer.len() > MAX_AUTOCONFIGURED_HW_MTU {
+                                            if frame_buffer.len() > rx_capacity {
                                                 log::warn!(
                                                     "tcp_client: dropping oversized partial hdlc frame iface={} peer=<{}> buffered_len={} max_len={}",
                                                     iface_address,
                                                     rx_addr,
                                                     frame_buffer.len(),
-                                                    MAX_AUTOCONFIGURED_HW_MTU,
+                                                    rx_capacity,
                                                 );
                                                 frame_buffer.clear();
                                             }
@@ -295,8 +302,8 @@ impl TcpClient {
                 let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
-                    let mut hdlc_tx_buffer = vec![0u8; MAX_AUTOCONFIGURED_HW_MTU + 2];
-                    let mut tx_buffer = vec![0u8; MAX_AUTOCONFIGURED_HW_MTU];
+                    let mut hdlc_tx_buffer = vec![0u8; hdlc_capacity];
+                    let mut tx_buffer = vec![0u8; tx_capacity];
 
                     loop {
                         if stop.is_cancelled() {
