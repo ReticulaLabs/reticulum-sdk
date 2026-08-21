@@ -108,6 +108,12 @@ pub(crate) const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 /// (without even the backoff check).  Guards the public backbone server
 /// against connection-flooding clients.
 pub(crate) const RECONNECT_REJECTION_BLOCK_THRESHOLD: usize = 200;
+/// Duration a blocklisted IP remains blocked before it is allowed to attempt
+/// a connection again.  Matches Python's `BackboneInterface.FAST_FLAP_EXPIRY`.
+/// A blocked IP that keeps attempting (and thus keeps getting rejected) stays
+/// blocked, mirroring Python's behavior of refreshing the flap window on each
+/// teardown.
+pub(crate) const RECONNECT_BLOCK_EXPIRY: Duration = Duration::from_secs(12 * 60 * 60);
 /// Maximum time a single client-side connect attempt may take before it is
 /// abandoned and the reconnect backoff path is engaged.  Prevents a silent
 /// (SYN-dropping or firewalled) remote from pinning the interface in a
@@ -510,6 +516,8 @@ pub struct NamedReconnectPacerMetrics {
     pub max_backoff_ms: u64,
     /// Number of rejections that triggers a blocklist.
     pub block_threshold: usize,
+    /// Duration (seconds) a blocklist remains effective before it expires.
+    pub block_expiry_secs: u64,
 }
 
 pub struct InterfaceChannel {
@@ -1726,6 +1734,7 @@ impl InterfaceManager {
                     initial_backoff_ms: metrics.initial_backoff_ms,
                     max_backoff_ms: metrics.max_backoff_ms,
                     block_threshold: metrics.block_threshold,
+                    block_expiry_secs: metrics.block_expiry_secs,
                 }
             })
             .collect()

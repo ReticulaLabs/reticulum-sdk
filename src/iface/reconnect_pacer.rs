@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use crate::iface::RECONNECT_REJECTION_BLOCK_THRESHOLD;
+use crate::iface::{RECONNECT_BLOCK_EXPIRY, RECONNECT_REJECTION_BLOCK_THRESHOLD};
 
 /// Per-source-IP reconnect backoff pacer.
 ///
@@ -17,11 +17,15 @@ use crate::iface::RECONNECT_REJECTION_BLOCK_THRESHOLD;
 /// (see [`RECONNECT_REJECTION_BLOCK_THRESHOLD`]) is blocklisted: every
 /// subsequent connection from that IP is dropped immediately, before the
 /// backoff check, so a connection-flooding client cannot keep consuming
-/// accept/backoff work indefinitely.
+/// accept/backoff work indefinitely.  A blocked IP remains blocked until
+/// either [`RECONNECT_BLOCK_EXPIRY`] passes without further attempts, or a
+/// connection is genuinely accepted (which clears the block), matching the
+/// behaviour of Python's `BackboneInterface` fast-flapping block.
 pub(crate) struct ReconnectPacer {
     entries: HashMap<IpAddr, ReconnectEntry>,
     initial_backoff: Duration,
     max_backoff: Duration,
+    block_expiry: Duration,
     cleanup_interval: Duration,
     last_cleanup: Instant,
 }
@@ -34,6 +38,10 @@ struct ReconnectEntry {
     /// Set once `rejections` reaches the block threshold; while true the IP
     /// is blocklisted and all connections are dropped immediately.
     blocked: bool,
+    /// When the current block began (or the last time the IP was rejected
+    /// while already blocked).  Used to expire a block after
+    /// [`ReconnectPacer::block_expiry`] of no further attempts.
+    blocked_at: Option<Instant>,
 }
 
 /// Snapshot of the reconnect pacer state for external metrics collection.
@@ -53,6 +61,8 @@ pub struct ReconnectPacerMetrics {
     pub max_backoff_ms: u64,
     /// Number of rejections that triggers a blocklist.
     pub block_threshold: usize,
+    /// Duration a blocklist remains effective before it expires.
+    pub block_expiry_secs: u64,
 }
 
 impl ReconnectPacer {
@@ -65,31 +75,46 @@ impl ReconnectPacer {
             entries: HashMap::new(),
             initial_backoff,
             max_backoff,
+            block_expiry: RECONNECT_BLOCK_EXPIRY,
             cleanup_interval,
             last_cleanup: Instant::now(),
         }
     }
 
+    /// Override the blocklist expiry (used by tests to exercise expiry without
+    /// waiting the real 12-hour default).
+    #[cfg(test)]
+    fn with_block_expiry(mut self, block_expiry: Duration) -> Self {
+        self.block_expiry = block_expiry;
+        self
+    }
+
     /// Returns `true` if the given IP is currently allowed to reconnect.
     /// Call this *after* accepting the TCP connection but *before* spawning
-    /// the client handler.  Blocklisted IPs are always denied.
+    /// the client handler.  Blocklisted IPs are denied unless their block has
+    /// expired, in which case the block is cleared and the IP is allowed.
     pub(crate) fn is_allowed(&self, ip: IpAddr) -> bool {
-        match self.entries.get(&ip) {
-            Some(entry) => {
-                if entry.blocked {
-                    return false;
-                }
-                let now = Instant::now();
-                now - entry.last_connect >= entry.backoff
+        let Some(entry) = self.entries.get(&ip) else {
+            return true;
+        };
+        if entry.blocked {
+            let now = Instant::now();
+            let expired = entry
+                .blocked_at
+                .map(|at| now.duration_since(at) >= self.block_expiry)
+                .unwrap_or(false);
+            if !expired {
+                return false;
             }
-            None => true,
         }
+        let now = Instant::now();
+        now - entry.last_connect >= entry.backoff
     }
 
     /// Record a successful connection from this IP.  This updates the
     /// per-IP backoff window so subsequent rapid reconnects are rejected,
-    /// and clears the accumulated rejection count (a legitimately accepted
-    /// connection proves the IP is not merely flooding).
+    /// clears the accumulated rejection count, and clears any block (a
+    /// legitimately accepted connection proves the IP is not merely flooding).
     /// Should be called only when `is_allowed()` returned `true`.
     pub(crate) fn record(&mut self, ip: IpAddr) {
         self.maybe_cleanup();
@@ -102,6 +127,7 @@ impl ReconnectPacer {
             backoff: self.initial_backoff,
             rejections: 0,
             blocked: false,
+            blocked_at: None,
         });
 
         if !is_first {
@@ -114,13 +140,16 @@ impl ReconnectPacer {
         }
         entry.last_connect = now;
         entry.rejections = 0;
+        entry.blocked = false;
+        entry.blocked_at = None;
     }
 
     /// Record a rejected (backoff-active or blocked) connection attempt from
     /// this IP.  Once the accumulated rejection count reaches the block
     /// threshold the IP is blocklisted and all further connections are
-    /// dropped immediately.  Should be called only when `is_allowed()`
-    /// returned `false`.
+    /// dropped immediately.  A blocked IP that keeps attempting keeps its
+    /// block fresh (mirroring Python refreshing the flap window on each
+    /// teardown).  Should be called only when `is_allowed()` returned `false`.
     pub(crate) fn record_rejection(&mut self, ip: IpAddr) {
         let now = Instant::now();
         let entry = self.entries.entry(ip).or_insert(ReconnectEntry {
@@ -128,20 +157,33 @@ impl ReconnectPacer {
             backoff: self.initial_backoff,
             rejections: 0,
             blocked: false,
+            blocked_at: None,
         });
         entry.rejections = entry.rejections.saturating_add(1);
         if entry.rejections >= RECONNECT_REJECTION_BLOCK_THRESHOLD as u32 {
             entry.blocked = true;
+            entry.blocked_at = Some(now);
+        } else if entry.blocked {
+            // Already blocked: a continued attempt keeps the block fresh so a
+            // persistent flooder cannot let its block expire while still
+            // hammering the server.
+            entry.blocked_at = Some(now);
         }
     }
 
-    /// Returns `true` if this IP has been blocklisted for exceeding the
-    /// rejection threshold.
+    /// Returns `true` if this IP is currently blocklisted for exceeding the
+    /// rejection threshold and the block has not yet expired.
     pub(crate) fn is_blocked(&self, ip: IpAddr) -> bool {
-        self.entries
-            .get(&ip)
-            .map(|entry| entry.blocked)
-            .unwrap_or(false)
+        let Some(entry) = self.entries.get(&ip) else {
+            return false;
+        };
+        if !entry.blocked {
+            return false;
+        }
+        entry
+            .blocked_at
+            .map(|at| Instant::now().duration_since(at) < self.block_expiry)
+            .unwrap_or(true)
     }
 
     /// Take a metrics snapshot without mutating internal state.
@@ -160,6 +202,7 @@ impl ReconnectPacer {
             initial_backoff_ms: self.initial_backoff.as_millis() as u64,
             max_backoff_ms: self.max_backoff.as_millis() as u64,
             block_threshold: RECONNECT_REJECTION_BLOCK_THRESHOLD,
+            block_expiry_secs: self.block_expiry.as_secs(),
         }
     }
 
@@ -168,8 +211,18 @@ impl ReconnectPacer {
         if now - self.last_cleanup >= self.cleanup_interval {
             self.last_cleanup = now;
             let retain_duration = self.max_backoff.saturating_mul(2);
-            self.entries
-                .retain(|_, entry| !entry.blocked || now - entry.last_connect < retain_duration);
+            self.entries.retain(|_, entry| {
+                if entry.blocked {
+                    // Keep blocked entries until their block expires.  An
+                    // expired block is dropped so the IP can start fresh.
+                    entry
+                        .blocked_at
+                        .map(|at| now.duration_since(at) < self.block_expiry)
+                        .unwrap_or(false)
+                } else {
+                    now - entry.last_connect < retain_duration
+                }
+            });
         }
     }
 }
@@ -395,5 +448,88 @@ mod tests {
         assert_eq!(m.total_tracked_ips, 2);
         assert_eq!(m.blocked_ips, 1);
         assert_eq!(m.block_threshold, RECONNECT_REJECTION_BLOCK_THRESHOLD);
+    }
+
+    #[test]
+    fn blocked_ip_expires_after_block_expiry() {
+        let block_expiry = Duration::from_millis(200);
+        let initial_backoff = Duration::from_millis(50);
+        let mut pacer = ReconnectPacer::new(
+            initial_backoff,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )
+        .with_block_expiry(block_expiry);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Build up to the block threshold.
+        for _ in 0..RECONNECT_REJECTION_BLOCK_THRESHOLD {
+            pacer.record_rejection(ip);
+        }
+        assert!(pacer.is_blocked(ip));
+        assert!(!pacer.is_allowed(ip));
+
+        // Once the block expiry passes without further attempts, the IP is no
+        // longer blocklisted.  With the short initial backoff also elapsed,
+        // it is allowed to try again.
+        std::thread::sleep(block_expiry + initial_backoff + Duration::from_millis(20));
+        assert!(!pacer.is_blocked(ip));
+        assert!(pacer.is_allowed(ip));
+    }
+
+    #[test]
+    fn continued_rejections_while_blocked_keep_block_fresh() {
+        let block_expiry = Duration::from_millis(200);
+        let mut pacer = ReconnectPacer::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )
+        .with_block_expiry(block_expiry);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Build up to the block threshold.
+        for _ in 0..RECONNECT_REJECTION_BLOCK_THRESHOLD {
+            pacer.record_rejection(ip);
+        }
+        assert!(pacer.is_blocked(ip));
+
+        // A persistent flooder keeps trying; each attempt refreshes the block
+        // so it never expires while the peer is still hammering.
+        let mut still_blocked = true;
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(50));
+            pacer.record_rejection(ip);
+            if !pacer.is_blocked(ip) {
+                still_blocked = false;
+                break;
+            }
+        }
+        assert!(
+            still_blocked,
+            "continued attempts must keep the block fresh"
+        );
+    }
+
+    #[test]
+    fn accepted_connection_clears_block() {
+        let block_expiry = Duration::from_millis(200);
+        let mut pacer = ReconnectPacer::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )
+        .with_block_expiry(block_expiry);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Build up to the block threshold.
+        for _ in 0..RECONNECT_REJECTION_BLOCK_THRESHOLD {
+            pacer.record_rejection(ip);
+        }
+        assert!(pacer.is_blocked(ip));
+
+        // A genuinely accepted connection clears the block entirely.
+        pacer.record(ip);
+        assert!(!pacer.is_blocked(ip));
     }
 }
