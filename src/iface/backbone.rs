@@ -239,6 +239,11 @@ impl BackboneServer {
                                 {
                                     let mut pacer = reconnect_pacer.lock().unwrap();
                                     if pacer.is_blocked(peer_ip) {
+                                        // Refresh the block so a persistent
+                                        // flooder cannot let its block expire
+                                        // while still hammering the server
+                                        // (mirrors Python's fast-flap window).
+                                        pacer.record_rejection(peer_ip);
                                         log::debug!(
                                             "backbone_server: dropping connection from blocklisted <{}>",
                                             client.1,
