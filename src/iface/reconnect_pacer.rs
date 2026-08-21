@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+use crate::iface::RECONNECT_REJECTION_BLOCK_THRESHOLD;
+
 /// Per-source-IP reconnect backoff pacer.
 ///
 /// Tracks how recently and how often each client IP address has connected
@@ -10,6 +12,12 @@ use std::time::{Duration, Instant};
 /// rejected.  The backoff doubles on each accepted connection up to a
 /// configurable maximum, preventing rapid reconnect storms from
 /// misbehaving or buggy clients.
+///
+/// Additionally, a source IP that accumulates too many pacer rejections
+/// (see [`RECONNECT_REJECTION_BLOCK_THRESHOLD`]) is blocklisted: every
+/// subsequent connection from that IP is dropped immediately, before the
+/// backoff check, so a connection-flooding client cannot keep consuming
+/// accept/backoff work indefinitely.
 pub(crate) struct ReconnectPacer {
     entries: HashMap<IpAddr, ReconnectEntry>,
     initial_backoff: Duration,
@@ -21,6 +29,11 @@ pub(crate) struct ReconnectPacer {
 struct ReconnectEntry {
     last_connect: Instant,
     backoff: Duration,
+    /// Number of rejections this IP has accumulated while in backoff.
+    rejections: u32,
+    /// Set once `rejections` reaches the block threshold; while true the IP
+    /// is blocklisted and all connections are dropped immediately.
+    blocked: bool,
 }
 
 /// Snapshot of the reconnect pacer state for external metrics collection.
@@ -31,10 +44,15 @@ pub struct ReconnectPacerMetrics {
     pub entries_in_backoff: usize,
     /// Total number of source IPs currently tracked by the pacer.
     pub total_tracked_ips: usize,
+    /// Number of source IPs that have been blocklisted for exceeding the
+    /// rejection threshold.
+    pub blocked_ips: usize,
     /// Configured initial backoff duration.
     pub initial_backoff_ms: u64,
     /// Configured maximum backoff duration.
     pub max_backoff_ms: u64,
+    /// Number of rejections that triggers a blocklist.
+    pub block_threshold: usize,
 }
 
 impl ReconnectPacer {
@@ -54,10 +72,13 @@ impl ReconnectPacer {
 
     /// Returns `true` if the given IP is currently allowed to reconnect.
     /// Call this *after* accepting the TCP connection but *before* spawning
-    /// the client handler.
+    /// the client handler.  Blocklisted IPs are always denied.
     pub(crate) fn is_allowed(&self, ip: IpAddr) -> bool {
         match self.entries.get(&ip) {
             Some(entry) => {
+                if entry.blocked {
+                    return false;
+                }
                 let now = Instant::now();
                 now - entry.last_connect >= entry.backoff
             }
@@ -66,7 +87,9 @@ impl ReconnectPacer {
     }
 
     /// Record a successful connection from this IP.  This updates the
-    /// per-IP backoff window so subsequent rapid reconnects are rejected.
+    /// per-IP backoff window so subsequent rapid reconnects are rejected,
+    /// and clears the accumulated rejection count (a legitimately accepted
+    /// connection proves the IP is not merely flooding).
     /// Should be called only when `is_allowed()` returned `true`.
     pub(crate) fn record(&mut self, ip: IpAddr) {
         self.maybe_cleanup();
@@ -77,6 +100,8 @@ impl ReconnectPacer {
         let entry = self.entries.entry(ip).or_insert(ReconnectEntry {
             last_connect: now,
             backoff: self.initial_backoff,
+            rejections: 0,
+            blocked: false,
         });
 
         if !is_first {
@@ -88,6 +113,35 @@ impl ReconnectPacer {
             }
         }
         entry.last_connect = now;
+        entry.rejections = 0;
+    }
+
+    /// Record a rejected (backoff-active or blocked) connection attempt from
+    /// this IP.  Once the accumulated rejection count reaches the block
+    /// threshold the IP is blocklisted and all further connections are
+    /// dropped immediately.  Should be called only when `is_allowed()`
+    /// returned `false`.
+    pub(crate) fn record_rejection(&mut self, ip: IpAddr) {
+        let now = Instant::now();
+        let entry = self.entries.entry(ip).or_insert(ReconnectEntry {
+            last_connect: now,
+            backoff: self.initial_backoff,
+            rejections: 0,
+            blocked: false,
+        });
+        entry.rejections = entry.rejections.saturating_add(1);
+        if entry.rejections >= RECONNECT_REJECTION_BLOCK_THRESHOLD as u32 {
+            entry.blocked = true;
+        }
+    }
+
+    /// Returns `true` if this IP has been blocklisted for exceeding the
+    /// rejection threshold.
+    pub(crate) fn is_blocked(&self, ip: IpAddr) -> bool {
+        self.entries
+            .get(&ip)
+            .map(|entry| entry.blocked)
+            .unwrap_or(false)
     }
 
     /// Take a metrics snapshot without mutating internal state.
@@ -96,13 +150,16 @@ impl ReconnectPacer {
         let entries_in_backoff = self
             .entries
             .values()
-            .filter(|e| now - e.last_connect < e.backoff)
+            .filter(|e| !e.blocked && now - e.last_connect < e.backoff)
             .count();
+        let blocked_ips = self.entries.values().filter(|e| e.blocked).count();
         ReconnectPacerMetrics {
             entries_in_backoff,
             total_tracked_ips: self.entries.len(),
+            blocked_ips,
             initial_backoff_ms: self.initial_backoff.as_millis() as u64,
             max_backoff_ms: self.max_backoff.as_millis() as u64,
+            block_threshold: RECONNECT_REJECTION_BLOCK_THRESHOLD,
         }
     }
 
@@ -112,7 +169,7 @@ impl ReconnectPacer {
             self.last_cleanup = now;
             let retain_duration = self.max_backoff.saturating_mul(2);
             self.entries
-                .retain(|_, entry| now - entry.last_connect < retain_duration);
+                .retain(|_, entry| !entry.blocked || now - entry.last_connect < retain_duration);
         }
     }
 }
@@ -232,5 +289,111 @@ mod tests {
         pacer.record(ip_a);
         assert!(!pacer.is_allowed(ip_a));
         assert!(pacer.is_allowed(ip_b));
+    }
+
+    #[test]
+    fn ip_is_blocklisted_after_rejection_threshold() {
+        let mut pacer = ReconnectPacer::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // First rejection moves the untracked (allowed) IP into tracked-and-
+        // rejected state; rejections accumulate below the threshold without
+        // blocking.
+        pacer.record_rejection(ip);
+        for _ in 1..(RECONNECT_REJECTION_BLOCK_THRESHOLD - 1) {
+            assert!(!pacer.is_blocked(ip));
+            assert!(!pacer.is_allowed(ip));
+            pacer.record_rejection(ip);
+        }
+        // Total rejections so far: 1 + (THRESHOLD - 2) = THRESHOLD - 1.
+        assert!(!pacer.is_blocked(ip));
+
+        // The threshold rejection flips the IP to blocked.
+        assert!(!pacer.is_allowed(ip));
+        pacer.record_rejection(ip);
+        assert!(pacer.is_blocked(ip));
+        assert!(!pacer.is_allowed(ip));
+    }
+
+    #[test]
+    fn blocked_ip_is_denied_even_after_backoff_expires() {
+        let mut pacer = ReconnectPacer::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Build up to the block threshold.
+        for _ in 0..RECONNECT_REJECTION_BLOCK_THRESHOLD {
+            pacer.record_rejection(ip);
+        }
+        assert!(pacer.is_blocked(ip));
+
+        // Even after a long wait (well past max_backoff), a blocked IP is
+        // still denied immediately.
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(!pacer.is_allowed(ip));
+    }
+
+    #[test]
+    fn accepted_connection_resets_rejection_count() {
+        let mut pacer = ReconnectPacer::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Accumulate rejections below the threshold.
+        for _ in 0..(RECONNECT_REJECTION_BLOCK_THRESHOLD - 1) {
+            pacer.record_rejection(ip);
+        }
+        assert!(!pacer.is_blocked(ip));
+
+        // A successful connection clears the rejection count.
+        pacer.record(ip);
+        assert!(!pacer.is_blocked(ip));
+        assert!(!pacer.is_allowed(ip)); // now in backoff, but not blocked
+
+        // Rejections start counting again from zero.
+        for _ in 0..(RECONNECT_REJECTION_BLOCK_THRESHOLD - 1) {
+            pacer.record_rejection(ip);
+        }
+        assert!(
+            !pacer.is_blocked(ip),
+            "rejections were not reset by record()"
+        );
+    }
+
+    #[test]
+    fn blocked_ips_are_not_counted_as_in_backoff() {
+        let mut pacer = ReconnectPacer::new(
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let normal: IpAddr = "10.0.0.1".parse().unwrap();
+        let blocked: IpAddr = "10.0.0.2".parse().unwrap();
+
+        // normal IP in backoff
+        pacer.record(normal);
+        // blocked IP
+        for _ in 0..RECONNECT_REJECTION_BLOCK_THRESHOLD {
+            pacer.record_rejection(blocked);
+        }
+        assert!(pacer.is_blocked(blocked));
+
+        let m = pacer.metrics();
+        // Only the normal IP counts toward entries_in_backoff; blocked IPs are
+        // tracked separately and excluded.
+        assert_eq!(m.entries_in_backoff, 1);
+        assert_eq!(m.total_tracked_ips, 2);
+        assert_eq!(m.blocked_ips, 1);
+        assert_eq!(m.block_threshold, RECONNECT_REJECTION_BLOCK_THRESHOLD);
     }
 }

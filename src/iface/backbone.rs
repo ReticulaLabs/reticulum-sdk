@@ -232,14 +232,32 @@ impl BackboneServer {
                                 let peer_ip = client.1.ip();
 
                                 // Per-IP backoff: reject rapid reconnects from
-                                // the same source address before spawning a handler.
+                                // the same source address before spawning a
+                                // handler.  A source that accumulates too many
+                                // rejections is blocklisted and dropped
+                                // immediately (before the backoff check).
                                 {
                                     let mut pacer = reconnect_pacer.lock().unwrap();
-                                    if !pacer.is_allowed(peer_ip) {
+                                    if pacer.is_blocked(peer_ip) {
                                         log::debug!(
-                                            "backbone_server: rejecting reconnect from <{}> (backoff active)",
+                                            "backbone_server: dropping connection from blocklisted <{}>",
                                             client.1,
                                         );
+                                        continue;
+                                    }
+                                    if !pacer.is_allowed(peer_ip) {
+                                        pacer.record_rejection(peer_ip);
+                                        if pacer.is_blocked(peer_ip) {
+                                            log::warn!(
+                                                "backbone_server: blocklisting <{}> after too many reconnect rejections",
+                                                client.1,
+                                            );
+                                        } else {
+                                            log::debug!(
+                                                "backbone_server: rejecting reconnect from <{}> (backoff active)",
+                                                client.1,
+                                            );
+                                        }
                                         continue;
                                     }
                                     pacer.record(peer_ip);

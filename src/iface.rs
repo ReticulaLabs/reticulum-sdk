@@ -103,6 +103,11 @@ const SATURATED_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum reconnect backoff for client-style interfaces.
 pub(crate) const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// Number of pacer rejections from a single source IP before that IP is
+/// blocklisted and all subsequent connections from it are dropped immediately
+/// (without even the backoff check).  Guards the public backbone server
+/// against connection-flooding clients.
+pub(crate) const RECONNECT_REJECTION_BLOCK_THRESHOLD: usize = 200;
 /// Maximum time a single client-side connect attempt may take before it is
 /// abandoned and the reconnect backoff path is engaged.  Prevents a silent
 /// (SYN-dropping or firewalled) remote from pinning the interface in a
@@ -497,10 +502,14 @@ pub struct NamedReconnectPacerMetrics {
     pub entries_in_backoff: usize,
     /// Total number of source IPs tracked by this pacer.
     pub total_tracked_ips: usize,
+    /// Number of source IPs blocklisted for exceeding the rejection threshold.
+    pub blocked_ips: usize,
     /// Configured initial backoff in milliseconds.
     pub initial_backoff_ms: u64,
     /// Configured maximum backoff in milliseconds.
     pub max_backoff_ms: u64,
+    /// Number of rejections that triggers a blocklist.
+    pub block_threshold: usize,
 }
 
 pub struct InterfaceChannel {
@@ -1713,8 +1722,10 @@ impl InterfaceManager {
                     name: name.clone(),
                     entries_in_backoff: metrics.entries_in_backoff,
                     total_tracked_ips: metrics.total_tracked_ips,
+                    blocked_ips: metrics.blocked_ips,
                     initial_backoff_ms: metrics.initial_backoff_ms,
                     max_backoff_ms: metrics.max_backoff_ms,
+                    block_threshold: metrics.block_threshold,
                 }
             })
             .collect()
