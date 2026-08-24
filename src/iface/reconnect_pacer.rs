@@ -114,13 +114,15 @@ impl ReconnectPacer {
     /// Record a successful connection from this IP.  This updates the
     /// per-IP backoff window so subsequent rapid reconnects are rejected.
     ///
-    /// The accumulated rejection count is reset only when the peer has
-    /// demonstrated stability — a gap of at least [`ReconnectPacer::max_backoff`]
-    /// since its previous connection.  A peer that keeps reconnecting within
-    /// its backoff window (and thus keeps being rejected between accepts)
-    /// retains its rejection history so it can still reach the block
-    /// threshold.  This mirrors Python's `BackboneInterface`, which never
-    /// clears the fast-flap counter on a successful connection.
+    /// The accumulated rejection count is deliberately NOT reset here: a peer
+    /// that keeps reconnecting (and thus keeps being rejected between accepts)
+    /// must accumulate toward the block threshold even if it is occasionally
+    /// accepted — otherwise a flapper whose backoff has maxed out would have
+    /// its count wiped on every accept and never reach the block threshold.
+    /// This mirrors Python's `BackboneInterface`, which never clears its
+    /// fast-flap counter on a successful connection.  A rejection history is
+    /// only cleared when the block expires (12h) or the entry is evicted after
+    /// prolonged inactivity.
     pub(crate) fn record(&mut self, ip: IpAddr) {
         self.maybe_cleanup();
 
@@ -138,13 +140,8 @@ impl ReconnectPacer {
         if !is_first {
             let elapsed = now - entry.last_connect;
             if elapsed >= self.max_backoff {
-                // The peer waited a full backoff window before reconnecting:
-                // it has settled down, so give it a clean slate.
                 entry.backoff = self.initial_backoff;
-                entry.rejections = 0;
             } else {
-                // Still connecting rapidly — keep the rejection history so a
-                // persistent flapper accumulates toward the block threshold.
                 entry.backoff = self.max_backoff.min(entry.backoff.saturating_mul(2));
             }
         }
@@ -404,17 +401,17 @@ mod tests {
 
     #[test]
     fn rapid_reconnects_accumulate_rejections_toward_block() {
+        // A flapper whose backoff maxes out is rejected for most of the window,
+        // then accepted at the max-backoff boundary.  The accept must NOT reset
+        // the rejection count, or the block threshold is never reached (this
+        // was the production bug: the count reset every 30s accept).
         let mut pacer = ReconnectPacer::new(
             Duration::from_millis(10),
-            Duration::from_secs(30),
+            Duration::from_millis(50),
             Duration::from_secs(60),
         );
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        // A flapper keeps connecting within its backoff window: accepted,
-        // rejected repeatedly, accepted again.  An accept while still
-        // connecting rapidly must NOT reset the accumulated rejection count,
-        // otherwise the block threshold is never reached.
         let mut total_rejections = 0;
         while total_rejections < RECONNECT_REJECTION_BLOCK_THRESHOLD {
             if pacer.is_allowed(ip) {
@@ -433,10 +430,13 @@ mod tests {
     }
 
     #[test]
-    fn stable_gap_resets_rejection_history() {
+    fn rejections_persist_across_accepts_even_after_stable_gap() {
+        // Matching Python (which never clears the fast-flap counter on a
+        // successful connection): an accept — even one after a full backoff
+        // window — must not reset the rejection history.
         let mut pacer = ReconnectPacer::new(
             Duration::from_millis(10),
-            Duration::from_secs(30),
+            Duration::from_millis(50),
             Duration::from_secs(60),
         );
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -447,20 +447,17 @@ mod tests {
         }
         assert!(!pacer.is_blocked(ip));
 
-        // Wait out the full backoff window: the peer has settled down, so the
-        // next successful connection clears its rejection history.
-        std::thread::sleep(Duration::from_secs(31));
+        // Simulate an accepted connection after a gap longer than max_backoff.
+        std::thread::sleep(Duration::from_millis(60));
         pacer.record(ip);
-        assert!(!pacer.is_blocked(ip));
 
-        // Rejections are cleared; a fresh set below the threshold does not
-        // block the peer.
-        for _ in 0..(RECONNECT_REJECTION_BLOCK_THRESHOLD - 1) {
-            pacer.record_rejection(ip);
-        }
+        // The rejection history is preserved: one more rejection crosses the
+        // threshold and blocks the peer.
+        assert!(!pacer.is_blocked(ip));
+        pacer.record_rejection(ip);
         assert!(
-            !pacer.is_blocked(ip),
-            "stable peer history should have been reset by record()"
+            pacer.is_blocked(ip),
+            "accepted connection must not reset the rejection history"
         );
     }
 
