@@ -244,7 +244,7 @@ impl BackboneServer {
                                         // while still hammering the server
                                         // (mirrors Python's fast-flap window).
                                         pacer.record_rejection(peer_ip);
-                                        log::debug!(
+                                        log::trace!(
                                             "backbone_server: dropping connection from blocklisted <{}>",
                                             client.1,
                                         );
