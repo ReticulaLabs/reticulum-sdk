@@ -19,6 +19,17 @@ const PATHFINDER_RW_MILLIS: u64 = 500;
 /// Matches Python `LOCAL_REBROADCASTS_MAX`.
 const LOCAL_REBROADCASTS_MAX: u8 = 2;
 
+/// How long completed announces are retained in the archive cache to answer
+/// onward path requests.  Bounds the cache so it cannot grow to the full
+/// capacity on long-running nodes.
+const ANNOUNCE_CACHE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+/// Minimum interval between archive-cache prune sweeps.  The prune is
+/// triggered from the 1-second retransmit cycle but throttled to this
+/// cadence so a large cache is not swept on every tick.
+const ANNOUNCE_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+/// Maximum number of destinations retained in the archive cache (per bucket).
+const ANNOUNCE_CACHE_CAPACITY: usize = 10_000;
+
 fn random_rw_jitter() -> Duration {
     let mut rng = UnwrapErr(SysRng);
     Duration::from_millis(rng.next_u64() % (PATHFINDER_RW_MILLIS + 1))
@@ -111,6 +122,7 @@ struct AnnounceCache {
     newer: Option<BTreeMap<AddressHash, AnnounceEntry>>,
     older: Option<BTreeMap<AddressHash, AnnounceEntry>>,
     capacity: usize,
+    last_prune: Instant,
 }
 
 impl AnnounceCache {
@@ -119,6 +131,7 @@ impl AnnounceCache {
             newer: Some(BTreeMap::new()),
             older: None,
             capacity,
+            last_prune: Instant::now(),
         }
     }
 
@@ -143,6 +156,24 @@ impl AnnounceCache {
         return None;
     }
 
+    /// Drop archive entries whose announce is older than `max_age`.  Kept
+    /// throttled by [`ANNOUNCE_CACHE_PRUNE_INTERVAL`] so sweeping a large
+    /// cache is amortised over many retransmit cycles.
+    fn prune(&mut self, max_age: Duration) {
+        let now = Instant::now();
+        if now.duration_since(self.last_prune) < ANNOUNCE_CACHE_PRUNE_INTERVAL {
+            return;
+        }
+        self.last_prune = now;
+
+        if let Some(newer) = &mut self.newer {
+            newer.retain(|_, entry| now.duration_since(entry.timestamp) <= max_age);
+        }
+        if let Some(older) = &mut self.older {
+            older.retain(|_, entry| now.duration_since(entry.timestamp) <= max_age);
+        }
+    }
+
     fn clear(&mut self) {
         self.newer.as_mut().unwrap().clear();
         self.older = None;
@@ -160,7 +191,7 @@ impl AnnounceTable {
         Self {
             map: BTreeMap::new(),
             responses: BTreeMap::new(),
-            cache: AnnounceCache::new(100000), // TODO make capacity configurable
+            cache: AnnounceCache::new(ANNOUNCE_CACHE_CAPACITY),
         }
     }
 
@@ -221,6 +252,17 @@ impl AnnounceTable {
 
     pub fn entries_len(&self) -> usize {
         self.map.len() + self.responses.len()
+    }
+
+    /// Number of destinations retained in the archive cache used to answer
+    /// onward path requests.
+    pub fn cache_len(&self) -> usize {
+        self.cache
+            .newer
+            .as_ref()
+            .map(|newer| newer.len())
+            .unwrap_or(0)
+            + self.cache.older.as_ref().map(|older| older.len()).unwrap_or(0)
     }
 
     pub fn clear(&mut self) {
@@ -294,6 +336,10 @@ impl AnnounceTable {
     pub fn to_retransmit(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {
         let mut messages = vec![];
         let mut completed = vec![];
+
+        // Throttled prune of the archive cache so stale announce entries do
+        // not accumulate to the capacity cap on long-running nodes.
+        self.cache.prune(ANNOUNCE_CACHE_MAX_AGE);
 
         for (destination, ref mut entry) in &mut self.map {
             if self.responses.contains_key(destination) {
@@ -558,5 +604,94 @@ mod tests {
             "announce must be rebroadcast to all interfaces, carrying the \
              ingress interface as the mode-filtering origin (not excluded)",
         );
+    }
+
+    /// The archive cache drops entries whose announce is older than
+    /// [`ANNOUNCE_CACHE_MAX_AGE`], preventing it from accumulating to the
+    /// capacity cap on long-running nodes.
+    #[tokio::test(start_paused = true)]
+    async fn archive_cache_prunes_stale_entries() {
+        let mut cache = AnnounceCache::new(10);
+        let stale_dest = AddressHash::new([0x11; 16]);
+        let fresh_dest = AddressHash::new([0x22; 16]);
+
+        let mut stale_entry = make_announce_entry(stale_dest);
+        stale_entry.timestamp = time::Instant::now();
+        cache.insert(stale_dest, stale_entry);
+
+        // Age the stale entry past the retention window, then add a fresh one.
+        time::advance(ANNOUNCE_CACHE_MAX_AGE + Duration::from_secs(1)).await;
+        let mut fresh_entry = make_announce_entry(fresh_dest);
+        fresh_entry.timestamp = time::Instant::now();
+        cache.insert(fresh_dest, fresh_entry);
+
+        // Ensure the throttled prune interval has also elapsed so the sweep
+        // actually runs.
+        time::advance(ANNOUNCE_CACHE_PRUNE_INTERVAL + Duration::from_secs(1)).await;
+        cache.prune(ANNOUNCE_CACHE_MAX_AGE);
+
+        assert!(
+            cache.get(&stale_dest).is_none(),
+            "archive entries older than the max age must be pruned"
+        );
+        assert!(
+            cache.get(&fresh_dest).is_some(),
+            "recent archive entries must be retained"
+        );
+    }
+
+    /// The archive-cache prune is throttled: sweeps before
+    /// [`ANNOUNCE_CACHE_PRUNE_INTERVAL`] leave the cache untouched.
+    #[tokio::test(start_paused = true)]
+    async fn archive_cache_prune_is_throttled() {
+        let mut cache = AnnounceCache::new(10);
+        let dest = AddressHash::new([0x33; 16]);
+
+        // An entry whose announce is already older than the max age, inserted
+        // immediately after cache construction (so the prune throttle window
+        // has not yet elapsed).
+        let mut entry = make_announce_entry(dest);
+        entry.timestamp = time::Instant::now() - (ANNOUNCE_CACHE_MAX_AGE + Duration::from_secs(1));
+        cache.insert(dest, entry);
+
+        // Still inside the throttle window: the sweep is skipped even though
+        // the entry is stale.
+        cache.prune(ANNOUNCE_CACHE_MAX_AGE);
+        assert!(
+            cache.get(&dest).is_some(),
+            "prune must be throttled to ANNOUNCE_CACHE_PRUNE_INTERVAL"
+        );
+
+        // Once the throttle window has elapsed, the stale entry is dropped.
+        time::advance(ANNOUNCE_CACHE_PRUNE_INTERVAL + Duration::from_secs(1)).await;
+        cache.prune(ANNOUNCE_CACHE_MAX_AGE);
+        assert!(
+            cache.get(&dest).is_none(),
+            "a sweep after the throttle window must prune stale entries"
+        );
+    }
+
+    fn make_announce_entry(destination: AddressHash) -> AnnounceEntry {
+        AnnounceEntry {
+            packet: Packet {
+                header: Header {
+                    packet_type: PacketType::Announce,
+                    destination_type: DestinationType::Single,
+                    ..Default::default()
+                },
+                ifac: None,
+                destination,
+                transport: None,
+                context: PacketContext::None,
+                data: PacketDataBuffer::new_from_slice(&[1, 2, 3]),
+            },
+            timestamp: time::Instant::now(),
+            timeout: time::Instant::now(),
+            received_from: destination,
+            retries: 0,
+            local_rebroadcasts: 0,
+            hops: 0,
+            response_to_iface: None,
+        }
     }
 }

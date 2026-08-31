@@ -111,6 +111,13 @@ const INTERVAL_LINK_TABLE_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_KEEP_REVERSE_PATH: Duration = Duration::from_secs(8 * 60);
 const INTERVAL_PATH_TABLE_CULL: Duration = Duration::from_secs(30);
 
+/// How long a destination is retained in `single_out_destinations` after
+/// its last validated announce before being evicted.  Matches the longest
+/// path-table expiry (7 days) so the destination cache stays bounded in
+/// step with the path table instead of growing forever on long-running
+/// transport nodes.
+const INTERVAL_SINGLE_OUT_DESTINATION_EXPIRE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+
 const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
 const PATH_REQUEST_GRACE: Duration = Duration::from_millis(400);
 const PATH_REQUEST_RG: Duration = Duration::from_millis(1500);
@@ -303,6 +310,11 @@ pub struct TransportMetrics {
     pub decryption_failures: u64,
     /// Number of entries in the announce retransmit table.
     pub announce_table_entries: usize,
+    /// Number of destinations retained in the announce archive cache.
+    pub announce_cache_entries: usize,
+    /// Number of distinct destinations cached from validated announces
+    /// (bounded by [`INTERVAL_SINGLE_OUT_DESTINATION_EXPIRE`]).
+    pub single_out_destinations_entries: usize,
     /// Number of entries in the link forwarding table.
     pub link_table_entries: usize,
     /// Number of entries in the reverse path table.
@@ -465,6 +477,11 @@ struct TransportHandler {
     reverse_table: ReverseTable,
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
+    /// Last validated-announce timestamp per destination in
+    /// `single_out_destinations`.  Used to evict destinations that stop
+    /// re-announcing, keeping the map bounded on long-running transport
+    /// nodes.
+    single_out_last_seen: HashMap<AddressHash, time::Instant>,
     probe_destination: Option<Arc<Mutex<SingleInputDestination>>>,
     discovery_destination: Arc<Mutex<SingleInputDestination>>,
     discoverable_ifaces: HashMap<AddressHash, RegisteredDiscoveryInterface>,
@@ -850,6 +867,7 @@ impl Transport {
             reverse_table: ReverseTable::new(),
             single_in_destinations,
             single_out_destinations: HashMap::new(),
+            single_out_last_seen: HashMap::new(),
             probe_destination,
             discovery_destination,
             discoverable_ifaces: HashMap::new(),
@@ -1046,6 +1064,8 @@ impl Transport {
             announces_rate_limited: handler.announces_rate_limited,
             decryption_failures: handler.decryption_failures,
             announce_table_entries: handler.announce_table.entries_len(),
+            announce_cache_entries: handler.announce_table.cache_len(),
+            single_out_destinations_entries: handler.single_out_destinations.len(),
             link_table_entries: handler.link_table.len(),
             reverse_table_entries: handler.reverse_table.len(),
             packet_cache_entries,
@@ -2836,6 +2856,7 @@ impl TransportHandler {
         let count = drop_destinations.len();
         for dest_hash in &drop_destinations {
             self.single_out_destinations.remove(dest_hash);
+            self.single_out_last_seen.remove(dest_hash);
             self.send_ctx.path_table.write().unwrap().remove(dest_hash);
         }
 
@@ -2849,6 +2870,59 @@ impl TransportHandler {
         }
 
         count
+    }
+
+    /// Evict destinations from `single_out_destinations` that have not
+    /// re-announced within [`INTERVAL_SINGLE_OUT_DESTINATION_EXPIRE`],
+    /// keeping the map bounded on long-running transport nodes.  Without
+    /// this, every destination ever announced is retained forever, leaking
+    /// memory at the rate of unique network destinations over time.
+    ///
+    /// Returns the number of destinations evicted.
+    fn prune_single_out_destinations(&mut self) -> usize {
+        let now = time::Instant::now();
+        let stale: Vec<AddressHash> = self
+            .single_out_last_seen
+            .iter()
+            .filter(|(_, last)| now.duration_since(**last) > INTERVAL_SINGLE_OUT_DESTINATION_EXPIRE)
+            .map(|(dest, _)| *dest)
+            .collect();
+
+        let count = stale.len();
+        for dest in stale {
+            self.single_out_last_seen.remove(&dest);
+            self.single_out_destinations.remove(&dest);
+        }
+
+        if count > 0 {
+            log::debug!(
+                "tp({}): pruned {} stale destination{} from the destination cache",
+                self.config.name,
+                count,
+                if count == 1 { "" } else { "s" },
+            );
+        }
+
+        count
+    }
+
+    /// Drop path-request rate-limit markers that have outlived their
+    /// [`PATH_REQUEST_MI`] window.  Entries are only consulted within that
+    /// window, so anything older can be discarded; without this the map
+    /// grows by one entry per distinct destination ever path-requested.
+    fn prune_last_path_requests(&mut self) {
+        let before = self.last_path_requests.len();
+        self.last_path_requests
+            .retain(|_, last| last.elapsed() <= PATH_REQUEST_MI);
+        let pruned = before - self.last_path_requests.len();
+        if pruned > 0 {
+            log::trace!(
+                "tp({}): pruned {} stale path-request rate-limit entr{}",
+                self.config.name,
+                pruned,
+                if pruned == 1 { "y" } else { "ies" },
+            );
+        }
     }
 
     fn accepts_transport_packet(&self, packet: &Packet) -> bool {
@@ -3618,6 +3692,10 @@ is_path_response={}",
             iface,
             packet.context == PacketContext::PathResponse,
         );
+
+        handler
+            .single_out_last_seen
+            .insert(packet.destination, time::Instant::now());
 
         if !handler
             .single_out_destinations
@@ -5013,6 +5091,12 @@ async fn manage_transport(
                         let mut handler = handler.lock().await;
                         handler.link_table.remove_stale(INTERVAL_LINK_TABLE_STALE);
                         handler.reverse_table.remove_stale(INTERVAL_KEEP_REVERSE_PATH);
+
+                        // Evict destinations and path-request rate-limit
+                        // markers that have not been refreshed, keeping both
+                        // maps bounded on long-running transport nodes.
+                        handler.prune_single_out_destinations();
+                        handler.prune_last_path_requests();
 
                         // Periodically remove expired blackhole entries
                         // (rate-limited internally to 60-second intervals).
@@ -7197,6 +7281,112 @@ mod tests {
             msgs.iter()
                 .any(|m| m.packet.data.as_slice() == e2.data.as_slice()),
             "a direct re-announce must refresh the announce table entry so the new emission is propagated"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_single_out_destinations_are_pruned() {
+        let mut config = TransportConfig::default();
+        config.set_retransmit(true);
+        let transport = Transport::new(config);
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        // Announce a remote destination so it is cached.
+        let remote = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "prune.dest"),
+        );
+        let mut announce = remote.announce(&mut rng, None).expect("valid announce");
+        let dest_hash = announce.destination;
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_announce(
+                &announce,
+                &mut *h,
+                &mut pending,
+                AddressHash::new_from_slice(b"iface"),
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                h.single_out_destinations.contains_key(&dest_hash),
+                "announced destination must be cached"
+            );
+
+            // Age the destination past the retention window and evict it.
+            h.single_out_last_seen.insert(
+                dest_hash,
+                time::Instant::now()
+                    - (INTERVAL_SINGLE_OUT_DESTINATION_EXPIRE + Duration::from_secs(1)),
+            );
+            let pruned = h.prune_single_out_destinations();
+            assert_eq!(pruned, 1);
+            assert!(
+                !h.single_out_destinations.contains_key(&dest_hash),
+                "stale destination must be evicted from the cache"
+            );
+            assert!(
+                !h.single_out_last_seen.contains_key(&dest_hash),
+                "stale destination's last-seen marker must be dropped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_single_out_destinations_are_retained() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        let mut h = handler.lock().await;
+        let dest_hash = AddressHash::new_from_slice(b"recent-dest");
+        let destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "keep.dest"),
+        );
+        // A placeholder output destination is enough: the prune is driven by
+        // the last-seen map, not the destination contents.
+        let output = DestinationAnnounce::validate(
+            &destination.announce(&mut rng, None).expect("valid announce"),
+        )
+        .expect("validated announce")
+        .0;
+        h.single_out_destinations
+            .insert(dest_hash, Arc::new(Mutex::new(output)));
+        h.single_out_last_seen
+            .insert(dest_hash, time::Instant::now());
+
+        let pruned = h.prune_single_out_destinations();
+        assert_eq!(pruned, 0);
+        assert!(h.single_out_destinations.contains_key(&dest_hash));
+    }
+
+    #[tokio::test]
+    async fn stale_path_request_markers_are_pruned() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+
+        let mut h = handler.lock().await;
+        h.last_path_requests.insert(
+            AddressHash::new_from_slice(b"old-dest"),
+            time::Instant::now() - (PATH_REQUEST_MI + Duration::from_secs(1)),
+        );
+        h.last_path_requests
+            .insert(AddressHash::new_from_slice(b"recent-dest"), time::Instant::now());
+        h.prune_last_path_requests();
+
+        assert!(
+            !h.last_path_requests
+                .contains_key(&AddressHash::new_from_slice(b"old-dest")),
+            "path-request markers older than the rate-limit window must be pruned"
+        );
+        assert!(
+            h.last_path_requests
+                .contains_key(&AddressHash::new_from_slice(b"recent-dest")),
+            "recent path-request markers must be retained"
         );
     }
 }
