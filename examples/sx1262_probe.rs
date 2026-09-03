@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.command_delay = Duration::from_millis(2);
     config.rx_poll_interval = Duration::from_millis(50);
 
-    let mut chipset = SX1262::new(spi, gpio);
+    let mut chipset = SX1262::new(Box::new(spi), gpio);
     chipset.check_por_canary()?;
     if !no_sleep {
         let _ = chipset.probe_sleep();

@@ -242,6 +242,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-hal"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
+
+[[package]]
 name = "env_logger"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -578,6 +584,7 @@ dependencies = [
  "cbc",
  "crypto-common 0.1.7",
  "ed25519-dalek",
+ "embedded-hal",
  "env_logger",
  "getrandom",
  "gpio-cdev",

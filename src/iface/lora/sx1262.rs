@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    GpioLine, GpioPins, LoRaChipset, LoRaConfig, LoRaError, ReceivedPacket, SpiBus,
+    GpioPins, LoRaChipset, LoRaConfig, LoRaError, LoRaGpio, LoRaSpi, ReceivedPacket,
 };
 
 // ── Command opcodes ───────────────────────────────────────────────────────
@@ -150,10 +150,10 @@ fn calibrate_image_bands(freq_hz: u64) -> (u8, u8) {
 // ── SX1262 driver ─────────────────────────────────────────────────────────
 
 pub struct SX1262 {
-    spi: SpiBus,
-    busy: Option<GpioLine>,
-    reset: Option<GpioLine>,
-    dio1: Option<GpioLine>,
+    spi: Box<dyn LoRaSpi>,
+    busy: Option<Box<dyn LoRaGpio>>,
+    reset: Option<Box<dyn LoRaGpio>>,
+    dio1: Option<Box<dyn LoRaGpio>>,
     config: Option<LoRaConfig>,
     command_delay: Duration,
     rx_active: bool,
@@ -842,7 +842,7 @@ impl SX1262 {
 }
 
 impl LoRaChipset for SX1262 {
-    fn new(spi: SpiBus, gpio: GpioPins) -> Self {
+    fn new(spi: Box<dyn LoRaSpi>, gpio: GpioPins) -> Self {
         Self {
             spi,
             busy: gpio.busy,

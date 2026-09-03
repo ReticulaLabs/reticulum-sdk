@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.command_delay = Duration::from_millis(2);
     config.rx_poll_interval = Duration::from_millis(50);
 
-    let mut chipset = SX1262::new(spi, gpio);
+    let mut chipset = SX1262::new(Box::new(spi), gpio);
     chipset.init(&config)?;
     log::info!("init OK — chip now in RX (re-armed by open_chipset); starting TX walkthrough");
     log::info!(

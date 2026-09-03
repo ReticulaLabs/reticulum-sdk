@@ -33,205 +33,282 @@ const CR_MAX: u8 = 8;
 
 pub const DEFAULT_SYNC_WORD: u16 = 0x1424;
 
-const SPI_IOC_MESSAGE_1: u64 = 0x40206B00;
-const SPI_IOC_WR_MODE: u64 = 0x40016B01;
-const SPI_IOC_WR_MAX_SPEED_HZ: u64 = 0x40046B04;
-const SPI_IOC_WR_BITS_PER_WORD: u64 = 0x40016B03;
+// ---------------------------------------------------------------------------
+// LoRa hardware abstraction
+// ---------------------------------------------------------------------------
+// The LoRa chipsets are driven over SPI plus a handful of GPIO lines (busy,
+// reset, dio1). Two backends provide these:
+//
+// * the `lora-linux` feature supplies a Linux `spidev` bus ([`linux::SpiBus`])
+//   and `gpio-cdev` GPIO lines ([`linux::GpioLine`]);
+// * the `lora` feature supplies an embedded `embedded-hal` backend
+//   ([`embedded`]) that drives a [`embedded_hal::spi::SpiDevice`] and
+//   `embedded-hal` GPIO pins, for microcontrollers such as the ESP32.
+//
+// An application supplies hardware via a [`LoRaHwProvider`] (set on the config
+// with [`LoRaConfig::with_embedded_hw`]); on Linux the legacy
+// `spi_path`/`gpio_chip` config fields are used as before.
 
-/// SPI bus abstraction over a Linux spidev device using raw ioctls.
-pub struct SpiBus {
-    fd: std::fs::File,
+/// SPI bus abstraction used by the LoRa chipsets.
+pub trait LoRaSpi: Send {
+    /// Full-duplex transfer: send `tx_buf`, receive into `rx_buf`.
+    fn xfer(&mut self, tx_buf: &[u8], rx_buf: &mut [u8]) -> Result<(), LoRaError>;
 }
 
-impl SpiBus {
-    pub fn open(path: &str, speed_hz: u32) -> Result<Self, LoRaError> {
-        use std::os::fd::AsRawFd;
-
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|e| LoRaError::Spi(format!("cannot open {}: {}", path, e)))?;
-
-        let fd = file.as_raw_fd();
-
-        // Set SPI mode 0
-        let mode: u8 = 0x00;
-        let ret = unsafe { libc::ioctl(fd, SPI_IOC_WR_MODE as _, &mode) };
-        if ret < 0 {
-            return Err(LoRaError::Spi(format!("cannot set SPI mode: {}", std::io::Error::last_os_error())));
-        }
-
-        // Set speed
-        let ret = unsafe { libc::ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ as _, &speed_hz) };
-        if ret < 0 {
-            return Err(LoRaError::Spi(format!("cannot set SPI speed: {}", std::io::Error::last_os_error())));
-        }
-
-        // Set bits per word
-        let bits: u8 = 8;
-        let ret = unsafe { libc::ioctl(fd, SPI_IOC_WR_BITS_PER_WORD as _, &bits) };
-        if ret < 0 {
-            return Err(LoRaError::Spi(format!("cannot set SPI bits: {}", std::io::Error::last_os_error())));
-        }
-
-        Ok(Self { fd: file })
-    }
-
-    /// Full-duplex transfer. Sends `tx_buf` bytes and receives into `rx_buf`.
-    pub fn xfer(&mut self, tx_buf: &[u8], rx_buf: &mut [u8]) -> Result<(), LoRaError> {
-        use std::os::fd::AsRawFd;
-
-        #[repr(C)]
-        struct SpiIocTransfer {
-            tx_buf: u64,
-            rx_buf: u64,
-            len: u32,
-            speed_hz: u32,
-            delay_usecs: u16,
-            bits_per_word: u8,
-            cs_change: u8,
-            tx_nbits: u8,
-            rx_nbits: u8,
-            pad: u8,
-        }
-
-        let transfer = SpiIocTransfer {
-            tx_buf: tx_buf.as_ptr() as u64,
-            rx_buf: rx_buf.as_mut_ptr() as u64,
-            len: tx_buf.len() as u32,
-            speed_hz: 0,
-            delay_usecs: 0,
-            bits_per_word: 0,
-            cs_change: 0,
-            tx_nbits: 0,
-            rx_nbits: 0,
-            pad: 0,
-        };
-
-        let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), SPI_IOC_MESSAGE_1 as _, &transfer) };
-        if ret < 0 {
-            return Err(LoRaError::Spi(format!("SPI xfer failed: {}", std::io::Error::last_os_error())));
-        }
-        Ok(())
-    }
-
-    /// Half-duplex write.
-    pub fn write(&mut self, buf: &[u8]) -> Result<(), LoRaError> {
-        use std::io::Write;
-        self.fd.write_all(buf).map_err(|e| {
-            LoRaError::Spi(format!("write failed: {}", e))
-        })
-    }
+/// A single GPIO line used by a LoRa chipset (busy / reset / dio1).
+pub trait LoRaGpio: Send {
+    /// Read the line level (for inputs such as `busy` / `dio1`).
+    fn get_value(&self) -> Result<bool, LoRaError>;
+    /// Drive the line (for outputs such as `reset`).
+    fn set_value(&self, value: bool) -> Result<(), LoRaError>;
 }
 
-// ---------------------------------------------------------------------------
-// Minimal GPIO abstraction using the Linux GPIO character-device v2 ioctl API
-// (v1 is deprecated; v2 is the universal modern API and is what drivers
-// like mcp2221_gpio expose).
-// ---------------------------------------------------------------------------
-// GPIO abstraction backed by the `gpio-cdev` crate. The crate wraps the
-// Linux GPIO character device API and picks v1 or v2 automatically per
-// driver; this is the only safe way to talk to /dev/gpiochipN when the
-// driver is v2-only (e.g. mcp2221_gpio, which is what /dev/gpiochip2 is
-// on the Saleae Logic 2 host).
-// ---------------------------------------------------------------------------
-mod gpio {
-    use std::io;
+/// Embedded (`embedded-hal`) SPI + GPIO backends for the LoRa interface.
+#[cfg(feature = "lora")]
+pub mod embedded;
 
-    use gpio_cdev::{Chip, Line, LineHandle, LineRequestFlags};
+/// Linux `spidev` + `gpio-cdev` backends for the LoRa interface.
+#[cfg(feature = "lora-linux")]
+mod linux {
+    use super::{LoRaError, LoRaGpio, LoRaSpi};
 
-    /// Wrapper around a single requested GPIO line. Holds a `LineHandle`
-    /// from the `gpio-cdev` crate, which owns the file descriptor and
-    /// the underlying chip reference (so the chip stays open as long
-    /// as the handle is alive).
-    pub struct GpioLine {
-        handle: LineHandle,
-        // Keep the source `Line` alive for the lifetime of the handle.
-        // (The handle already borrows the chip via Arc, but keeping
-        // a `Line` here documents the binding and makes the type
-        // self-contained.)
-        _line: Line,
+    const SPI_IOC_MESSAGE_1: u64 = 0x40206B00;
+    const SPI_IOC_WR_MODE: u64 = 0x40016B01;
+    const SPI_IOC_WR_MAX_SPEED_HZ: u64 = 0x40046B04;
+    const SPI_IOC_WR_BITS_PER_WORD: u64 = 0x40016B03;
+
+
+
+
+    // ---------------------------------------------------------------------------
+    // Minimal GPIO abstraction using the Linux GPIO character-device v2 ioctl API
+    // (v1 is deprecated; v2 is the universal modern API and is what drivers
+    // like mcp2221_gpio expose).
+    // ---------------------------------------------------------------------------
+    // GPIO abstraction backed by the `gpio-cdev` crate. The crate wraps the
+    // Linux GPIO character device API and picks v1 or v2 automatically per
+    // driver; this is the only safe way to talk to /dev/gpiochipN when the
+    // driver is v2-only (e.g. mcp2221_gpio, which is what /dev/gpiochip2 is
+    // on the Saleae Logic 2 host).
+    // ---------------------------------------------------------------------------
+    pub(crate) mod gpio {
+        use std::io;
+
+        use gpio_cdev::{Chip, Line, LineHandle, LineRequestFlags};
+
+        /// Wrapper around a single requested GPIO line. Holds a `LineHandle`
+        /// from the `gpio-cdev` crate, which owns the file descriptor and
+        /// the underlying chip reference (so the chip stays open as long
+        /// as the handle is alive).
+        pub struct GpioLine {
+            handle: LineHandle,
+            // Keep the source `Line` alive for the lifetime of the handle.
+            // (The handle already borrows the chip via Arc, but keeping
+            // a `Line` here documents the binding and makes the type
+            // self-contained.)
+            _line: Line,
+        }
+
+        impl GpioLine {
+            pub fn new_output(chip_path: &str, line: u32) -> io::Result<Self> {
+                Self::request_line(chip_path, line, LineRequestFlags::OUTPUT, 0)
+            }
+
+            pub fn new_input(chip_path: &str, line: u32) -> io::Result<Self> {
+                Self::request_line(chip_path, line, LineRequestFlags::INPUT, 0)
+            }
+
+            fn request_line(
+                chip_path: &str,
+                line: u32,
+                flags: LineRequestFlags,
+                default: u8,
+            ) -> io::Result<Self> {
+                let mut chip = Chip::new(chip_path).map_err(io::Error::other)?;
+                let line_obj = chip.get_line(line).map_err(io::Error::other)?;
+                // .request() takes (flags, default, consumer). For INPUT
+                // the default is ignored; for OUTPUT it's the initial
+                // level. Use 0 (inactive) as a safe default.
+                let handle = line_obj
+                    .request(flags, default, "rs-reticulum")
+                    .map_err(io::Error::other)?;
+                Ok(GpioLine {
+                    handle,
+                    _line: line_obj,
+                })
+            }
+
+            pub fn set_value(&self, value: bool) -> io::Result<()> {
+                self.handle
+                    .set_value(value as u8)
+                    .map_err(io::Error::other)
+            }
+
+            pub fn get_value(&self) -> io::Result<bool> {
+                self.handle.get_value().map(|v| v != 0).map_err(io::Error::other)
+            }
+        }
     }
 
-    impl GpioLine {
-        pub fn new_output(chip_path: &str, line: u32) -> io::Result<Self> {
-            Self::request_line(chip_path, line, LineRequestFlags::OUTPUT, 0)
+    use gpio::GpioLine;
+
+    impl LoRaGpio for GpioLine {
+        fn get_value(&self) -> Result<bool, LoRaError> {
+            GpioLine::get_value(self).map_err(|e| LoRaError::Gpio(e.to_string()))
         }
 
-        pub fn new_input(chip_path: &str, line: u32) -> io::Result<Self> {
-            Self::request_line(chip_path, line, LineRequestFlags::INPUT, 0)
+        fn set_value(&self, value: bool) -> Result<(), LoRaError> {
+            GpioLine::set_value(self, value).map_err(|e| LoRaError::Gpio(e.to_string()))
+        }
+    }
+
+    /// SPI bus abstraction over a Linux spidev device using raw ioctls.
+    pub struct SpiBus {
+        fd: std::fs::File,
+    }
+
+    impl SpiBus {
+        pub fn open(path: &str, speed_hz: u32) -> Result<Self, LoRaError> {
+            use std::os::fd::AsRawFd;
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| LoRaError::Spi(format!("cannot open {}: {}", path, e)))?;
+
+            let fd = file.as_raw_fd();
+
+            // Set SPI mode 0
+            let mode: u8 = 0x00;
+            let ret = unsafe { libc::ioctl(fd, SPI_IOC_WR_MODE as _, &mode) };
+            if ret < 0 {
+                return Err(LoRaError::Spi(format!("cannot set SPI mode: {}", std::io::Error::last_os_error())));
+            }
+
+            // Set speed
+            let ret = unsafe { libc::ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ as _, &speed_hz) };
+            if ret < 0 {
+                return Err(LoRaError::Spi(format!("cannot set SPI speed: {}", std::io::Error::last_os_error())));
+            }
+
+            // Set bits per word
+            let bits: u8 = 8;
+            let ret = unsafe { libc::ioctl(fd, SPI_IOC_WR_BITS_PER_WORD as _, &bits) };
+            if ret < 0 {
+                return Err(LoRaError::Spi(format!("cannot set SPI bits: {}", std::io::Error::last_os_error())));
+            }
+
+            Ok(Self { fd: file })
         }
 
-        fn request_line(
-            chip_path: &str,
-            line: u32,
-            flags: LineRequestFlags,
-            default: u8,
-        ) -> io::Result<Self> {
-            let mut chip = Chip::new(chip_path).map_err(io::Error::other)?;
-            let line_obj = chip.get_line(line).map_err(io::Error::other)?;
-            // .request() takes (flags, default, consumer). For INPUT
-            // the default is ignored; for OUTPUT it's the initial
-            // level. Use 0 (inactive) as a safe default.
-            let handle = line_obj
-                .request(flags, default, "rs-reticulum")
-                .map_err(io::Error::other)?;
-            Ok(GpioLine {
-                handle,
-                _line: line_obj,
+        /// Full-duplex transfer. Sends `tx_buf` bytes and receives into `rx_buf`.
+        pub fn xfer(&mut self, tx_buf: &[u8], rx_buf: &mut [u8]) -> Result<(), LoRaError> {
+            use std::os::fd::AsRawFd;
+
+            #[repr(C)]
+            struct SpiIocTransfer {
+                tx_buf: u64,
+                rx_buf: u64,
+                len: u32,
+                speed_hz: u32,
+                delay_usecs: u16,
+                bits_per_word: u8,
+                cs_change: u8,
+                tx_nbits: u8,
+                rx_nbits: u8,
+                pad: u8,
+            }
+
+            let transfer = SpiIocTransfer {
+                tx_buf: tx_buf.as_ptr() as u64,
+                rx_buf: rx_buf.as_mut_ptr() as u64,
+                len: tx_buf.len() as u32,
+                speed_hz: 0,
+                delay_usecs: 0,
+                bits_per_word: 0,
+                cs_change: 0,
+                tx_nbits: 0,
+                rx_nbits: 0,
+                pad: 0,
+            };
+
+            let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), SPI_IOC_MESSAGE_1 as _, &transfer) };
+            if ret < 0 {
+                return Err(LoRaError::Spi(format!("SPI xfer failed: {}", std::io::Error::last_os_error())));
+            }
+            Ok(())
+        }
+
+        /// Half-duplex write.
+        pub fn write(&mut self, buf: &[u8]) -> Result<(), LoRaError> {
+            use std::io::Write;
+            self.fd.write_all(buf).map_err(|e| {
+                LoRaError::Spi(format!("write failed: {}", e))
             })
         }
+    }
 
-        pub fn set_value(&self, value: bool) -> io::Result<()> {
-            self.handle
-                .set_value(value as u8)
-                .map_err(io::Error::other)
-        }
-
-        pub fn get_value(&self) -> io::Result<bool> {
-            self.handle.get_value().map(|v| v != 0).map_err(io::Error::other)
+    impl LoRaSpi for SpiBus {
+        fn xfer(&mut self, tx_buf: &[u8], rx_buf: &mut [u8]) -> Result<(), LoRaError> {
+            SpiBus::xfer(self, tx_buf, rx_buf)
         }
     }
 }
 
-use gpio::GpioLine;
+/// Re-export the Linux SPI bus (spidev) for host use.
+#[cfg(feature = "lora-linux")]
+pub use linux::SpiBus;
 
-
+/// GPIO pins used by the LoRa chipsets: `busy`, `reset` and `dio1`.
+///
+/// Each pin is a boxed [`LoRaGpio`]; an application supplies them either via
+/// the Linux backend ([`GpioPins::open`]) or via the embedded backend
+/// ([`embedded::EmbeddedLoRaHw`]).
 pub struct GpioPins {
-    pub busy: Option<GpioLine>,
-    pub reset: Option<GpioLine>,
-    pub dio1: Option<GpioLine>,
+    pub busy: Option<Box<dyn LoRaGpio>>,
+    pub reset: Option<Box<dyn LoRaGpio>>,
+    pub dio1: Option<Box<dyn LoRaGpio>>,
 }
 
 impl GpioPins {
+    /// All pins unset.
+    pub fn none() -> Self {
+        Self { busy: None, reset: None, dio1: None }
+    }
+}
+
+#[cfg(feature = "lora-linux")]
+impl GpioPins {
+    /// Open GPIO pins from the Linux `gpio-cdev` path described in `config`.
     pub fn open(config: &LoRaConfig) -> Result<Self, LoRaError> {
+        use linux::gpio::GpioLine;
         let chip_path = match &config.gpio_chip {
             Some(p) => p.as_str(),
-            None => return Ok(Self { busy: None, reset: None, dio1: None }),
+            None => return Ok(Self::none()),
         };
 
         let busy = match config.busy_line {
-            Some(line) => Some(
+            Some(line) => Some(Box::new(
                 GpioLine::new_input(chip_path, line)
                     .map_err(|e| LoRaError::Gpio(format!("busy pin: {}", e)))?,
-            ),
+            ) as Box<dyn LoRaGpio>),
             None => None,
         };
 
         let reset = match config.reset_line {
-            Some(line) => Some(
+            Some(line) => Some(Box::new(
                 GpioLine::new_output(chip_path, line)
                     .map_err(|e| LoRaError::Gpio(format!("reset pin: {}", e)))?,
-            ),
+            ) as Box<dyn LoRaGpio>),
             None => None,
         };
 
         let dio1 = match config.dio1_line {
-            Some(line) => Some(
+            Some(line) => Some(Box::new(
                 GpioLine::new_input(chip_path, line)
                     .map_err(|e| LoRaError::Gpio(format!("dio1 pin: {}", e)))?,
-            ),
+            ) as Box<dyn LoRaGpio>),
             None => None,
         };
 
@@ -282,7 +359,7 @@ impl From<std::io::Error> for LoRaError {
 // Configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LoRaConfig {
     pub spi_path: String,
     pub gpio_chip: Option<String>,
@@ -308,6 +385,24 @@ pub struct LoRaConfig {
     pub rx_poll_interval: Duration,
     pub flow_control: bool,
     pub sx1261_mode: bool,
+    /// Embedded hardware provider. When set, it is used to construct the SPI
+    /// bus and GPIO pins instead of the Linux `spi_path` / `gpio_chip` fields.
+    pub hw_provider: Option<Arc<dyn LoRaHwProvider>>,
+}
+
+impl core::fmt::Debug for LoRaConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoRaConfig")
+            .field("spi_path", &self.spi_path)
+            .field("gpio_chip", &self.gpio_chip)
+            .field("frequency", &self.frequency)
+            .field("bandwidth", &self.bandwidth)
+            .field("spreading_factor", &self.spreading_factor)
+            .field("coding_rate", &self.coding_rate)
+            .field("tx_power", &self.tx_power)
+            .field("hw_provider", &self.hw_provider.is_some())
+            .finish()
+    }
 }
 
 impl LoRaConfig {
@@ -344,7 +439,16 @@ impl LoRaConfig {
             rx_poll_interval: DEFAULT_RX_POLL_INTERVAL,
             flow_control: false,
             sx1261_mode: false,
+            hw_provider: None,
         }
+    }
+
+    /// Use `provider` to construct the SPI bus and GPIO pins for the LoRa
+    /// radio. This is how an embedded board (e.g. ESP32) supplies its
+    /// `embedded-hal` SPI device and pins; see [`embedded::EmbeddedLoRaHw`].
+    pub fn with_embedded_hw(mut self, provider: Arc<dyn LoRaHwProvider>) -> Self {
+        self.hw_provider = Some(provider);
+        self
     }
 
     pub fn with_gpio(mut self, chip: &str, busy: u32, reset: u32, dio1: u32) -> Self {
@@ -542,8 +646,18 @@ impl LoRaInterfaceStats {
 // LoRa chipset abstraction trait
 // ---------------------------------------------------------------------------
 
+/// Constructs the SPI + GPIO hardware for a LoRa chipset.
+///
+/// An application supplies a provider when it wants to drive a LoRa radio over
+/// an embedded `embedded-hal` bus (see [`embedded`]). If no provider is set,
+/// the interface falls back to the Linux `spidev` / `gpio-cdev` path described
+/// by the `spi_path` / `gpio_chip` config fields.
+pub trait LoRaHwProvider: Send + Sync {
+    fn build(&self) -> Result<(Box<dyn LoRaSpi>, GpioPins), LoRaError>;
+}
+
 pub trait LoRaChipset: Send {
-    fn new(spi: SpiBus, gpio: GpioPins) -> Self;
+    fn new(spi: Box<dyn LoRaSpi>, gpio: GpioPins) -> Self;
     fn init(&mut self, config: &LoRaConfig) -> Result<(), LoRaError>;
     fn transmit(&mut self, payload: &[u8]) -> Result<(), LoRaError>;
     fn start_receive(&mut self) -> Result<(), LoRaError>;
@@ -794,8 +908,26 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
     async fn open_chipset(config: &LoRaConfig) -> Result<C, LoRaError> {
         let config = config.clone();
         tokio::task::spawn_blocking(move || -> Result<C, LoRaError> {
-            let spi = SpiBus::open(&config.spi_path, config.spi_speed)?;
-            let gpio = GpioPins::open(&config)?;
+            // Prefer an application-supplied hardware provider (embedded
+            // `embedded-hal` bus), otherwise fall back to the Linux
+            // spidev/gpio-cdev path.
+            let (spi, gpio) = match &config.hw_provider {
+                Some(provider) => provider.build()?,
+                #[cfg(feature = "lora-linux")]
+                None => {
+                    let spi = Box::new(SpiBus::open(&config.spi_path, config.spi_speed)?)
+                        as Box<dyn LoRaSpi>;
+                    let gpio = GpioPins::open(&config)?;
+                    (spi, gpio)
+                }
+                #[cfg(not(feature = "lora-linux"))]
+                None => {
+                    return Err(LoRaError::Config(
+                        "no LoRa hardware provider configured (set LoRaConfig::hw_provider)"
+                            .to_string(),
+                    ));
+                }
+            };
             let mut chipset = C::new(spi, gpio);
             chipset.init(&config)?;
             chipset.start_receive()?;

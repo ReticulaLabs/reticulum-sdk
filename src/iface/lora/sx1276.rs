@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use super::{
-    GpioLine, GpioPins, LoRaChipset, LoRaConfig, LoRaError, ReceivedPacket, SpiBus,
+    GpioPins, LoRaChipset, LoRaConfig, LoRaError, LoRaGpio, LoRaSpi, ReceivedPacket,
 };
 
 // ── Registers ──────────────────────────────────────────────────────────────
@@ -116,8 +116,8 @@ fn needs_ldro(sf: u8, bw_khz: u32) -> bool {
 // ── SX1276 driver ──────────────────────────────────────────────────────────
 
 pub struct SX1276 {
-    spi: SpiBus,
-    reset: Option<GpioLine>,
+    spi: Box<dyn LoRaSpi>,
+    reset: Option<Box<dyn LoRaGpio>>,
     config: Option<LoRaConfig>,
     command_delay: Duration,
     rx_active: bool,
@@ -517,7 +517,7 @@ impl SX1276 {
 }
 
 impl LoRaChipset for SX1276 {
-    fn new(spi: SpiBus, gpio: GpioPins) -> Self {
+    fn new(spi: Box<dyn LoRaSpi>, gpio: GpioPins) -> Self {
         Self {
             spi,
             reset: gpio.reset,

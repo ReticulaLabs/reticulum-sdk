@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{GpioLine, GpioPins, LoRaChipset, LoRaConfig, LoRaError, ReceivedPacket, SpiBus};
+use super::{GpioPins, LoRaChipset, LoRaConfig, LoRaError, LoRaGpio, LoRaSpi, ReceivedPacket};
 
 // ── Frequency bands (LR1121-specific) ─────────────────────────────────────
 
@@ -329,10 +329,10 @@ fn subghz_pa_config(power_dbm: i8) -> (u8, u8, u8, u8) {
 // ── LR1121 driver ─────────────────────────────────────────────────────────
 
 pub struct LR1121 {
-    spi: SpiBus,
-    busy: Option<GpioLine>,
-    reset: Option<GpioLine>,
-    dio_irq: Option<GpioLine>,
+    spi: Box<dyn LoRaSpi>,
+    busy: Option<Box<dyn LoRaGpio>>,
+    reset: Option<Box<dyn LoRaGpio>>,
+    dio_irq: Option<Box<dyn LoRaGpio>>,
     config: Option<LoRaConfig>,
     command_delay: Duration,
     band: FrequencyBand,
@@ -1463,7 +1463,7 @@ impl LR1121 {
 }
 
 impl LoRaChipset for LR1121 {
-    fn new(spi: SpiBus, gpio: GpioPins) -> Self {
+    fn new(spi: Box<dyn LoRaSpi>, gpio: GpioPins) -> Self {
         Self {
             spi,
             busy: gpio.busy,

@@ -69,18 +69,27 @@ serde_json = "1.0.140"
 log = "0.4.27"
 
 # GPIO character device (Linux /dev/gpiochipN). Only used by the host-side
-# LoRa GPIO abstraction, so it is optional and enabled via the `lora` feature.
-# Linux-only.
+# LoRa GPIO abstraction, so it is optional and enabled via the `lora-linux`
+# feature. Linux-only.
 gpio-cdev = { version = "0.6", optional = true }
+
+# embedded-hal traits for the LoRa interface's SPI + GPIO backend on embedded
+# targets (SX126x / SX127x / LR1121 over an `embedded_hal::spi::SpiDevice`).
+embedded-hal = { version = "1.0", optional = true }
 
 [features]
 # Serial / packet-radio interfaces that run over serial ports and depend on
-# `tokio-serial` (and, for LoRa, the Linux GPIO API). Enabled by default to
-# preserve the previous behaviour; disable default features for embedded
-# builds that only need network interfaces (UDP/TCP/backbone).
+# `tokio-serial`. Disabled for embedded builds that only need network
+# interfaces (UDP/TCP/backbone).
 serial = ["dep:tokio-serial"]
-lora = ["dep:gpio-cdev"]
-default = ["alloc", "serial", "lora"]
+# LoRa interface. `embedded-hal` provides an SPI + GPIO backend usable on
+# microcontrollers; the Linux spidev/gpio-cdev backends are added by
+# `lora-linux`.
+lora = ["dep:embedded-hal"]
+# Linux backends for the LoRa interface (spidev ioctls + the gpio-cdev GPIO
+# API). Linux-only; leave off for embedded builds.
+lora-linux = ["lora", "dep:gpio-cdev"]
+default = ["alloc", "serial", "lora", "lora-linux"]
 alloc = []
 fernet-aes128 = []
 

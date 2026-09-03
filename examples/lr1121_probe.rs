@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.command_delay = Duration::from_millis(2);
     config.rx_poll_interval = Duration::from_millis(50);
 
-    let mut chipset = LR1121::new(spi, gpio);
+    let mut chipset = LR1121::new(Box::new(spi), gpio);
     if !no_sleep {
         let _ = chipset.probe_sleep();
     } else {

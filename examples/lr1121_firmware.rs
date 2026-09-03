@@ -316,7 +316,7 @@ fn open_chipset(args: &Args) -> Result<LR1121, Box<dyn std::error::Error>> {
     let spi = SpiBus::open(&args.spi_path, args.spi_speed)?;
     let config = LoRaConfig::new(&args.spi_path, 914_875_000, 250_000.0, 22, 8, 5);
     let gpio = GpioPins::open(&config)?;
-    Ok(LR1121::new(spi, gpio))
+    Ok(LR1121::new(Box::new(spi), gpio))
 }
 
 fn confirm(prompt: &str) -> Result<bool, io::Error> {
