@@ -65,7 +65,7 @@ cargo test
 Cargo.toml
 ```toml
 [dependencies]
-reticulum-sdk = "2.2"
+reticulum-sdk = "2.3"
 ```
 ## Python Protocol Deviations
 
