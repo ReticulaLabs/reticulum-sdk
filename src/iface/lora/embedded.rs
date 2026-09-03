@@ -46,10 +46,9 @@ impl<DEV: 'static> EmbeddedSpi<DEV> {
     }
 }
 
-impl<DEV, E> LoRaSpi for EmbeddedSpi<DEV>
+impl<DEV> LoRaSpi for EmbeddedSpi<DEV>
 where
-    DEV: SpiDevice<Error = E> + Send,
-    E: core::fmt::Debug + Send,
+    DEV: SpiDevice<Error: core::fmt::Debug> + Send,
 {
     fn xfer(&mut self, tx_buf: &[u8], rx_buf: &mut [u8]) -> Result<(), LoRaError> {
         self.dev
@@ -71,10 +70,9 @@ impl<P: 'static> EmbeddedInputPin<P> {
     }
 }
 
-impl<P, E> LoRaGpio for EmbeddedInputPin<P>
+impl<P> LoRaGpio for EmbeddedInputPin<P>
 where
-    P: InputPin<Error = E> + Send,
-    E: core::fmt::Debug + Send,
+    P: InputPin<Error: core::fmt::Debug> + Send,
 {
     fn get_value(&self) -> Result<bool, LoRaError> {
         let mut pin = self
@@ -100,10 +98,9 @@ impl<P: 'static> EmbeddedOutputPin<P> {
     }
 }
 
-impl<P, E> LoRaGpio for EmbeddedOutputPin<P>
+impl<P> LoRaGpio for EmbeddedOutputPin<P>
 where
-    P: OutputPin<Error = E> + Send,
-    E: core::fmt::Debug + Send,
+    P: OutputPin<Error: core::fmt::Debug> + Send,
 {
     fn get_value(&self) -> Result<bool, LoRaError> {
         Err(LoRaError::Gpio("pin is configured as an output".into()))
@@ -143,13 +140,12 @@ impl<DEV: 'static, BUSY: 'static, RESET: 'static, DIO1: 'static> EmbeddedLoRaHw<
     }
 }
 
-impl<DEV: 'static, BUSY: 'static, RESET: 'static, DIO1: 'static, E> LoRaHwProvider for EmbeddedLoRaHw<DEV, BUSY, RESET, DIO1>
+impl<DEV: 'static, BUSY: 'static, RESET: 'static, DIO1: 'static> LoRaHwProvider for EmbeddedLoRaHw<DEV, BUSY, RESET, DIO1>
 where
-    DEV: SpiDevice<Error = E> + Send + Sync,
-    BUSY: InputPin<Error = E> + Send + Sync,
-    RESET: OutputPin<Error = E> + Send + Sync,
-    DIO1: InputPin<Error = E> + Send + Sync,
-    E: core::fmt::Debug + Send,
+    DEV: SpiDevice<Error: core::fmt::Debug> + Send,
+    BUSY: InputPin<Error: core::fmt::Debug> + Send,
+    RESET: OutputPin<Error: core::fmt::Debug> + Send,
+    DIO1: InputPin<Error: core::fmt::Debug> + Send,
 {
     fn build(&self) -> Result<(Box<dyn LoRaSpi>, GpioPins), LoRaError> {
         Ok((
