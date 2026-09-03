@@ -1,19 +1,27 @@
 pub mod backbone;
 pub mod hdlc;
 pub mod ifac;
+// Serial / packet-radio interfaces. KISS framing and RNode run over serial
+// ports (termios) and are only available with the `serial` feature.
+#[cfg(feature = "serial")]
 pub mod kiss;
+// The LoRa interface's Linux GPIO path needs the (Linux-only) gpio-cdev crate.
+#[cfg(feature = "lora")]
 pub mod lora;
 pub mod modem73;
 pub mod reconnect_pacer;
+#[cfg(feature = "serial")]
 pub mod rnode;
 pub mod tcp_client;
 pub mod tcp_server;
+#[cfg(feature = "serial")]
 pub mod serial;
 pub mod udp;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use portable_atomic::AtomicU64;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::net::TcpStream;

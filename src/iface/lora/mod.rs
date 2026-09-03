@@ -5,7 +5,8 @@ pub mod sx1276;
 use std::collections::VecDeque;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 

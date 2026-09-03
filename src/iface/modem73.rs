@@ -2,8 +2,9 @@ use std::cmp;
 use std::io;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use portable_atomic::AtomicU64;
 use std::time::Duration;
 
 use serde_json::{Value, json};

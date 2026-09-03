@@ -43,14 +43,21 @@ bzip2 = "0.6"
 # Random Number generator
 rand_core = "0.10"
 
-# GPIO character device (Linux /dev/gpiochipN). v2 ABI; works on
-# mcp2221_gpio and any other modern GPIO driver.
-gpio-cdev = "0.6"
+# Portable 64-bit atomics. On 32-bit targets without hardware 64-bit CAS
+# (e.g. the Xtensa ESP32-S3) `std::sync::atomic::AtomicU64` is unavailable;
+# `portable-atomic` provides a compatible type with a spinlock fallback there.
+portable-atomic = { version = "1", features = ["fallback"] }
 
 # Async IO
-tokio = { version = "1.53", features = ["full"] }
+# Targeted tokio feature set: `full` pulls in `signal`/`process`/`fs`, which
+# add heavy dependencies (e.g. signal-hook-registry) that do not build on
+# embedded targets such as ESP-IDF. Only the features the stack actually uses
+# are enabled.
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
 tokio-util = "0.7.19"
-tokio-serial = "5.4.5"
+# Serial interfaces (serial, KISS, RNode) are optional: they depend on
+# `tokio-serial`/`serialport`, which are not available on every target.
+tokio-serial = { version = "5.4.5", optional = true }
 libc = "0.2.172"
 
 rmp = "0.8.14"
@@ -60,17 +67,30 @@ serde_json = "1.0.140"
 
 # Logging
 log = "0.4.27"
-env_logger = "0.10"
+
+# GPIO character device (Linux /dev/gpiochipN). Only used by the host-side
+# LoRa GPIO abstraction, so it is optional and enabled via the `lora` feature.
+# Linux-only.
+gpio-cdev = { version = "0.6", optional = true }
 
 [features]
-default = ["alloc"]
+# Serial / packet-radio interfaces that run over serial ports and depend on
+# `tokio-serial` (and, for LoRa, the Linux GPIO API). Enabled by default to
+# preserve the previous behaviour; disable default features for embedded
+# builds that only need network interfaces (UDP/TCP/backbone).
+serial = ["dep:tokio-serial"]
+lora = ["dep:gpio-cdev"]
+default = ["alloc", "serial", "lora"]
 alloc = []
 fernet-aes128 = []
 
 
 
 [dev-dependencies]
-tokio = { version = "1.44.2", features = ["test-util"] }
+# Extra tokio features needed by examples/tests on the host only (signal for
+# ctrl-c, io-std for stdin). These are never enabled for embedded builds.
+tokio = { version = "1.44.2", features = ["test-util", "signal", "io-std", "io-util"] }
+env_logger = "0.10"
 
 [[example]]
 name = "tcp_server"
