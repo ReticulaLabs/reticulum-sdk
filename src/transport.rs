@@ -105,8 +105,14 @@ const INTERVAL_OUTPUT_LINK_KEEP: Duration = Duration::from_secs(5);
 const INTERVAL_IFACE_CLEANUP: Duration = Duration::from_secs(10);
 const INTERVAL_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(1);
 const INTERVAL_OLD_ANNOUNCES_RETRANSMIT: Duration = Duration::from_secs(60);
+#[cfg(not(feature = "embedded"))]
 const INTERVAL_KEEP_PACKET_CACHED: Duration = Duration::from_secs(180);
+#[cfg(feature = "embedded")]
+const INTERVAL_KEEP_PACKET_CACHED: Duration = Duration::from_secs(20);
+#[cfg(not(feature = "embedded"))]
 const INTERVAL_PACKET_CACHE_CLEANUP: Duration = Duration::from_secs(90);
+#[cfg(feature = "embedded")]
+const INTERVAL_PACKET_CACHE_CLEANUP: Duration = Duration::from_secs(10);
 const INTERVAL_LINK_TABLE_STALE: Duration = Duration::from_secs(720);
 const INTERVAL_KEEP_REVERSE_PATH: Duration = Duration::from_secs(8 * 60);
 const INTERVAL_PATH_TABLE_CULL: Duration = Duration::from_secs(30);
@@ -116,7 +122,10 @@ const INTERVAL_PATH_TABLE_CULL: Duration = Duration::from_secs(30);
 /// path-table expiry (7 days) so the destination cache stays bounded in
 /// step with the path table instead of growing forever on long-running
 /// transport nodes.
+#[cfg(not(feature = "embedded"))]
 const INTERVAL_SINGLE_OUT_DESTINATION_EXPIRE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+#[cfg(feature = "embedded")]
+const INTERVAL_SINGLE_OUT_DESTINATION_EXPIRE: Duration = Duration::from_secs(120);
 
 const PATH_REQUEST_MI: Duration = Duration::from_secs(20);
 const PATH_REQUEST_GRACE: Duration = Duration::from_millis(400);

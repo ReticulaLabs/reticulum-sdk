@@ -78,6 +78,11 @@ gpio-cdev = { version = "0.6", optional = true }
 embedded-hal = { version = "1.0", optional = true }
 
 [features]
+# Resource-constrained targets (e.g. the ESP32, etc): shorter packet /
+# destination / path retention so the transport state stays bounded on a busy
+# network within a few hundred KB of RAM. Without this, the transport keeps
+# the upstream (desktop) retention defaults.
+embedded = []
 # Serial / packet-radio interfaces that run over serial ports and depend on
 # `tokio-serial`. Disabled for embedded builds that only need network
 # interfaces (UDP/TCP/backbone).

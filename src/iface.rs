@@ -1935,13 +1935,23 @@ impl InterfaceManager {
 
     /// Return the path expiry duration appropriate for the interface
     /// mode at `address`.  AccessPoint → 1 day, Roaming → 6 hours,
-    /// everything else → 7 days.
+    /// everything else → 7 days. With the `embedded` feature, access-point
+    /// and roaming paths expire after 5 minutes so the path table stays
+    /// bounded on a busy network within limited RAM.
     pub fn path_expiry_for_iface(&self, address: &AddressHash) -> Duration {
-        match self.interface_mode(address) {
+        #[cfg(not(feature = "embedded"))]
+        let expiry = match self.interface_mode(address) {
             InterfaceMode::AccessPoint => Duration::from_secs(60 * 60 * 24),
             InterfaceMode::Roaming => Duration::from_secs(60 * 60 * 6),
             _ => Duration::from_secs(60 * 60 * 24 * 7),
-        }
+        };
+        #[cfg(feature = "embedded")]
+        let expiry = match self.interface_mode(address) {
+            InterfaceMode::AccessPoint => Duration::from_secs(5 * 60),
+            InterfaceMode::Roaming => Duration::from_secs(5 * 60),
+            _ => Duration::from_secs(60 * 60 * 24 * 7),
+        };
+        expiry
     }
 
     /// Returns `true` if the interface at `address` has a mode that
