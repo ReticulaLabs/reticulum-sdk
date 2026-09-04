@@ -67,6 +67,38 @@ Cargo.toml
 [dependencies]
 reticulum-sdk = "2.3"
 ```
+
+## Crate features
+
+The crate is designed to function on resource-constrained (embedded) targets, so most
+behavioral tuning and optional hardware backends are feature-gated. The default
+features enable the full host build; adjust them for your target.
+
+> Standard, full size desktop and server targets can use the default features for optimum performance.
+
+| Feature | Default | Description |
+|---|---|---|
+| `alloc` | yes | Pulls in the `alloc` crate. Always safe to keep enabled on hosted targets. |
+| `serial` | yes | Serial port interfaces (`SerialInterface`, `KISSInterface`, `RNodeInterface`) via `tokio-serial`. Disable for builds that only need network interfaces (UDP/TCP/backbone). |
+| `lora` | yes | LoRa interface with an SPI/GPIO backend based on `embedded-hal`, usable on microcontrollers for SX126x / SX127x / LR1121 chipsets. |
+| `lora-linux` | yes | Linux backends for the LoRa interface (spidev ioctls + `gpio-cdev` GPIO). Implies `lora`. Linux-only; leave off for embedded builds. |
+| `embedded` | no | Tuned for resource-constrained targets (e.g. ESP32, ESP32-S3): shorter packet / destination / path retention and smaller cache bounds so transport state stays bounded within a few hundred KB of RAM on a busy network. Without it, the transport keeps the upstream (desktop) retention defaults. |
+| `fernet-aes128` | no | Use 256-bit derived keys (AES-128) for identity encryption instead of the default 512-bit derived keys. Enables interop with Reticulum versions that use AES-128. |
+
+### Examples
+
+Embedded build with only network interfaces (no serial/LoRa):
+
+```
+cargo build --no-default-features --features alloc,embedded
+```
+
+Full desktop build (default):
+
+```
+cargo build
+```
+
 ## Python Protocol Deviations
 
 * The 2% announcement cap implemented in the official Python implementation can quickly begin
