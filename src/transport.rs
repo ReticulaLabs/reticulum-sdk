@@ -242,6 +242,14 @@ pub struct TransportConfig {
     /// it to save memory.
     event_channel_capacity: usize,
 
+    /// When enabled, every received link data message is acknowledged with a
+    /// per-message proof (sent back over the same link). Mirrors the Python
+    /// reference, where a destination's packet callback explicitly proves
+    /// received link data. Without this, senders that rely on proofs to
+    /// confirm delivery (e.g. LXMF) will not know a message was received and
+    /// will retransmit it, causing duplicate deliveries.
+    prove_link_messages: bool,
+
     /// Python-compatible rpc instance mode. When enabled, this transport
     /// tries to become the local rpc instance and falls back to connecting
     /// to an existing one.
@@ -576,6 +584,7 @@ impl TransportConfig {
             rpc_connected: false,
             is_standalone_instance: true,
             event_channel_capacity: EVENT_CHANNEL_CAPACITY,
+            prove_link_messages: false,
         }
     }
 
@@ -654,6 +663,13 @@ impl TransportConfig {
     /// - Low-rate LoRa / serial / KISS:  512–1024
     pub fn set_event_channel_capacity(&mut self, capacity: usize) {
         self.event_channel_capacity = capacity;
+    }
+
+    /// Opt in to per-message proofs for received link data (see the
+    /// `prove_link_messages` field). Applied to links created after this
+    /// setting is made.
+    pub fn set_prove_link_messages(&mut self, prove_link_messages: bool) {
+        self.prove_link_messages = prove_link_messages;
     }
 
     pub fn set_rpc_instance(&mut self, rpc_instance: bool) {
@@ -783,6 +799,7 @@ impl Default for TransportConfig {
             rpc_connected: false,
             is_standalone_instance: true,
             event_channel_capacity: EVENT_CHANNEL_CAPACITY,
+            prove_link_messages: false,
         }
     }
 }
@@ -1302,6 +1319,9 @@ impl Transport {
         };
 
         let mut link = Link::new(destination, self.link_out_event_tx.clone());
+        if self.handler.lock().await.config.prove_link_messages {
+            link.prove_messages(true);
+        }
 
         // Bound how long the link may stay unestablished: a pending link
         // that never receives its proof must eventually fail and be
@@ -4150,6 +4170,9 @@ async fn handle_link_request_as_destination(
             );
 
             if let Ok(mut link) = link {
+                if handler.config.prove_link_messages {
+                    link.prove_messages(true);
+                }
                 let prove_packet = link.prove();
                 pending.push(handler.send_ctx.prepare_send_packet(prove_packet));
 
