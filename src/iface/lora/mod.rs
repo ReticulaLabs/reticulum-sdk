@@ -786,9 +786,13 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 let poll_interval = config.rx_poll_interval;
                 let stats = stats.clone();
 
-                tokio::task::spawn_blocking(move || {
+                // Poll the radio for IRQs on the tokio worker instead of a
+                // dedicated blocking thread: the chipset work is a short SPI
+                // transaction, and on embedded targets a blocking pool thread
+                // needs a large internal-RAM stack that is often unavailable.
+                tokio::spawn(async move {
                     while !stop.is_cancelled() && !cancel.is_cancelled() {
-                        std::thread::sleep(poll_interval);
+                        tokio::time::sleep(poll_interval).await;
 
                         let result = {
                             let mut cs = chipset.lock().unwrap();
@@ -798,7 +802,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                         match result {
                             Ok(packets) => {
                                 for pkt in packets {
-                                    if rx_packet_tx.blocking_send(pkt).is_err() {
+                                    if rx_packet_tx.send(pkt).await.is_err() {
                                         return;
                                     }
                                 }
@@ -906,35 +910,33 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
     }
 
     async fn open_chipset(config: &LoRaConfig) -> Result<C, LoRaError> {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || -> Result<C, LoRaError> {
-            // Prefer an application-supplied hardware provider (embedded
-            // `embedded-hal` bus), otherwise fall back to the Linux
-            // spidev/gpio-cdev path.
-            let (spi, gpio) = match &config.hw_provider {
-                Some(provider) => provider.build()?,
-                #[cfg(feature = "lora-linux")]
-                None => {
-                    let spi = Box::new(SpiBus::open(&config.spi_path, config.spi_speed)?)
-                        as Box<dyn LoRaSpi>;
-                    let gpio = GpioPins::open(&config)?;
-                    (spi, gpio)
-                }
-                #[cfg(not(feature = "lora-linux"))]
-                None => {
-                    return Err(LoRaError::Config(
-                        "no LoRa hardware provider configured (set LoRaConfig::hw_provider)"
-                            .to_string(),
-                    ));
-                }
-            };
-            let mut chipset = C::new(spi, gpio);
-            chipset.init(&config)?;
-            chipset.start_receive()?;
-            Ok(chipset)
-        })
-        .await
-        .map_err(|e| LoRaError::Chipset(format!("spawn_blocking join: {}", e)))?
+        // The chipset construction is a short, bounded sequence of SPI/GPIO
+        // transactions. Run it inline on the tokio worker rather than via
+        // `spawn_blocking`: on embedded targets (e.g. the ESP32) a blocking
+        // pool thread needs its own large OS stack from internal RAM, which is
+        // often not available, and the hardware provider here is a small
+        // `embedded-hal` bus with no long-running work.
+        let (spi, gpio) = match &config.hw_provider {
+            Some(provider) => provider.build()?,
+            #[cfg(feature = "lora-linux")]
+            None => {
+                let spi = Box::new(SpiBus::open(&config.spi_path, config.spi_speed)?)
+                    as Box<dyn LoRaSpi>;
+                let gpio = GpioPins::open(&config)?;
+                (spi, gpio)
+            }
+            #[cfg(not(feature = "lora-linux"))]
+            None => {
+                return Err(LoRaError::Config(
+                    "no LoRa hardware provider configured (set LoRaConfig::hw_provider)"
+                        .to_string(),
+                ));
+            }
+        };
+        let mut chipset = C::new(spi, gpio);
+        chipset.init(&config)?;
+        chipset.start_receive()?;
+        Ok(chipset)
     }
 
     async fn do_transmit(
@@ -954,37 +956,29 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
         };
 
         let payload = tx_buffer[..tx_len].to_vec();
-        let chipset = chipset.clone();
 
         stats.record_tx_attempt(payload.len());
 
-        let result = tokio::task::spawn_blocking(move || {
+        // The transmit is a single short SPI transaction; run it inline on the
+        // tokio worker instead of `spawn_blocking` (see open_chipset).
+        let result = {
             let mut cs = chipset.lock().unwrap();
             cs.transmit(&payload)
-        })
-        .await;
+        };
 
         // A failed TX is not fatal: transmit() already returns the chipset to
         // a known state (STDBY_RC + IRQ cleared) and the RX poll loop re-arms
         // RX, so we log + count and keep going rather than tearing the whole
         // interface down for RECONNECT_DELAY.
         match result {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 stats.record_tx_ok();
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 stats.record_tx_failure();
                 log::error!(
                     "lora_interface: transmit error: {} (tx_attempts={})",
                     error,
-                    stats.snapshot().tx_attempts,
-                );
-            }
-            Err(e) => {
-                stats.record_tx_failure();
-                log::error!(
-                    "lora_interface: spawn_blocking join error: {} (tx_attempts={})",
-                    e,
                     stats.snapshot().tx_attempts,
                 );
             }
