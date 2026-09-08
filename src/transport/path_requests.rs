@@ -124,7 +124,7 @@ impl PathRequests {
 
             let tag = (request.destination, request.tag_bytes.clone());
             if self.cache.contains_key(&tag) {
-                log::debug!(
+                log::trace!(
                     "tp({}): ignoring duplicate path request for destination {}",
                     self.name,
                     request.destination
