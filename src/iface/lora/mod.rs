@@ -68,7 +68,7 @@ pub trait LoRaGpio: Send {
 pub mod embedded;
 
 /// Linux `spidev` + `gpio-cdev` backends for the LoRa interface.
-#[cfg(feature = "lora-linux")]
+#[cfg(all(feature = "lora-linux", target_os = "linux"))]
 mod linux {
     use super::{LoRaError, LoRaGpio, LoRaSpi};
 
@@ -257,7 +257,7 @@ mod linux {
 }
 
 /// Re-export the Linux SPI bus (spidev) for host use.
-#[cfg(feature = "lora-linux")]
+#[cfg(all(feature = "lora-linux", target_os = "linux"))]
 pub use linux::SpiBus;
 
 /// GPIO pins used by the LoRa chipsets: `busy`, `reset` and `dio1`.
@@ -278,7 +278,7 @@ impl GpioPins {
     }
 }
 
-#[cfg(feature = "lora-linux")]
+#[cfg(all(feature = "lora-linux", target_os = "linux"))]
 impl GpioPins {
     /// Open GPIO pins from the Linux `gpio-cdev` path described in `config`.
     pub fn open(config: &LoRaConfig) -> Result<Self, LoRaError> {
@@ -918,14 +918,14 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
         // `embedded-hal` bus with no long-running work.
         let (spi, gpio) = match &config.hw_provider {
             Some(provider) => provider.build()?,
-            #[cfg(feature = "lora-linux")]
+            #[cfg(all(feature = "lora-linux", target_os = "linux"))]
             None => {
                 let spi = Box::new(SpiBus::open(&config.spi_path, config.spi_speed)?)
                     as Box<dyn LoRaSpi>;
                 let gpio = GpioPins::open(&config)?;
                 (spi, gpio)
             }
-            #[cfg(not(feature = "lora-linux"))]
+            #[cfg(not(all(feature = "lora-linux", target_os = "linux")))]
             None => {
                 return Err(LoRaError::Config(
                     "no LoRa hardware provider configured (set LoRaConfig::hw_provider)"
