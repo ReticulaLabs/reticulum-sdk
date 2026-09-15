@@ -3156,9 +3156,10 @@ async fn handle_proof(
                 );
                 // The link is now established: record which interface it is
                 // carried on so outbound link packets route directly rather
-                // than falling back to broadcast, and bind the link to that
-                // interface for inbound acceptance checks.
-                link.set_attached_interface(iface);
+                // than falling back to broadcast. The link itself is bound
+                // to this interface for inbound acceptance checks by
+                // `Link::handle_packet_from` before the `Activated` event
+                // fires.
                 handler
                     .send_ctx
                     .link_ifaces

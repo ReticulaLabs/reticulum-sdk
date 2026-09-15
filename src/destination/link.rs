@@ -292,6 +292,13 @@ pub trait ChannelMessage: Sized {
 pub struct LinkEventData {
     pub id: LinkId,
     pub address_hash: AddressHash,
+    /// The interface the link is carried on (the interface its packets are
+    /// received on), if the link has been bound to one yet. Set for in-links
+    /// from the moment they are created from an inbound request, and for
+    /// out-links once they are activated by their proof (and thus present on
+    /// the `Activated` event). `None` for a pending out-link that has not yet
+    /// received its proof.
+    pub iface: Option<AddressHash>,
     pub event: LinkEvent,
 }
 
@@ -1343,6 +1350,7 @@ impl Link {
         let _ = self.event_tx.send(LinkEventData {
             id: self.id,
             address_hash: self.destination.address_hash,
+            iface: self.attached_interface,
             event,
         });
     }
@@ -1514,7 +1522,24 @@ impl Link {
             return LinkHandleResult::WrongInterface;
         }
 
-        self.handle_packet(packet, out_link)
+        // A pending out-link binds to the interface its link-request proof
+        // arrives on (matching Python's `Link.validate_proof`, which records
+        // `attached_interface` before activating the link). Bind *before*
+        // dispatching so the `Activated` event already carries the interface;
+        // if the proof turns out to be invalid we revert, because a pending
+        // link must stay able to accept a later valid proof from anywhere.
+        let tentative_bind = out_link
+            && self.attached_interface.is_none()
+            && packet.header.packet_type == PacketType::Proof
+            && packet.context == PacketContext::LinkRequestProof;
+        if tentative_bind {
+            self.set_attached_interface(*iface);
+        }
+        let result = self.handle_packet(packet, out_link);
+        if tentative_bind && !matches!(result, LinkHandleResult::Activated) {
+            self.attached_interface = None;
+        }
+        result
     }
 }
 
@@ -1835,6 +1860,54 @@ mod tests {
         // The same packet on the bound interface is processed normally.
         let accepted = in_link.handle_packet_from(&packet, false, &bound_iface);
         assert!(matches!(accepted, LinkHandleResult::MessageReceived(_)));
+    }
+
+    #[test]
+    fn out_link_activation_binds_interface_and_exposes_it_on_event() {
+        let identity = PrivateIdentity::new_from_name("iface owner");
+        let destination = SingleInputDestination::new(
+            identity,
+            DestinationName::new("example_utilities", "link.iface_event"),
+        );
+        let (out_event_tx, mut out_event_rx) = tokio::sync::broadcast::channel(8);
+        let (in_event_tx, _) = tokio::sync::broadcast::channel(8);
+
+        let mut out_link = Link::new(destination.desc, out_event_tx);
+        let link_request = out_link.request(None);
+        assert!(out_link.attached_interface().is_none());
+
+        let mut in_link = Link::new_from_request(
+            &link_request,
+            destination.sign_key().clone(),
+            destination.desc,
+            in_event_tx,
+        )
+        .expect("input link");
+        let proof_iface = AddressHash::new_from_slice(b"proof-interface");
+        in_link.set_attached_interface(proof_iface);
+        let proof = in_link.prove();
+
+        // An invalid proof must not bind the still-pending link: it has to
+        // remain able to accept a later valid proof from any interface.
+        let mut bad_proof = proof.clone();
+        bad_proof.data.reset();
+        bad_proof.data.write(&[0x00; 5]);
+        assert!(matches!(
+            out_link.handle_packet_from(&bad_proof, true, &proof_iface),
+            LinkHandleResult::None
+        ));
+        assert!(out_link.attached_interface().is_none());
+
+        // A valid link-request proof binds the pending out-link to the
+        // interface it arrived on, and the `Activated` event carries it
+        // (matching Python's `Link.validate_proof`).
+        let result = out_link.handle_packet_from(&proof, true, &proof_iface);
+        assert!(matches!(result, LinkHandleResult::Activated));
+        assert_eq!(out_link.attached_interface(), Some(proof_iface));
+
+        let ev = out_event_rx.try_recv().expect("activated event");
+        assert!(matches!(ev.event, LinkEvent::Activated));
+        assert_eq!(ev.iface, Some(proof_iface));
     }
 
     #[test]
