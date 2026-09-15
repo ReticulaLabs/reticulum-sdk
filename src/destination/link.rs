@@ -158,6 +158,12 @@ impl From<&Packet> for LinkId {
 
 pub enum LinkHandleResult {
     None,
+    /// The packet was dropped because it arrived on an interface other
+    /// than the one the link is bound to (a possible manipulation attempt).
+    /// The transport releases the packet hash from its duplicate cache on
+    /// this result so a retransmission on the bound interface is not
+    /// discarded as a duplicate (mirroring Python `Transport.py:2593-2594`).
+    WrongInterface,
     Activated,
     KeepAlive,
     MessageReceived(Option<Packet>),
@@ -332,6 +338,14 @@ pub struct Link {
     /// path does not perform a fresh zeroed heap allocation (up to the MDU)
     /// on every packet, which dominates throughput on high-speed links.
     decrypt_buffer: Vec<u8>,
+    /// Interface this link is bound to. Set when an in-link is created from
+    /// an inbound request, or when an out-link is activated by its proof.
+    /// While unset (e.g. a pending out-link) the link accepts packets from
+    /// any interface; once set, packets for the link are only accepted from
+    /// this interface, matching Python's `Link.receive` check
+    /// (`Link.py:939-940`), which rejects link packets arriving on any other
+    /// interface as a possible manipulation attempt.
+    attached_interface: Option<AddressHash>,
 }
 
 impl Link {
@@ -362,6 +376,7 @@ impl Link {
             channel_rx_stall_since: None,
             channel_tx: None,
             decrypt_buffer: Vec::new(),
+            attached_interface: None,
         }
     }
 
@@ -424,6 +439,7 @@ impl Link {
             channel_rx_stall_since: None,
             channel_tx: None,
             decrypt_buffer: Vec::new(),
+            attached_interface: None,
         };
 
         link.handshake(peer_identity);
@@ -1448,6 +1464,58 @@ impl Link {
     pub fn rtt(&self) -> &Duration {
         &self.rtt
     }
+
+    /// Bind this link to the interface it is carried on. Called when an
+    /// in-link is created from an inbound request, and when an out-link is
+    /// activated by its proof. After this, packets for the link are only
+    /// accepted from `iface` (see [`Self::accepts_interface`]).
+    pub fn set_attached_interface(&mut self, iface: AddressHash) {
+        self.attached_interface = Some(iface);
+    }
+
+    /// The interface this link is bound to, if any.
+    pub fn attached_interface(&self) -> Option<AddressHash> {
+        self.attached_interface
+    }
+
+    /// Whether a packet for this link may be accepted when it arrived on
+    /// `iface`. A link that has not been bound yet (e.g. a pending out-link
+    /// awaiting its proof) accepts from anywhere; a bound link only accepts
+    /// from its recorded interface, matching Python's `Link.receive`
+    /// (`Link.py:939-940`).
+    pub fn accepts_interface(&self, iface: &AddressHash) -> bool {
+        match self.attached_interface {
+            Some(attached) => attached == *iface,
+            None => true,
+        }
+    }
+
+    /// Handle a packet for this link, rejecting it if it arrived on an
+    /// interface other than the one the link is bound to. Mirrors Python's
+    /// `Link.__receive`, which drops link-associated packets received on an
+    /// unexpected interface (logging a possible-manipulation warning).
+    pub fn handle_packet_from(
+        &mut self,
+        packet: &Packet,
+        out_link: bool,
+        iface: &AddressHash,
+    ) -> LinkHandleResult {
+        if !self.accepts_interface(iface) {
+            log::warn!(
+                "link({}): dropping packet received on unexpected interface {} (link is bound to {}); \
+                 someone might be trying to manipulate your communication",
+                self.id,
+                iface,
+                self.attached_interface
+                    .as_ref()
+                    .map(|attached| attached.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+            );
+            return LinkHandleResult::WrongInterface;
+        }
+
+        self.handle_packet(packet, out_link)
+    }
 }
 
 pub(crate) fn validate_proof_packet(
@@ -1738,6 +1806,35 @@ mod tests {
         let _ = out_event_rx.try_recv();
 
         (out_link, in_link, out_event_rx, in_event_rx)
+    }
+
+    #[test]
+    fn link_drops_packets_from_unexpected_interface() {
+        let (mut out_link, mut in_link, _out_events, _in_events) = create_active_link_pair();
+
+        let bound_iface = AddressHash::new_from_slice(b"bound-interface");
+        let other_iface = AddressHash::new_from_slice(b"other-interface");
+
+        // An unbound link accepts from anywhere; once bound it only accepts
+        // packets from its own interface (matching Python's `Link.receive`).
+        assert!(in_link.accepts_interface(&bound_iface));
+        in_link.set_attached_interface(bound_iface);
+        assert_eq!(in_link.attached_interface(), Some(bound_iface));
+        assert!(in_link.accepts_interface(&bound_iface));
+        assert!(!in_link.accepts_interface(&other_iface));
+
+        let packet = out_link
+            .data_packet(b"interface binding")
+            .expect("data packet");
+
+        // A packet for the link arriving on any other interface is dropped
+        // without being decrypted or delivered.
+        let dropped = in_link.handle_packet_from(&packet, false, &other_iface);
+        assert!(matches!(dropped, LinkHandleResult::WrongInterface));
+
+        // The same packet on the bound interface is processed normally.
+        let accepted = in_link.handle_packet_from(&packet, false, &bound_iface);
+        assert!(matches!(accepted, LinkHandleResult::MessageReceived(_)));
     }
 
     #[test]

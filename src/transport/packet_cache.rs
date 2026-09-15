@@ -45,6 +45,16 @@ impl PacketCache {
         self.map.retain(|_, track| track.time.elapsed() <= duration);
     }
 
+    /// Remove a specific packet's hash from the cache so a later
+    /// retransmission of the same packet is not treated as a duplicate.
+    /// Mirrors Python's `Transport.py:2593-2594`, which removes the hash
+    /// from `packet_hashlist`/`packet_hashlist_prev` when a link-associated
+    /// packet is dropped on an unexpected interface, so the link can still
+    /// receive the packet when it finally arrives over the correct path.
+    pub fn release_packet(&mut self, packet: &Packet) {
+        self.map.remove(&packet.hash());
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -179,5 +189,32 @@ mod tests {
         }
 
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn release_packet_allows_retransmission_to_pass_again() {
+        let mut cache = PacketCache::with_max_entries(4);
+
+        // First arrival is new and cached.
+        assert!(cache.update(&packet(42)));
+        // A retransmission would normally be filtered as a duplicate.
+        assert!(!cache.update(&packet(42)));
+
+        // After release, the same packet is treated as new again, so a
+        // retransmission arriving on the correct interface is processed.
+        cache.release_packet(&packet(42));
+        assert!(!cache.contains(&packet(42)));
+        assert!(cache.update(&packet(42)));
+    }
+
+    #[test]
+    fn release_packet_of_unknown_packet_is_a_noop() {
+        let mut cache = PacketCache::with_max_entries(4);
+        insert_new(&mut cache, 1);
+
+        cache.release_packet(&packet(99));
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains(&packet(1)));
     }
 }

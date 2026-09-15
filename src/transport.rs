@@ -3135,7 +3135,19 @@ async fn handle_proof(
 
     if let Some(out_link) = handler.out_links_by_link_id.get(&packet.destination).cloned() {
         let mut link = out_link.lock().await;
-        match link.handle_packet(packet, true) {
+        match link.handle_packet_from(packet, true, &iface) {
+            LinkHandleResult::WrongInterface => {
+                // The proof arrived on an interface the link is not bound
+                // to. Release its hash so a retransmission arriving on the
+                // correct interface is not discarded as a duplicate
+                // (mirroring Python `Transport.py:2593-2594`).
+                handler
+                    .send_ctx
+                    .packet_cache
+                    .lock()
+                    .unwrap()
+                    .release_packet(packet);
+            }
             LinkHandleResult::Activated => {
                 log::debug!(
                     "tp({}): out-link {} activated by proof, sending RTT",
@@ -3144,7 +3156,9 @@ async fn handle_proof(
                 );
                 // The link is now established: record which interface it is
                 // carried on so outbound link packets route directly rather
-                // than falling back to broadcast.
+                // than falling back to broadcast, and bind the link to that
+                // interface for inbound acceptance checks.
+                link.set_attached_interface(iface);
                 handler
                     .send_ctx
                     .link_ifaces
@@ -3368,8 +3382,21 @@ async fn handle_data(
     if packet.header.destination_type == DestinationType::Link {
         if let Some(link) = handler.in_links.get(&packet.destination).cloned() {
             let mut link = link.lock().await;
-            let result = link.handle_packet(packet, false);
+            let result = link.handle_packet_from(packet, false, &iface);
             match result {
+                LinkHandleResult::WrongInterface => {
+                    // The packet arrived on an interface the link is not
+                    // bound to (possible manipulation attempt). Release its
+                    // hash so a retransmission arriving on the bound
+                    // interface is not discarded as a duplicate (mirroring
+                    // Python `Transport.py:2593-2594`).
+                    handler
+                        .send_ctx
+                        .packet_cache
+                        .lock()
+                        .unwrap()
+                        .release_packet(packet);
+                }
                 LinkHandleResult::KeepAlive => {
                     log::trace!(
                         "tp({}): received keepalive on in-link {}, sending response",
@@ -3413,7 +3440,20 @@ async fn handle_data(
 
         if let Some(out_link) = handler.out_links_by_link_id.get(&packet.destination).cloned() {
             let mut link = out_link.lock().await;
-            let result = link.handle_packet(packet, true);
+            let result = link.handle_packet_from(packet, true, &iface);
+            if matches!(result, LinkHandleResult::WrongInterface) {
+                // The packet arrived on an interface the link is not bound
+                // to (possible manipulation attempt). Release its hash so a
+                // retransmission arriving on the bound interface is not
+                // discarded as a duplicate (mirroring Python
+                // `Transport.py:2593-2594`).
+                handler
+                    .send_ctx
+                    .packet_cache
+                    .lock()
+                    .unwrap()
+                    .release_packet(packet);
+            }
             if matches!(result, LinkHandleResult::KeepAlive) {
                 log::trace!(
                     "tp({}): received keepalive response on out-link {}",
@@ -4170,6 +4210,10 @@ async fn handle_link_request_as_destination(
             );
 
             if let Ok(mut link) = link {
+                // Bind the link to the interface the request arrived on, so
+                // subsequent packets for this link are only accepted from
+                // that interface (matching Python's `Link.receive`).
+                link.set_attached_interface(iface);
                 if handler.config.prove_link_messages {
                     link.prove_messages(true);
                 }
