@@ -2137,7 +2137,7 @@ fn handle_rpc_request(request: &Value, mut handler: Option<&mut TransportHandler
         return match operation {
             "path_table" => rpc_path_table(handler.as_deref_mut()),
             "rate_table" => rpc_rate_table(handler.as_deref_mut()),
-            "interface_stats" => rpc_interface_stats(),
+            "interface_stats" => rpc_interface_stats(handler.as_deref_mut()),
             "next_hop_if_name" => rpc_next_hop_if_name(map, handler.as_deref()),
             "next_hop" => rpc_next_hop(map, handler.as_deref()),
             "packet_snr" => handler
@@ -2471,14 +2471,78 @@ fn rpc_interfaces(handler: Option<&mut TransportHandler>) -> Value {
     Value::Array(entries)
 }
 
-fn rpc_interface_stats() -> Value {
+fn rpc_interface_stats(handler: Option<&mut TransportHandler>) -> Value {
+    let Some(handler) = handler else {
+        return Value::Map(vec![
+            (Value::from("interfaces"), Value::Array(vec![])),
+            (Value::from("rxb"), Value::from(0)),
+            (Value::from("txb"), Value::from(0)),
+            (Value::from("rxs"), Value::from(0)),
+            (Value::from("txs"), Value::from(0)),
+            (Value::from("rss"), Value::Nil),
+        ]);
+    };
+
+    // Snapshot per-interface statistics.  The interface manager lock is
+    // acquired synchronously (best-effort); on contention we fall back to an
+    // empty interface list rather than blocking the RPC handler.
+    let iface_manager = handler.send_ctx.iface_manager.clone();
+    let stats = match iface_manager.try_lock() {
+        Ok(mgr) => mgr.interface_stats_list(),
+        Err(_) => Vec::new(),
+    };
+
+    let mut total_txb: u64 = 0;
+    let interfaces: Vec<Value> = stats
+        .into_iter()
+        .map(|s| {
+            total_txb += s.bytes_tx;
+            Value::Map(vec![
+                (Value::from("name"), Value::from(s.name)),
+                (Value::from("type"), Value::from(s.interface_type)),
+                (Value::from("address"), Value::from(s.address.to_hex_string())),
+                (Value::from("mode"), Value::from(s.mode.as_str())),
+                (Value::from("status"), Value::Boolean(true)),
+                (Value::from("clients"), Value::Nil),
+                (Value::from("error_count"), Value::from(s.error_count)),
+                (Value::from("packets_tx"), Value::from(s.packets_tx)),
+                (Value::from("txb"), Value::from(s.bytes_tx)),
+                (Value::from("rxb"), Value::from(0)),
+                (Value::from("txbuffered"), Value::from(s.tx_queue as u64)),
+                (Value::from("announce_queue"), Value::from(s.announce_queue as u64)),
+                (Value::from("channel_load"), Value::from(s.channel_load)),
+                (Value::from("gravity"), Value::from(s.gravity)),
+                (
+                    Value::from("bitrate"),
+                    s.bitrate.map(Value::from).unwrap_or(Value::Nil),
+                ),
+                (
+                    Value::from("mtu"),
+                    s.mtu.map(|m| Value::from(m as u64)).unwrap_or(Value::Nil),
+                ),
+            ])
+        })
+        .collect();
+
+    // The SDK does not track received bytes per interface, so `rxb` is
+    // reported as the total number of received packets (a best-effort proxy).
+    let total_rxb: u64 = handler.packets_received_by_type.announce
+        + handler.packets_received_by_type.link_request
+        + handler.packets_received_by_type.proof
+        + handler.packets_received_by_type.data;
+
+    let rss = handler
+        .last_rssi
+        .map(|v| Value::from(v as i64))
+        .unwrap_or(Value::Nil);
+
     Value::Map(vec![
-        (Value::from("interfaces"), Value::Array(vec![])),
-        (Value::from("rxb"), Value::from(0)),
-        (Value::from("txb"), Value::from(0)),
+        (Value::from("interfaces"), Value::Array(interfaces)),
+        (Value::from("rxb"), Value::from(total_rxb)),
+        (Value::from("txb"), Value::from(total_txb)),
         (Value::from("rxs"), Value::from(0)),
         (Value::from("txs"), Value::from(0)),
-        (Value::from("rss"), Value::Nil),
+        (Value::from("rss"), rss),
     ])
 }
 

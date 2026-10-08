@@ -498,6 +498,36 @@ pub struct InterfaceInfo {
     pub mode: InterfaceMode,
 }
 
+/// Per-interface statistics for the RPC `get interface_stats` operation.
+///
+/// Unlike [`InterfaceInfo`], this carries the traffic counters and queue
+/// depths that the Python `rnstatus` utility expects when it queries a shared
+/// instance over RPC.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceStats {
+    pub name: String,
+    pub interface_type: String,
+    pub address: AddressHash,
+    pub error_count: u64,
+    pub mode: InterfaceMode,
+    /// Cumulative number of packets sent through this interface.
+    pub packets_tx: u64,
+    /// Cumulative number of data bytes sent through this interface.
+    pub bytes_tx: u64,
+    /// Number of outbound packets currently queued for the interface worker.
+    pub tx_queue: usize,
+    /// Number of forwarded announces waiting in the interface announce pacer.
+    pub announce_queue: usize,
+    /// Current channel load as a percentage × 1000 (e.g. 6.9% → 6900).
+    pub channel_load: u64,
+    /// Interface bitrate in bps, if known.
+    pub bitrate: Option<f64>,
+    /// Hardware MTU, if known.
+    pub mtu: Option<usize>,
+    /// Interface gravity.
+    pub gravity: i64,
+}
+
 /// Queue length snapshot for the interface manager.
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct InterfaceQueueLengths {
@@ -1979,6 +2009,53 @@ impl InterfaceManager {
                 address: iface.address,
                 error_count: iface.error_counter.load(Ordering::Relaxed),
                 mode: iface.mode,
+            })
+            .collect()
+    }
+
+    /// Snapshot of per-interface traffic statistics for the RPC
+    /// `get interface_stats` operation.
+    ///
+    /// This is synchronous (unlike [`InterfaceManager::queue_lengths`]) so it
+    /// can be served from the RPC request handler without an async context.
+    /// The announce queue depth is read best-effort via `try_lock`; on
+    /// contention it is reported as `0`.
+    pub fn interface_stats_list(&self) -> Vec<InterfaceStats> {
+        self.ifaces
+            .iter()
+            .filter(|iface| !iface.stop.is_cancelled())
+            .map(|iface| {
+                let channel_load = match &iface.announce_pacer {
+                    Some(pacer) => pacer
+                        .channel_load
+                        .as_ref()
+                        .map(|cl| (*cl.lock().unwrap() * 1000.0) as u64)
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                let announce_queue = match &iface.announce_pacer {
+                    Some(pacer) => pacer
+                        .state
+                        .try_lock()
+                        .map(|s| s.announce_data.len())
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                InterfaceStats {
+                    name: iface.name.clone(),
+                    interface_type: iface.interface_type.clone(),
+                    address: iface.address,
+                    error_count: iface.error_counter.load(Ordering::Relaxed),
+                    mode: iface.mode,
+                    packets_tx: iface.packets_tx.load(Ordering::Relaxed),
+                    bytes_tx: iface.bytes_tx.load(Ordering::Relaxed),
+                    tx_queue: channel_queue_len(&iface.tx_send),
+                    announce_queue,
+                    channel_load,
+                    bitrate: iface.bitrate,
+                    mtu: iface.hw_mtu.as_ref().map(|m| m.load(Ordering::Relaxed)),
+                    gravity: iface.gravity,
+                }
             })
             .collect()
     }
