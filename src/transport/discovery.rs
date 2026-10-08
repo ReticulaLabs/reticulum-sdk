@@ -19,6 +19,8 @@ use crate::{
 
 const KEY_NAME: u8 = 0xFF;
 const KEY_TRANSPORT_ID: u8 = 0xFE;
+const KEY_TRANSPORT_IMPL: u8 = 0xFD;
+const KEY_TRANSPORT_VERS: u8 = 0xFC;
 const KEY_INTERFACE_TYPE: u8 = 0x00;
 const KEY_TRANSPORT: u8 = 0x01;
 const KEY_REACHABLE_ON: u8 = 0x02;
@@ -32,6 +34,11 @@ const KEY_FREQUENCY: u8 = 0x09;
 const KEY_BANDWIDTH: u8 = 0x0A;
 const KEY_SPREADINGFACTOR: u8 = 0x0B;
 const KEY_CODINGRATE: u8 = 0x0C;
+
+/// Implementation identifier included in interface discovery announces.
+const IMPLEMENTATION_NAME: &str = "RSDK-RS";
+/// Implementation version included in interface discovery announces.
+const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const DISCOVERY_APP_NAME: &str = "rnstransport";
 pub const DISCOVERY_ASPECTS: &str = "discovery.interface";
@@ -205,6 +212,14 @@ impl DiscoveryInterfaceConfig {
                 u8_value(KEY_TRANSPORT_ID),
                 Value::Binary(transport_id.as_slice().to_vec()),
             ),
+            (
+                u8_value(KEY_TRANSPORT_IMPL),
+                Value::from(IMPLEMENTATION_NAME),
+            ),
+            (
+                u8_value(KEY_TRANSPORT_VERS),
+                Value::from(IMPLEMENTATION_VERSION),
+            ),
             (u8_value(KEY_NAME), Value::from(self.name.as_str())),
             (u8_value(KEY_LATITUDE), optional_f64(self.latitude)),
             (u8_value(KEY_LONGITUDE), optional_f64(self.longitude)),
@@ -289,6 +304,8 @@ pub struct DiscoveredInterface {
     pub name: String,
     pub transport_enabled: bool,
     pub transport_id: AddressHash,
+    pub impl_name: Option<String>,
+    pub version: Option<String>,
     pub hops: u8,
     pub reachable_on: Option<String>,
     pub port: Option<u16>,
@@ -380,6 +397,8 @@ impl DiscoveredInterface {
         let interface_type = get_string(map, KEY_INTERFACE_TYPE)?.ok_or(RnsError::PacketError)?;
         let transport_enabled = get_bool(map, KEY_TRANSPORT)?.unwrap_or(false);
         let transport_id = get_address_hash(map, KEY_TRANSPORT_ID)?.ok_or(RnsError::PacketError)?;
+        let impl_name = get_string(map, KEY_TRANSPORT_IMPL)?;
+        let version = get_string(map, KEY_TRANSPORT_VERS)?;
         let name = get_string(map, KEY_NAME)?
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("Discovered {interface_type}"));
@@ -459,6 +478,8 @@ impl DiscoveredInterface {
             name,
             transport_enabled,
             transport_id,
+            impl_name,
+            version,
             hops,
             reachable_on,
             port,
@@ -678,6 +699,8 @@ mod tests {
         assert_eq!(decoded.name, "Rust Node");
         assert!(decoded.transport_enabled);
         assert_eq!(decoded.transport_id, transport_id);
+        assert_eq!(decoded.impl_name.as_deref(), Some(IMPLEMENTATION_NAME));
+        assert_eq!(decoded.version.as_deref(), Some(IMPLEMENTATION_VERSION));
         assert_eq!(decoded.reachable_on.as_deref(), Some("127.0.0.1"));
         assert_eq!(decoded.port, Some(4242));
         assert_eq!(decoded.ifac_netname.as_deref(), Some("mesh"));

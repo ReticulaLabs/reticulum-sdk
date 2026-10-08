@@ -88,6 +88,8 @@ async fn discovery_announce_roundtrip() {
 
     assert_eq!(discovered.interface_type, "TCPServerInterface");
     assert_eq!(discovered.name, "Rust Test Nøde 測試");
+    assert_eq!(discovered.impl_name.as_deref(), Some("RSDK-RS"));
+    assert_eq!(discovered.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
     assert_eq!(discovered.reachable_on.as_deref(), Some("127.0.0.1"));
     assert_eq!(discovered.port, Some(port_a));
     assert!(discovered.stamp_value >= 14);
