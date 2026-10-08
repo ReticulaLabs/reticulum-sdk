@@ -949,8 +949,14 @@ impl LoRaChipset for SX1262 {
         // Set sync word
         self.set_sync_word(config.sync_word)?;
 
-        // Set DIO IRQ params
-        self.set_dio_irq_params(config.dio1_line.is_some())?;
+        // Set DIO IRQ params. Enable DIO1 whenever the pin is actually wired
+        // (via the Linux gpio-cdev backend *or* the embedded-hal backend), not
+        // just when the Linux `dio1_line` config field is set. The embedded
+        // backend supplies DIO1 through `hw_provider` (GpioPins.dio1), leaving
+        // `dio1_line` None; gating on it here disabled DIO1 IRQ mapping, so the
+        // pin never asserted and `process_irq` returned early without ever
+        // reading the IRQ status register — RX silently stopped working.
+        self.set_dio_irq_params(self.dio1.is_some())?;
 
         // BW500 workaround
         self.fix_lora_bw500(config.bandwidth as u32)?;
