@@ -20,6 +20,7 @@ pub struct TcpServer {
     max_connections: Option<usize>,
     mode: InterfaceMode,
     gravity: i64,
+    name: String,
 }
 
 impl TcpServer {
@@ -36,6 +37,7 @@ impl TcpServer {
             max_connections: Some(128),
             mode: InterfaceMode::Full,
             gravity: 0,
+            name: String::new(),
         }
     }
 
@@ -53,7 +55,13 @@ impl TcpServer {
             max_connections: Some(128),
             mode: InterfaceMode::Full,
             gravity: 0,
+            name: String::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn with_bitrate(mut self, bitrate: f64) -> Self {
@@ -217,6 +225,10 @@ impl TcpServer {
 }
 
 impl Interface for TcpServer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         DEFAULT_HW_MTU
     }

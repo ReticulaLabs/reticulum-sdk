@@ -47,6 +47,7 @@ pub struct BackboneServer {
     mode: InterfaceMode,
     gravity: i64,
     reconnect_pacer: Arc<Mutex<ReconnectPacer>>,
+    name: String,
 }
 
 impl BackboneServer {
@@ -69,6 +70,7 @@ impl BackboneServer {
                 MAX_RECONNECT_BACKOFF,
                 Duration::from_secs(60),
             ))),
+            name: String::new(),
         }
     }
 
@@ -92,7 +94,13 @@ impl BackboneServer {
                 MAX_RECONNECT_BACKOFF,
                 Duration::from_secs(60),
             ))),
+            name: String::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn with_bitrate(mut self, bitrate: f64) -> Self {
@@ -316,6 +324,10 @@ impl BackboneServer {
 }
 
 impl Interface for BackboneServer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         self.hw_mtu
     }
@@ -352,6 +364,7 @@ pub struct BackboneClient {
     ifac_netkey: Option<String>,
     mode: InterfaceMode,
     gravity: i64,
+    name: String,
 }
 
 impl BackboneClient {
@@ -365,6 +378,7 @@ impl BackboneClient {
             ifac_netkey: None,
             mode: InterfaceMode::Full,
             gravity: 0,
+            name: String::new(),
         }
     }
 
@@ -378,7 +392,13 @@ impl BackboneClient {
             ifac_netkey: None,
             mode: InterfaceMode::Full,
             gravity: 0,
+            name: String::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn with_bitrate(mut self, bitrate: f64) -> Self {
@@ -725,6 +745,10 @@ impl BackboneClient {
 }
 
 impl Interface for BackboneClient {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         self.hw_mtu
     }

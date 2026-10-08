@@ -39,6 +39,7 @@ pub struct SerialInterface {
     parity: SerialParity,
     stopbits: u8,
     compatibility_mode: bool,
+    name: String,
 }
 
 impl SerialInterface {
@@ -50,7 +51,13 @@ impl SerialInterface {
             parity: SerialParity::None,
             stopbits: 1,
             compatibility_mode: false,
+            name: String::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn with_serial_params(
@@ -199,6 +206,10 @@ impl SerialInterface {
 }
 
 impl Interface for SerialInterface {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         HW_MTU
     }

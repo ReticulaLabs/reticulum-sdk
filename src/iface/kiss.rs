@@ -61,6 +61,7 @@ pub struct KissInterface {
     persistence: u8,
     slottime: u16,
     flow_control: bool,
+    name: String,
 }
 
 impl KissInterface {
@@ -76,7 +77,13 @@ impl KissInterface {
             persistence: DEFAULT_PERSISTENCE,
             slottime: DEFAULT_SLOTTIME_MS,
             flow_control: false,
+            name: String::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn with_serial_params(
@@ -243,6 +250,10 @@ impl KissInterface {
 }
 
 impl Interface for KissInterface {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         HW_MTU
     }

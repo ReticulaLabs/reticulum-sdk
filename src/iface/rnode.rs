@@ -212,6 +212,7 @@ pub struct RNodeInterface {
     config: RNodeConfig,
     mode: InterfaceMode,
     gravity: i64,
+    name: String,
 }
 
 impl RNodeInterface {
@@ -220,7 +221,13 @@ impl RNodeInterface {
             config,
             mode: InterfaceMode::Full,
             gravity: 0,
+            name: String::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn with_interface_mode(mut self, mode: InterfaceMode) -> Self {
@@ -359,6 +366,10 @@ impl RNodeInterface {
 }
 
 impl Interface for RNodeInterface {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         RNODE_HW_MTU
     }

@@ -31,6 +31,7 @@ pub struct TcpClient {
     bitrate: Option<f64>,
     mode: InterfaceMode,
     gravity: i64,
+    name: String,
 }
 
 impl TcpClient {
@@ -41,6 +42,7 @@ impl TcpClient {
             bitrate: None,
             mode: InterfaceMode::Full,
             gravity: 0,
+            name: String::new(),
         }
     }
 
@@ -51,7 +53,13 @@ impl TcpClient {
             bitrate: None,
             mode: InterfaceMode::Full,
             gravity: 0,
+            name: String::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn with_bitrate(mut self, bitrate: f64) -> Self {
@@ -390,6 +398,10 @@ impl TcpClient {
 }
 
 impl Interface for TcpClient {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         DEFAULT_HW_MTU
     }

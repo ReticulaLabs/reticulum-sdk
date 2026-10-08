@@ -674,6 +674,7 @@ pub struct LoRaInterface<C: LoRaChipset> {
     config: LoRaConfig,
     stats: LoRaInterfaceStats,
     _chipset: PhantomData<C>,
+    name: String,
 }
 
 impl<C: LoRaChipset + 'static> LoRaInterface<C> {
@@ -682,7 +683,13 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
             config,
             stats: LoRaInterfaceStats::default(),
             _chipset: PhantomData,
+            name: String::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     /// Shared diagnostic counters for this interface (usable from any thread).
@@ -987,6 +994,10 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
 }
 
 impl<C: LoRaChipset> Interface for LoRaInterface<C> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         LORA_HW_MTU
     }

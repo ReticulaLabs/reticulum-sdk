@@ -81,6 +81,7 @@ pub struct Modem73Interface {
     fragmentation_target: Arc<AtomicBool>,
     mode: InterfaceMode,
     gravity: i64,
+    name: String,
 }
 
 impl Default for Modem73Interface {
@@ -101,11 +102,17 @@ impl Modem73Interface {
             fragmentation_target: Arc::new(AtomicBool::new(false)),
             mode: InterfaceMode::Full,
             gravity: 0,
+            name: String::new(),
         }
     }
 
     pub fn new_with_defaults() -> Self {
         Self::default()
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn with_mtu_overhead(mut self, mtu_overhead: usize) -> Self {
@@ -287,6 +294,10 @@ impl Modem73Interface {
 }
 
 impl Interface for Modem73Interface {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn hw_mtu(&self) -> usize {
         self.current_mtu.load(std::sync::atomic::Ordering::Relaxed)
     }
