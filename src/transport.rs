@@ -553,6 +553,33 @@ pub struct Transport {
     iface_manager: Arc<Mutex<InterfaceManager>>,
     send_ctx: Arc<SendCtx>,
     cancel: CancellationToken,
+    /// Defers shutdown until the last [`Transport`] handle is released. See
+    /// [`TransportShutdown`].
+    _shutdown: Arc<TransportShutdown>,
+}
+
+/// Cancels the transport-wide [`CancellationToken`] when the last [`Transport`]
+/// handle is dropped.
+///
+/// `Transport` is `Clone`, and cloning a [`CancellationToken`] shares its
+/// state rather than giving each clone an independent copy. A bare
+/// `Drop for Transport` would therefore cancel the transport as soon as *any*
+/// clone was released, tearing down every interface, link and background task
+/// for all remaining holders — which is reachable from ordinary library use:
+/// `Channel` keeps an owned clone inside `Outbound` and releases it whenever
+/// the channel closes.
+///
+/// Holding this guard behind an `Arc` means the `Drop` only runs once the final
+/// handle goes away, so the transport lives exactly as long as somebody is
+/// still using it.
+struct TransportShutdown {
+    cancel: CancellationToken,
+}
+
+impl Drop for TransportShutdown {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl TransportConfig {
@@ -964,6 +991,12 @@ impl Transport {
             ));
         }
 
+        // Built before `cancel` is moved into the struct below; the guard
+        // shares the token's state, so it observes the same cancellation.
+        let shutdown = Arc::new(TransportShutdown {
+            cancel: cancel.clone(),
+        });
+
         Self {
             name,
             discovery_tx,
@@ -976,6 +1009,7 @@ impl Transport {
             handler,
             send_ctx,
             cancel,
+            _shutdown: shutdown,
         }
     }
 
@@ -2906,12 +2940,6 @@ async fn write_py_connection_frame(stream: &mut TcpStream, data: &[u8]) -> Resul
         .await
         .map_err(|error| error.to_string())?;
     stream.flush().await.map_err(|error| error.to_string())
-}
-
-impl Drop for Transport {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
 }
 
 impl TransportHandler {
@@ -5734,6 +5762,33 @@ mod tests {
     use crate::iface::Interface;
     use crate::packet::{HeaderType, PACKET_MDU};
     use std::net::TcpListener as StdTcpListener;
+
+    /// Regression test: `Transport` is `Clone`, and a `CancellationToken`
+    /// clone shares its state. Releasing one handle must not shut the
+    /// transport down underneath the holders that are still using it — this
+    /// is reachable via `Channel`, which parks an owned clone in `Outbound`
+    /// and releases it on close. Shutdown must happen on the *last* drop.
+    #[tokio::test]
+    async fn transport_shuts_down_only_when_the_last_handle_is_dropped() {
+        let transport = Transport::new(TransportConfig::default());
+
+        // An independent handle on the same token, so cancellation stays
+        // observable after `transport` itself has been dropped.
+        let observer = transport.cancel.clone();
+        let clone = transport.clone();
+
+        drop(clone);
+        assert!(
+            !observer.is_cancelled(),
+            "dropping one of two handles must not shut down the transport"
+        );
+
+        drop(transport);
+        assert!(
+            observer.is_cancelled(),
+            "dropping the final handle must cancel the transport"
+        );
+    }
 
     /// Minimal interface used to give the transport an active interface in
     /// tests that exercise egress paths.
