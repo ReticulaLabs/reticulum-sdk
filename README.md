@@ -1,8 +1,7 @@
 # Reticulum SDK
 
 An SDK of the Reticulum protocol in Rust. This SDK is designed to be fully wire and protocol compatible
-with the original [Python implementation](https://github.com/markqvist/Reticulum) which is now
-"[developed privately](https://github.com/markqvist/Reticulum/blob/master/MIRROR.md)".
+with the original [Python implementation](https://github.com/markqvist/Reticulum).
 
 To be a good neighbor on the Reticulum network, all Reticulum-SDK instances identify themselves
 as ```RSDK-RS``` on the network.
