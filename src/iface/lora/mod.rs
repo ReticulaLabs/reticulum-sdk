@@ -16,7 +16,15 @@ use tokio_util::sync::CancellationToken;
 use crate::iface::{decode_rx, encode_tx, IfacConfig, Interface, InterfaceContext, RxMessage};
 use crate::packet::Packet;
 
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
+
 const LORA_HW_MTU: usize = 508;
+/// Interface bytes carried by one over-air frame, excluding the header byte.
+/// Matches `SINGLE_MTU - HEADER_L` in radio firmware.
+const LORA_FRAME_MTU: usize = 254;
+/// Bit 0 of the header byte marks a frame continuing into the next one.
+pub const LORA_FLAG_SPLIT: u8 = 0x01;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const DEFAULT_COMMAND_DELAY: Duration = Duration::from_millis(2);
 const DEFAULT_RX_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -774,6 +782,108 @@ pub trait LoRaChipset: Send {
 }
 
 // ---------------------------------------------------------------------------
+// On-air framing
+// ---------------------------------------------------------------------------
+// Every Reticulum LoRa frame carries a one-byte header in front of the
+// interface data: the upper nibble is a per-packet sequence and bit 0 marks a
+// frame that continues into the next one. Radio firmware adds the byte before
+// handing a frame to the modem and strips it before passing data up to the
+// host, so it exists only on air — never inside a KISS frame, and never in
+// what a host sees over serial.
+//
+// `rnode.rs` therefore needs no framing code: the firmware it talks to has
+// already applied it. The direct chipset drivers do their own SPI/GPIO and
+// bypass that firmware, so they must add and strip the byte themselves or
+// peers read every frame one byte out of step.
+
+/// Sequence nibble for the next outbound frame.
+///
+/// Randomised so interleaved traffic, or the two halves of a split frame
+/// separated by someone else's packet, is unlikely to be read as a
+/// continuation of each other.
+fn random_sequence() -> u8 {
+    let mut rng = UnwrapErr(SysRng);
+    crate::hash::AddressHash::new_from_rand(&mut rng).as_slice()[0]
+}
+
+/// Prepend the header byte, splitting across two frames if `data` is longer
+/// than one frame can carry. Both halves share a sequence.
+pub fn frames_for_tx(data: &[u8], sequence: u8) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if data.len() <= LORA_FRAME_MTU {
+        let mut frame = Vec::with_capacity(data.len() + 1);
+        frame.push(sequence & 0xF0);
+        frame.extend_from_slice(data);
+        out.push(frame);
+        return out;
+    }
+
+    let header = (sequence & 0xF0) | LORA_FLAG_SPLIT;
+    for chunk in data.chunks(LORA_FRAME_MTU) {
+        let mut frame = Vec::with_capacity(chunk.len() + 1);
+        frame.push(header);
+        frame.extend_from_slice(chunk);
+        out.push(frame);
+    }
+    out
+}
+
+/// Rebuilds interface data from received frames: strips the header byte and
+/// joins the two halves of a split frame.
+#[derive(Default)]
+pub struct Reassembler {
+    /// Sequence of the split frame being collected, if any.
+    sequence: Option<u8>,
+    buffer: Vec<u8>,
+}
+
+impl Reassembler {
+    pub fn new() -> Self {
+        Self { sequence: None, buffer: Vec::with_capacity(LORA_HW_MTU) }
+    }
+
+    /// Strip the header byte from `frame`, returning the interface bytes once
+    /// a whole frame is in. The first half of a split frame yields `None`.
+    pub fn accept(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        let (&header, data) = frame.split_first()?;
+
+        if header & LORA_FLAG_SPLIT == 0 {
+            self.sequence = None;
+            self.buffer.clear();
+            return Some(data.to_vec());
+        }
+
+        let sequence = header & 0xF0;
+        match self.sequence {
+            Some(pending) if pending == sequence => {
+                // Only two halves fit the air MTU. More than that means a
+                // malformed stream or a third frame arriving, so drop it
+                // rather than hand up a short buffer as if it were complete.
+                if self.buffer.len() + data.len() > LORA_HW_MTU {
+                    self.sequence = None;
+                    self.buffer.clear();
+                    log::warn!(
+                        "lora_interface: split frame exceeds {} bytes, dropping",
+                        LORA_HW_MTU
+                    );
+                    return None;
+                }
+                self.buffer.extend_from_slice(data);
+                self.sequence = None;
+                Some(core::mem::take(&mut self.buffer))
+            }
+            // First half, or a new sequence superseding a stale one.
+            _ => {
+                self.sequence = Some(sequence);
+                self.buffer.clear();
+                self.buffer.extend_from_slice(data);
+                None
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LoRaInterface — the Reticulum Interface wrapper
 // ---------------------------------------------------------------------------
 
@@ -853,12 +963,13 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                 let ifac_config = ifac_config.clone();
 
                 tokio::spawn(async move {
+                    let mut reassembler = Reassembler::new();
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => break,
                             _ = stop.cancelled() => break,
                             Some(pkt) = rx_packet_rx.recv() => {
-                                if pkt.payload.len() > LORA_HW_MTU {
+                                if pkt.payload.len() > LORA_FRAME_MTU + 1 {
                                     stats.record_rx_error();
                                     log::warn!(
                                         "lora_interface: dropping oversized packet len={}",
@@ -866,7 +977,17 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                     );
                                     continue;
                                 }
-                                match decode_rx(ifac_config.as_ref(), &pkt.payload) {
+                                // Strip the on-air header byte, joining the two
+                                // halves of a split frame.
+                                let Some(framed) = reassembler.accept(&pkt.payload) else {
+                                    log::trace!(
+                                        "lora_interface: first half of a split frame ({} bytes), \
+                                         awaiting continuation",
+                                        pkt.payload.len().saturating_sub(1)
+                                    );
+                                    continue;
+                                };
+                                match decode_rx(ifac_config.as_ref(), &framed) {
                                     Ok(packet) => {
                                         stats.record_rx_packet();
                                         let _ = rx_channel
@@ -882,7 +1003,7 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                         stats.record_rx_error();
                                         log::warn!(
                                             "lora_interface: couldn't decode received packet len={}",
-                                            pkt.payload.len()
+                                            framed.len()
                                         );
                                     }
                                 }
@@ -1073,12 +1194,31 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
 
         stats.record_tx_attempt(payload.len());
 
+        // Add the on-air header byte, splitting across two frames if needed.
+        let sequence = random_sequence();
+        let frames = frames_for_tx(&payload, sequence);
+        if frames.len() > 2 {
+            stats.record_tx_failure();
+            log::error!(
+                "lora_interface: packet of {} bytes exceeds the {} byte LoRa air MTU",
+                payload.len(),
+                LORA_HW_MTU
+            );
+            return;
+        }
+
         // The transmit is a single short SPI transaction; run it inline on the
         // tokio worker instead of `spawn_blocking` (see open_chipset).
-        let result = {
-            let mut cs = chipset.lock().unwrap();
-            cs.transmit(&payload)
-        };
+        let mut result = Ok(());
+        for frame in &frames {
+            result = {
+                let mut cs = chipset.lock().unwrap();
+                cs.transmit(frame)
+            };
+            if result.is_err() {
+                break;
+            }
+        }
 
         // A failed TX is not fatal: transmit() already returns the chipset to
         // a known state (STDBY_RC + IRQ cleared) and the RX poll loop re-arms
