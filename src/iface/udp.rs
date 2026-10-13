@@ -10,7 +10,7 @@ use crate::iface::{
 };
 
 // TODO: Configure via features
-const PACKET_TRACE: bool = true;
+const PACKET_TRACE: bool = false;
 
 pub struct UdpInterface {
     bind_addr: String,
