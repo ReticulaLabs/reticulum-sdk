@@ -111,7 +111,8 @@ cargo build
 
 ## Implementations
 
-* Used by the [Rust reticulum-router daemon](https://github.com/ReticulaLabs/reticulum-router)
+* Used by the [Rust reticulum-router daemon](https://github.com/ReticulaLabs/reticulum-router) as a powerful and fully-compatible Reticulum transport.
+* Used by the [Rust reticula project](https://github.com/ReticulaLabs/reticula) as a tiny embedded end-user terminal for the LilyGo T-Deck.
 
 ## License
 
