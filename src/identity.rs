@@ -91,8 +91,7 @@ impl Identity {
             return Err(RnsError::IncorrectHash);
         }
 
-        let public_key_bytes: [u8; PUBLIC_KEY_LENGTH] =
-            hex_decode(&hex[..PUBLIC_KEY_LENGTH * 2])?;
+        let public_key_bytes: [u8; PUBLIC_KEY_LENGTH] = hex_decode(&hex[..PUBLIC_KEY_LENGTH * 2])?;
         let verifying_key_bytes: [u8; PUBLIC_KEY_LENGTH] =
             hex_decode(&hex[PUBLIC_KEY_LENGTH * 2..])?;
 
@@ -120,7 +119,11 @@ impl Identity {
             .map_err(|_| RnsError::IncorrectSignature)
     }
 
-    pub fn derive_key<R: CryptoRng + ?Sized>(&self, rng: &mut R, salt: Option<&[u8]>) -> DerivedKey {
+    pub fn derive_key<R: CryptoRng + ?Sized>(
+        &self,
+        rng: &mut R,
+        salt: Option<&[u8]>,
+    ) -> DerivedKey {
         DerivedKey::new_from_ephemeral_key(rng, &self.public_key, salt)
     }
 
@@ -301,10 +304,8 @@ impl PrivateIdentity {
             return Err(RnsError::IncorrectHash);
         }
 
-        let private_key_bytes: [u8; PUBLIC_KEY_LENGTH] =
-            hex_decode(&hex[..PUBLIC_KEY_LENGTH * 2])?;
-        let sign_key_bytes: [u8; PUBLIC_KEY_LENGTH] =
-            hex_decode(&hex[PUBLIC_KEY_LENGTH * 2..])?;
+        let private_key_bytes: [u8; PUBLIC_KEY_LENGTH] = hex_decode(&hex[..PUBLIC_KEY_LENGTH * 2])?;
+        let sign_key_bytes: [u8; PUBLIC_KEY_LENGTH] = hex_decode(&hex[PUBLIC_KEY_LENGTH * 2..])?;
 
         Ok(Self::new(
             StaticSecret::from(private_key_bytes),

@@ -1,10 +1,10 @@
 use core::cmp;
 use core::convert::From;
 
+use aes::cipher::block_padding::Pkcs7;
 use aes::cipher::BlockDecryptMut;
 use aes::cipher::Key;
 use aes::cipher::Unsigned;
-use aes::cipher::block_padding::Pkcs7;
 use cbc::cipher::BlockEncryptMut;
 use cbc::cipher::KeyIvInit;
 use crypto_common::{IvSizeUser, KeySizeUser, OutputSizeUser};
@@ -76,7 +76,11 @@ impl<'a> From<&'a [u8]> for Token<'a> {
 
 impl<'r, R: CryptoRng + ?Sized> Fernet<'r, R> {
     pub fn new(sign_key: [u8; AES_KEY_SIZE], enc_key: AesKey, rng: &'r mut R) -> Self {
-        Self { rng, sign_key, enc_key }
+        Self {
+            rng,
+            sign_key,
+            enc_key,
+        }
     }
 
     pub fn new_from_slices(sign_key: &[u8], enc_key: &[u8], rng: &'r mut R) -> Self {

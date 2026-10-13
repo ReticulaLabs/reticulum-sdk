@@ -102,10 +102,9 @@ impl AnnounceEntry {
 
         // Path responses are directed back to the requesting interface.
         // Everything else is rebroadcast on ALL interfaces, including the
-        // one the announce was received on. The Python reference
-        // implementation does the same (loop prevention relies on packet
+        // one the announce was received on. Loop prevention relies on packet
         // hash deduplication and echo counting, not on excluding the
-        // ingress interface). Excluding the ingress interface would break
+        // ingress interface. Excluding the ingress interface would break
         // multi-hop propagation on single-interface nodes, since the
         // announce would never be forwarded to the next hop on the same
         // shared medium.
@@ -564,9 +563,9 @@ mod tests {
     /// A received announce must be rebroadcast on ALL interfaces, including
     /// the one it was received on. Excluding the ingress interface breaks
     /// multi-hop propagation on single-interface nodes (the announce is
-    /// never forwarded to the next hop on the same shared medium). This
-    /// matches the Python reference, which rebroadcasts on every interface
-    /// and relies on packet-hash dedup + echo counting for loop control.
+    /// never forwarded to the next hop on the same shared medium).
+    /// Rebroadcasting on every interface relies on packet-hash dedup +
+    /// echo counting for loop control.
     #[tokio::test(start_paused = true)]
     async fn announce_rebroadcast_includes_ingress_interface() {
         let mut table = AnnounceTable::new();

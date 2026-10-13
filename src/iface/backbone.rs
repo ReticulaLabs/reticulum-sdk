@@ -29,8 +29,8 @@ const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
 pub const BACKBONE_DEFAULT_HW_MTU: usize = 1_048_576;
 pub const BACKBONE_DEFAULT_BITRATE: f64 = 1_000_000_000.0;
 
-/// Default Interface Access Code size for backbone interfaces, matching
-/// the Python reference `BackboneInterface.DEFAULT_IFAC_SIZE = 16`.
+/// Default Interface Access Code size for backbone interfaces. The protocol
+/// fixes this at 16 bytes for backbone interfaces.
 pub const DEFAULT_IFAC_SIZE: usize = 16;
 
 /// Server-side listening interface modeled after Python's `BackboneInterface`.
@@ -796,8 +796,8 @@ fn minimum_decoded_packet_len(data: &[u8]) -> usize {
             RETICULUM_MAX_HEADER_SIZE
         }
         // Header-only packets (empty data) are valid; accept the full
-        // Type1 header size (matching the header-only Type2 floor above
-        // and the Python reference, which has no minimum at all).
+        // Type1 header size (matching the header-only Type2 floor above;
+        // the protocol defines no minimum payload size).
         _ => RETICULUM_HEADER_MINSIZE,
     }
 }

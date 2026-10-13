@@ -2,11 +2,11 @@
 //!
 //! A registered single-input destination must be reachable at its
 //! *name-derived* destination hash (the hash peers compute from
-//! `name + identity hash`, matching the Python reference).  Inbound link
+//! `name + identity hash`).  Inbound link
 //! requests and data packets addressed to that hash must be delivered to the
 //! destination.  Peers never address a destination by the raw identity hash,
 //! so no alias registration is required (or desirable — it would diverge from
-//! the reference implementation).
+//! the protocol's addressing scheme).
 
 use std::net::TcpListener;
 use std::sync::Once;

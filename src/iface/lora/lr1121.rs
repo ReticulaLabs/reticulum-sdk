@@ -64,7 +64,7 @@ const RFSW0_HIGH: u8 = 0b00001; // DIO5 Built-in RfSw
 const RFSW1_HIGH: u8 = 0b00010; // DIO6 Built-in RfSw
 const RFSW2_HIGH: u8 = 0b00100; // DIO7
 const RFSW3_HIGH: u8 = 0b01000; // DIO8
-//const RFSW4_HIGH: u8 = 0b10000; // DIO9??
+                                //const RFSW4_HIGH: u8 = 0b10000; // DIO9??
 
 // Buffer access
 const CMD_WRITE_BUFFER_8: u16 = 0x0109;
@@ -173,11 +173,7 @@ const IRQ_CAD_DONE: u32 = 1 << 8;
 const IRQ_CAD_DETECTED: u32 = 1 << 9;
 const IRQ_TIMEOUT: u32 = 1 << 10;
 
-const IRQ_MASK_ALL: u32 = IRQ_TX_DONE
-    | IRQ_RX_DONE
-    | IRQ_HEADER_ERR
-    | IRQ_ERR
-    | IRQ_TIMEOUT;
+const IRQ_MASK_ALL: u32 = IRQ_TX_DONE | IRQ_RX_DONE | IRQ_HEADER_ERR | IRQ_ERR | IRQ_TIMEOUT;
 
 // ── Device error word (LR1121 UM §3.6.1, Table 3-5) ────────────────────────
 // Bit assignments are unique to the LR11xx family (they differ from the
@@ -238,7 +234,7 @@ fn lora_bandwidth_code_2p4g(bw_hz: u32) -> u8 {
         x if x <= 206_000 => 0x0D, // 203.125 kHz
         x if x <= 413_000 => 0x0E, // 406.25 kHz
         x if x <= 825_000 => 0x0F, // 812.5 kHz
-        _ => 0x0F,                  // 812.5 kHz (fallback)
+        _ => 0x0F,                 // 812.5 kHz (fallback)
     }
 }
 
@@ -262,17 +258,17 @@ fn needs_ldro(sf: u8, bw_hz: u32) -> bool {
 
 fn calibrate_image_bands(freq_hz: u64) -> Option<(u8, u8)> {
     if freq_hz < 446_000_000 {
-        Some((0x6B, 0x6E))  // 430–440 MHz
+        Some((0x6B, 0x6E)) // 430–440 MHz
     } else if freq_hz < 734_000_000 {
-        Some((0x75, 0x81))  // 470–510 MHz
+        Some((0x75, 0x81)) // 470–510 MHz
     } else if freq_hz < 828_000_000 {
-        Some((0xC1, 0xC5))  // 779–787 MHz
+        Some((0xC1, 0xC5)) // 779–787 MHz
     } else if freq_hz < 877_000_000 {
-        Some((0xD7, 0xDB))  // 863–870 MHz
+        Some((0xD7, 0xDB)) // 863–870 MHz
     } else if freq_hz < 1_000_000_000 {
-        Some((0xE1, 0xE9))  // 902–928 MHz
+        Some((0xE1, 0xE9)) // 902–928 MHz
     } else {
-        None                // HF bands: no image calibration needed
+        None // HF bands: no image calibration needed
     }
 }
 
@@ -292,7 +288,8 @@ const PA_HP_MAX_DBM: i8 = 22;
 /// Low-power PA duty cycle, indexed by `power_dbm - PA_LP_MIN_DBM`.
 const PA_LP_DUTY_CYCLE: [u8; 33] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02, 0x03, 0x04, 0x07,
+    0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x02, 0x03, 0x04,
+    0x07,
 ];
 
 /// Low-power PA hp_sel — always 0 for the LP PA.
@@ -388,7 +385,6 @@ impl LR1121 {
         }
     }
 
-
     fn wait_ready(&self) -> Result<(), LoRaError> {
         // Default wait covers a normal radio command (~10ms typical) plus
         // the WriteFlashEncrypted per-chunk budget (see below). Use
@@ -455,10 +451,7 @@ impl LR1121 {
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or_else(|| max_busy.as_millis().max(200) as u64);
-                std::thread::sleep(std::cmp::max(
-                    self.command_delay,
-                    Duration::from_millis(ms),
-                ));
+                std::thread::sleep(std::cmp::max(self.command_delay, Duration::from_millis(ms)));
                 Ok(())
             }
         }
@@ -483,13 +476,16 @@ impl LR1121 {
     pub fn hardware_reset(&mut self) -> Result<(), LoRaError> {
         match &self.reset {
             Some(reset) => {
-                reset.set_value(true)
+                reset
+                    .set_value(true)
                     .map_err(|e| LoRaError::Gpio(format!("reset high: {}", e)))?;
                 std::thread::sleep(Duration::from_millis(10));
-                reset.set_value(false)
+                reset
+                    .set_value(false)
                     .map_err(|e| LoRaError::Gpio(format!("reset low: {}", e)))?;
                 std::thread::sleep(Duration::from_millis(10));
-                reset.set_value(true)
+                reset
+                    .set_value(true)
                     .map_err(|e| LoRaError::Gpio(format!("reset high: {}", e)))?;
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -545,7 +541,12 @@ impl LR1121 {
     }
 
     /// Read command: send 16-bit opcode + args, wait BUSY, then read response.
-    fn read_command(&mut self, opcode: u16, args: &[u8], read_len: usize) -> Result<Vec<u8>, LoRaError> {
+    fn read_command(
+        &mut self,
+        opcode: u16,
+        args: &[u8],
+        read_len: usize,
+    ) -> Result<Vec<u8>, LoRaError> {
         self.wait_ready()?;
         // Phase 1 — send command; Stat1 reflects previous command status
         let mut tx = vec![(opcode >> 8) as u8, (opcode & 0xFF) as u8];
@@ -553,7 +554,11 @@ impl LR1121 {
         let mut rx = vec![0u8; tx.len()];
         self.spi.xfer(&tx, &mut rx)?;
         let stat1 = rx.first().copied().unwrap_or(0);
-        log::trace!("lr1121: readcmd tx={:02X?} rx={:02X?} stat1=0x{stat1:02X}", tx, rx);
+        log::trace!(
+            "lr1121: readcmd tx={:02X?} rx={:02X?} stat1=0x{stat1:02X}",
+            tx,
+            rx
+        );
         self.log_cmd_status(opcode, stat1);
         self.prev_status = Some((opcode, stat1));
         self.wait_ready()?;
@@ -563,7 +568,11 @@ impl LR1121 {
         let mut read_rx = vec![0x00u8; read_len + 1];
         self.spi.xfer(&read_tx, &mut read_rx)?;
         self.wait_ready()?;
-        log::trace!("lr1121: readcmd phase2 tx={:02X?} rx={:02X?}", read_tx, read_rx);
+        log::trace!(
+            "lr1121: readcmd phase2 tx={:02X?} rx={:02X?}",
+            read_tx,
+            read_rx
+        );
 
         // First byte is Stat1, remaining bytes are the actual response
         Ok(read_rx[1..].to_vec())
@@ -669,19 +678,12 @@ impl LR1121 {
     /// cleared so later checks aren't misread. Without a BUSY line we poll
     /// the status byte; this is the software equivalent of waiting for
     /// BUSY to release.
-    pub fn enter_standby_xosc(
-        &mut self,
-        startup_delay: Duration,
-    ) -> Result<(), LoRaError> {
+    pub fn enter_standby_xosc(&mut self, startup_delay: Duration) -> Result<(), LoRaError> {
         let timeout = startup_delay + Duration::from_millis(100);
         let max_busy = startup_delay + Duration::from_millis(100);
         for attempt in 0..4 {
-            self.write_command_with_max_busy(
-                CMD_SET_STANDBY,
-                &[STANDBY_XOSC],
-                max_busy,
-            )
-            .map(|_| ())?;
+            self.write_command_with_max_busy(CMD_SET_STANDBY, &[STANDBY_XOSC], max_busy)
+                .map(|_| ())?;
             if self.wait_for_standby_xosc(timeout)? {
                 let _ = self.clear_device_errors();
                 return Ok(());
@@ -710,7 +712,8 @@ impl LR1121 {
         // If the chip is awake this moves it to STBY_RC instantly; if it is
         // asleep the command's NSS falling edge is the wake trigger (the
         // command itself is ignored until the restart completes).
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC]).map(|_| ())?;
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])
+            .map(|_| ())?;
         std::thread::sleep(Duration::from_millis(10));
         let deadline = Instant::now() + Duration::from_millis(3000);
         while Instant::now() < deadline {
@@ -761,7 +764,16 @@ impl LR1121 {
             // don't wait on it here.
             let args = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
             self.spi.xfer(
-                &[(CMD_SET_SLEEP >> 8) as u8, CMD_SET_SLEEP as u8, args[0], args[1], args[2], args[3], args[4], args[5]],
+                &[
+                    (CMD_SET_SLEEP >> 8) as u8,
+                    CMD_SET_SLEEP as u8,
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3],
+                    args[4],
+                    args[5],
+                ],
                 &mut [0u8; 8],
             )?;
             std::thread::sleep(Duration::from_millis(50));
@@ -818,7 +830,8 @@ impl LR1121 {
         // SetSleep is only accepted from STDBY. Move to STDBY_RC first so a
         // warm-stuck chip that is still in TX or RX is in a defined mode
         // before we ask it to sleep.
-        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC]).map(|_| ())?;
+        self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])
+            .map(|_| ())?;
         std::thread::sleep(Duration::from_millis(5));
 
         // SetSleep args: bit 0 = warm_start, bit 1 = rtc_wakeup. We use
@@ -847,7 +860,11 @@ impl LR1121 {
         log::info!(
             "lr1121: probe_sleep: status bytes = {:02X?} -> chip was {}",
             rx,
-            if was_asleep { "ASLEEP (fresh POR)" } else { "AWAKE (warm/stuck)" }
+            if was_asleep {
+                "ASLEEP (fresh POR)"
+            } else {
+                "AWAKE (warm/stuck)"
+            }
         );
         Ok(was_asleep)
     }
@@ -873,10 +890,12 @@ impl LR1121 {
                 data.len()
             )));
         }
-        Ok((data[0] as u32) << 24
-            | (data[1] as u32) << 16
-            | (data[2] as u32) << 8
-            | data[3] as u32)
+        Ok(
+            (data[0] as u32) << 24
+                | (data[1] as u32) << 16
+                | (data[2] as u32) << 8
+                | data[3] as u32,
+        )
     }
 
     /// Write a single 32-bit register/memory word (WriteRegmem32,
@@ -919,7 +938,8 @@ impl LR1121 {
         let hw = data[0];
         log::debug!(
             "lr1121: SPI ping OK (version=0x{v:08X}, hw=0x{hw:02X}, fw=0x{:02X}{:02X})",
-            data[2], data[3]
+            data[2],
+            data[3]
         );
         Ok(())
     }
@@ -935,10 +955,12 @@ impl LR1121 {
                 "lr1121: GetVersion returned no data".into(),
             ));
         }
-        Ok((data[0] as u32) << 24
-            | (data[1] as u32) << 16
-            | (data[2] as u32) << 8
-            | data[3] as u32)
+        Ok(
+            (data[0] as u32) << 24
+                | (data[1] as u32) << 16
+                | (data[2] as u32) << 8
+                | data[3] as u32,
+        )
     }
 
     /// Configure the TCXO (SetTcxoMode, 0x0117): DIO3 sources the TCXO
@@ -952,22 +974,21 @@ impl LR1121 {
     /// fails after this, measure DIO3 with a multimeter — 0V here means the
     /// TCXO was never powered (software/harness), ~3.0V means the clock
     /// path itself is the problem.
-    pub fn set_tcxo_mode(&mut self, voltage_v: f64, startup_delay: Duration) -> Result<(), LoRaError> {
+    pub fn set_tcxo_mode(
+        &mut self,
+        voltage_v: f64,
+        startup_delay: Duration,
+    ) -> Result<(), LoRaError> {
         let code = tcxo_voltage_code(voltage_v);
         // TCXO startup timeout is 24 bits in 30.52µs steps. Honour the
         // caller's delay (clamped to a sane window); the WaveShare default
         // of 9.2ms corresponds to ~300 steps.
-        let delay: u32 = (startup_delay
-            .as_micros()
-            .saturating_div(30)
-            .min(0xFF_FFFF) as u32)
-            .max(1);
-        self.write_command(CMD_SET_TXCO_MODE, &[
-            code,
-            (delay >> 16) as u8,
-            (delay >> 8) as u8,
-            delay as u8,
-        ])?;
+        let delay: u32 =
+            (startup_delay.as_micros().saturating_div(30).min(0xFF_FFFF) as u32).max(1);
+        self.write_command(
+            CMD_SET_TXCO_MODE,
+            &[code, (delay >> 16) as u8, (delay >> 8) as u8, delay as u8],
+        )?;
         std::thread::sleep(Duration::from_millis(15));
         log::info!(
             "lr1121: SetTcxoMode accepted (v={voltage_v}V code=0x{code:02X}, timeout={startup_delay:?} = {delay} steps) — DIO3 should now be sourcing ~{voltage_v}V"
@@ -987,7 +1008,13 @@ impl LR1121 {
         Ok(())
     }
 
-    fn set_modulation_params(&mut self, sf: u8, bw_hz: u32, cr: u8, band: FrequencyBand) -> Result<(), LoRaError> {
+    fn set_modulation_params(
+        &mut self,
+        sf: u8,
+        bw_hz: u32,
+        cr: u8,
+        band: FrequencyBand,
+    ) -> Result<(), LoRaError> {
         let bw = match band {
             FrequencyBand::Band2p4G => lora_bandwidth_code_2p4g(bw_hz),
             _ => lora_bandwidth_code_subghz(bw_hz),
@@ -998,7 +1025,14 @@ impl LR1121 {
         Ok(())
     }
 
-    fn set_packet_params(&mut self, preamble: u16, header_mode: u8, payload_len: u8, crc: u8, iq: u8) -> Result<(), LoRaError> {
+    fn set_packet_params(
+        &mut self,
+        preamble: u16,
+        header_mode: u8,
+        payload_len: u8,
+        crc: u8,
+        iq: u8,
+    ) -> Result<(), LoRaError> {
         self.write_command(
             CMD_SET_PACKET_PARAMS,
             &[
@@ -1039,7 +1073,10 @@ impl LR1121 {
                 // high-power PA (HP, VBAT) above, each with the Seeed
                 // per-dBm duty_cycle/hp_sel tables.
                 let (pa_sel, reg_supply, pa_duty_cycle, pa_hp_sel) = subghz_pa_config(power_dbm);
-                self.write_command(CMD_SET_PA_CONFIG, &[pa_sel, reg_supply, pa_duty_cycle, pa_hp_sel])?;
+                self.write_command(
+                    CMD_SET_PA_CONFIG,
+                    &[pa_sel, reg_supply, pa_duty_cycle, pa_hp_sel],
+                )?;
             }
             FrequencyBand::LBand | FrequencyBand::SBand | FrequencyBand::Band2p4G => {
                 // High frequency PA
@@ -1082,7 +1119,10 @@ impl LR1121 {
                 (irq_mask >> 16) as u8,
                 (irq_mask >> 8) as u8,
                 irq_mask as u8,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
             ],
         )?;
         Ok(())
@@ -1091,16 +1131,19 @@ impl LR1121 {
     fn set_dio_as_rf_switch(&mut self, enabled: bool) -> Result<(), LoRaError> {
         if enabled {
             // Core1121-HF PE4259 SPDT: V1(DIO5/RFSW0), V2(DIO6/RFSW1).
-            self.write_command(CMD_SET_DIO_AS_RF_SWITCH, &[
-                RFSW0_HIGH | RFSW1_HIGH,  // RfswEnableCfg enable DIO5,6
-                0x00,                     // RfswStbyCfg standby
-                RFSW0_HIGH,               // RfswRxCfg RX
-                RFSW0_HIGH | RFSW1_HIGH,  // RfSwTxCfg TX
-                RFSW1_HIGH,               // RfSwTxHPCfg: High Power TX
-                0x00,                     // RfSwTxHfCfg: High Frequency TX
-                0x00,                     // RFU. GNSS?
-                0x00,                     // RFU. Wifi?
-            ])?;
+            self.write_command(
+                CMD_SET_DIO_AS_RF_SWITCH,
+                &[
+                    RFSW0_HIGH | RFSW1_HIGH, // RfswEnableCfg enable DIO5,6
+                    0x00,                    // RfswStbyCfg standby
+                    RFSW0_HIGH,              // RfswRxCfg RX
+                    RFSW0_HIGH | RFSW1_HIGH, // RfSwTxCfg TX
+                    RFSW1_HIGH,              // RfSwTxHPCfg: High Power TX
+                    0x00,                    // RfSwTxHfCfg: High Frequency TX
+                    0x00,                    // RFU. GNSS?
+                    0x00,                    // RFU. Wifi?
+                ],
+            )?;
         }
         Ok(())
     }
@@ -1109,9 +1152,9 @@ impl LR1121 {
         // Semtech workaround: clear bit 30 of register 0x00F30054
         // before RX, TX, CAD to avoid high adjacent channel power.
         let args = [
-            0x00, 0xF3, 0x00, 0x54,  // address
-            0x40, 0x00, 0x00, 0x00,  // mask = 1 << 30
-            0x00, 0x00, 0x00, 0x00,  // data = 0
+            0x00, 0xF3, 0x00, 0x54, // address
+            0x40, 0x00, 0x00, 0x00, // mask = 1 << 30
+            0x00, 0x00, 0x00, 0x00, // data = 0
         ];
         self.write_command(CMD_WRITE_REGMEM32_MASK, &args)?;
         Ok(())
@@ -1189,15 +1232,33 @@ impl LR1121 {
     /// Exposed for diagnostic logging.
     pub fn decode_device_errors(err: u16) -> Vec<&'static str> {
         let mut bits = Vec::new();
-        if err & ERR_LF_RC_CALIB != 0 { bits.push("LF_RC_CALIB_ERR"); }
-        if err & ERR_HF_RC_CALIB != 0 { bits.push("HF_RC_CALIB_ERR"); }
-        if err & ERR_ADC_CALIB != 0 { bits.push("ADC_CALIB_ERR"); }
-        if err & ERR_PLL_CALIB != 0 { bits.push("PLL_CALIB_ERR"); }
-        if err & ERR_IMG_CALIB != 0 { bits.push("IMG_CALIB_ERR"); }
-        if err & ERR_HF_XOSC_START != 0 { bits.push("HF_XOSC_START_ERR"); }
-        if err & ERR_LF_XOSC_START != 0 { bits.push("LF_XOSC_START_ERR"); }
-        if err & ERR_PLL_LOCK != 0 { bits.push("PLL_LOCK_ERR"); }
-        if err & ERR_RX_ADC_OFFSET != 0 { bits.push("RX_ADC_OFFSET_ERR"); }
+        if err & ERR_LF_RC_CALIB != 0 {
+            bits.push("LF_RC_CALIB_ERR");
+        }
+        if err & ERR_HF_RC_CALIB != 0 {
+            bits.push("HF_RC_CALIB_ERR");
+        }
+        if err & ERR_ADC_CALIB != 0 {
+            bits.push("ADC_CALIB_ERR");
+        }
+        if err & ERR_PLL_CALIB != 0 {
+            bits.push("PLL_CALIB_ERR");
+        }
+        if err & ERR_IMG_CALIB != 0 {
+            bits.push("IMG_CALIB_ERR");
+        }
+        if err & ERR_HF_XOSC_START != 0 {
+            bits.push("HF_XOSC_START_ERR");
+        }
+        if err & ERR_LF_XOSC_START != 0 {
+            bits.push("LF_XOSC_START_ERR");
+        }
+        if err & ERR_PLL_LOCK != 0 {
+            bits.push("PLL_LOCK_ERR");
+        }
+        if err & ERR_RX_ADC_OFFSET != 0 {
+            bits.push("RX_ADC_OFFSET_ERR");
+        }
         bits
     }
 
@@ -1225,9 +1286,7 @@ impl LR1121 {
     pub fn bl_get_version(&mut self) -> Result<BlVersion, LoRaError> {
         let data = self.read_command(CMD_GET_VERSION, &[], 4)?;
         if data.len() < 4 {
-            return Err(LoRaError::Chipset(
-                "bl: GetVersion returned no data".into(),
-            ));
+            return Err(LoRaError::Chipset("bl: GetVersion returned no data".into()));
         }
         Ok(BlVersion {
             hw: data[0],
@@ -1284,7 +1343,11 @@ impl LR1121 {
         log::trace!(
             "lr1121: reboot(stay_in_bootloader={stay_in_bootloader}) \
              in {} mode (stat2=0x{stat2:02X})",
-            if running_from_flash { "system" } else { "bootloader" }
+            if running_from_flash {
+                "system"
+            } else {
+                "bootloader"
+            }
         );
         if running_from_flash {
             self.system_reboot(stay_in_bootloader)
@@ -1319,11 +1382,7 @@ impl LR1121 {
     /// (64) `u32` words. The offset is in bytes from the start of flash
     /// and must be 256-byte aligned for every chunk except possibly the
     /// last one.
-    pub fn bl_write_flash_encrypted(
-        &mut self,
-        offset: u32,
-        data: &[u32],
-    ) -> Result<(), LoRaError> {
+    pub fn bl_write_flash_encrypted(&mut self, offset: u32, data: &[u32]) -> Result<(), LoRaError> {
         if data.is_empty() || data.len() > BL_FLASH_CHUNK_WORDS {
             return Err(LoRaError::Chipset(format!(
                 "bl: WriteFlashEncrypted chunk must be 1..={} words, got {}",
@@ -1369,9 +1428,7 @@ impl LR1121 {
     pub fn bl_get_hash(&mut self) -> Result<[u8; 16], LoRaError> {
         let data = self.read_command(CMD_BL_GET_HASH, &[], 16)?;
         if data.len() < 16 {
-            return Err(LoRaError::Chipset(
-                "bl: GetHash short response".into(),
-            ));
+            return Err(LoRaError::Chipset("bl: GetHash short response".into()));
         }
         let mut hash = [0u8; 16];
         hash.copy_from_slice(&data[..16]);
@@ -1384,12 +1441,16 @@ impl LR1121 {
         // failed.
         if let Some((_, stat1)) = self.prev_status {
             match (stat1 >> 1) & 0x07 {
-                0 => return Err(LoRaError::Chipset(format!(
-                    "bl: GetHash failed: CMD_FAIL (stat1=0x{stat1:02X})"
-                ))),
-                1 => return Err(LoRaError::Chipset(format!(
-                    "bl: GetHash failed: CMD_P_ERR (stat1=0x{stat1:02X})"
-                ))),
+                0 => {
+                    return Err(LoRaError::Chipset(format!(
+                        "bl: GetHash failed: CMD_FAIL (stat1=0x{stat1:02X})"
+                    )))
+                }
+                1 => {
+                    return Err(LoRaError::Chipset(format!(
+                        "bl: GetHash failed: CMD_P_ERR (stat1=0x{stat1:02X})"
+                    )))
+                }
                 _ => {}
             }
         }
@@ -1425,9 +1486,7 @@ impl LR1121 {
     pub fn bl_read_pin(&mut self) -> Result<[u8; 4], LoRaError> {
         let data = self.read_command(CMD_BL_GET_PIN, &[], 4)?;
         if data.len() < 4 {
-            return Err(LoRaError::Chipset(
-                "bl: GetPin short response".into(),
-            ));
+            return Err(LoRaError::Chipset("bl: GetPin short response".into()));
         }
         let mut pin = [0u8; 4];
         pin.copy_from_slice(&data[..4]);
@@ -1438,9 +1497,7 @@ impl LR1121 {
     pub fn bl_read_chip_eui(&mut self) -> Result<[u8; 8], LoRaError> {
         let data = self.read_command(CMD_BL_READ_CHIP_EUI, &[], 8)?;
         if data.len() < 8 {
-            return Err(LoRaError::Chipset(
-                "bl: ReadChipEui short response".into(),
-            ));
+            return Err(LoRaError::Chipset("bl: ReadChipEui short response".into()));
         }
         let mut eui = [0u8; 8];
         eui.copy_from_slice(&data[..8]);
@@ -1451,15 +1508,12 @@ impl LR1121 {
     pub fn bl_read_join_eui(&mut self) -> Result<[u8; 8], LoRaError> {
         let data = self.read_command(CMD_BL_READ_JOIN_EUI, &[], 8)?;
         if data.len() < 8 {
-            return Err(LoRaError::Chipset(
-                "bl: ReadJoinEui short response".into(),
-            ));
+            return Err(LoRaError::Chipset("bl: ReadJoinEui short response".into()));
         }
         let mut eui = [0u8; 8];
         eui.copy_from_slice(&data[..8]);
         Ok(eui)
     }
-
 }
 
 impl LoRaChipset for LR1121 {
@@ -1533,7 +1587,10 @@ impl LoRaChipset for LR1121 {
         //    converter (0x01) needs a 15µH inductor and is only exercised in
         //    STDBY_XOSC/FS/RX/TX, so on boards without a working DC-DC rail
         //    the first XOSC start fails. RadioLib also defaults to LDO.
-        self.write_command(CMD_SET_REG_MODE, &[if config.dcdc { REG_MODE_DCDC } else { 0x00 }])?;
+        self.write_command(
+            CMD_SET_REG_MODE,
+            &[if config.dcdc { REG_MODE_DCDC } else { 0x00 }],
+        )?;
 
         // 4. Configure TCXO — Core1121-HF uses 3.0V (code 0x06).
         //    Follow the user's voltage if set, otherwise default to 3.0V.
@@ -1685,14 +1742,14 @@ impl LoRaChipset for LR1121 {
         // post-wait must cover the configured tcxo_startup_delay — the
         // chip can hold BUSY for the full window, and SetTx that follows
         // is dropped if it's issued before BUSY clears.
-        self.write_command_with_max_busy(
-            CMD_SET_STANDBY,
-            &[STANDBY_XOSC],
-            self.xosc_max_busy(),
-        )?;
+        self.write_command_with_max_busy(CMD_SET_STANDBY, &[STANDBY_XOSC], self.xosc_max_busy())?;
         self.write_command(CMD_SET_TX, &[0x00, 0x00, 0x00])?;
 
-        log::trace!("lr1121: transmitted {} bytes on {:?}", payload.len(), self.band);
+        log::trace!(
+            "lr1121: transmitted {} bytes on {:?}",
+            payload.len(),
+            self.band
+        );
         Ok(())
     }
 
@@ -1719,11 +1776,7 @@ impl LoRaChipset for LR1121 {
         // tcxo_startup_delay — the chip can hold BUSY for the full
         // window, and SetRx that follows is dropped if it's issued
         // before BUSY clears.
-        self.write_command_with_max_busy(
-            CMD_SET_STANDBY,
-            &[STANDBY_XOSC],
-            self.xosc_max_busy(),
-        )?;
+        self.write_command_with_max_busy(CMD_SET_STANDBY, &[STANDBY_XOSC], self.xosc_max_busy())?;
         self.write_command(CMD_SET_RX, &[0xFF, 0xFF, 0xFF])?;
 
         self.rx_active = true;
@@ -1794,10 +1847,7 @@ impl LoRaChipset for LR1121 {
 
         self.clear_irq_status(irq_status)?;
 
-        if irq_status
-            & (IRQ_RX_DONE | IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_HEADER_ERR | IRQ_ERR)
-            != 0
-        {
+        if irq_status & (IRQ_RX_DONE | IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_HEADER_ERR | IRQ_ERR) != 0 {
             self.start_receive()?;
         }
 

@@ -196,8 +196,7 @@ pub struct TransportConfig {
 
     /// Enable dynamic in-place path rebalancing when a link-request proof
     /// (LRPROOF) reveals a shorter hop count to a destination than the
-    /// current path-table entry. Matches the behaviour of Reticulum
-    /// reference implementations (Python RNS 1.4.1+).
+    /// current path-table entry.
     ///
     /// When `true`, the hop count of a path is updated in place if a
     /// cryptographically-verified LRPROOF reports fewer hops than the
@@ -243,11 +242,11 @@ pub struct TransportConfig {
     event_channel_capacity: usize,
 
     /// When enabled, every received link data message is acknowledged with a
-    /// per-message proof (sent back over the same link). Mirrors the Python
-    /// reference, where a destination's packet callback explicitly proves
-    /// received link data. Without this, senders that rely on proofs to
-    /// confirm delivery (e.g. LXMF) will not know a message was received and
-    /// will retransmit it, causing duplicate deliveries.
+    /// per-message proof (sent back over the same link).
+    /// A destination's packet callback explicitly proves received link data.
+    /// Without this, senders that rely on proofs to confirm delivery (e.g. LXMF)
+    /// will not know a message was received and will retransmit it, causing
+    /// duplicate deliveries.
     prove_link_messages: bool,
 
     /// Python-compatible rpc instance mode. When enabled, this transport
@@ -1419,9 +1418,6 @@ impl Transport {
     }
 
     /// Send a response over a link using raw request-id bytes as-is.
-    ///
-    /// Interoperates with the Python reference, which correlates responses
-    /// against the request id it derives from the request.
     pub async fn link_response_raw(
         &self,
         link_id: LinkId,
@@ -3776,16 +3772,7 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
         // Per-destination announce rate limiting. Deliberately applied after
         // signature validation so that unauthenticated announces can never
         // consume rate-limit state or extend a block for a victim destination
-        // hash. This matches the Python reference, which validates the
-        // announce (`Transport.validate_announce()`) before rate-limiting it
-        // inside `should_add`. Path responses are exempt from the rate limiter.
-        // Only re-insert announces into the retransmit table when they
-        // would actually update or install a path, matching Python's
-        // `should_add` gating (Transport.py:1802-1892).  A duplicate copy
-        // of an emission already recorded does not change the path, so
-        // gating on `would_update_path` prevents circulating announces
-        // from re-arming the announce retransmit table and looping
-        // endlessly with inflated hop counts.
+        // hash.
         let (iface_gravity, iface_bitrate) = {
             let mgr = handler.send_ctx.iface_manager.lock().await;
             (
@@ -4191,11 +4178,10 @@ fn should_rebroadcast_inbound_packet(packet: &Packet) -> bool {
         && packet.header.hops == 1
 }
 
-/// Plan the redistribution of a first-hop plain broadcast, matching the
-/// Python reference (`Transport._process_incoming`): a broadcast received
-/// from a local-client (RPC instance) interface is relayed on all other
-/// attached interfaces, while a broadcast heard on a network interface is
-/// only relayed to attached local-client interfaces.  Returns the outbound
+/// Plan the redistribution of a first-hop plain broadcast: a broadcast
+/// received from a local-client (RPC instance) interface is relayed on all
+/// other attached interfaces, while a broadcast heard on a network interface
+/// is only relayed to attached local-client interfaces.  Returns the outbound
 /// messages to enqueue.
 fn plan_plain_broadcast_redistribution(
     packet: &Packet,
@@ -4242,8 +4228,7 @@ async fn handle_link_request_as_destination(
             // link request proof (e.g. it was lost in transit). Re-prove the
             // existing link and refresh its activity timer, so the initiator
             // can complete the handshake instead of waiting for this in-link
-            // to time out (~12 minutes). This mirrors the Python reference,
-            // which re-proves an in-link on a repeated link request.
+            // to time out (~12 minutes).
             if let Some(existing) = handler.in_links.get(&link_id).cloned() {
                 let mut existing = existing.lock().await;
                 if existing.status() != LinkStatus::Closed {
@@ -4476,11 +4461,10 @@ async fn handle_link_request(
     handler: &mut TransportHandler,
     pending: &mut PendingSends,
 ) {
-    // Note: unlike the Python reference, we do NOT apply ingress PR burst
-    // limiting to link requests. Python never limits link requests by the
-    // path-request burst limiter (Transport.py:1598-1744 has no such
-    // gate), so doing so here could drop legitimate link establishment
-    // attempts during a path-request burst on an interface.
+    // Note: we do NOT apply ingress PR burst limiting to link
+    // requests. Link requests are exempt from the path-request burst
+    // limiter, so applying it here could drop legitimate link
+    // establishment attempts during a path-request burst on an interface.
 
     if let Some(destination) = handler
         .single_in_destinations
@@ -5009,12 +4993,11 @@ async fn manage_transport(
 
                     if handler.config.broadcast && should_rebroadcast_inbound_packet(&packet) {
                         // Plain first-hop broadcasts are not inserted into
-                        // transport.  Repeat them locally, matching the
-                        // Python reference: broadcasts from local-client
-                        // (RPC instance) interfaces are relayed on all other
-                        // interfaces, while broadcasts from network
-                        // interfaces are only relayed to attached local
-                        // clients.
+                        // transport.  Repeat them locally: broadcasts from
+                        // local-client (RPC instance) interfaces are relayed
+                        // on all other interfaces, while broadcasts from
+                        // network interfaces are only relayed to attached
+                        // local clients.
                         let mgr = handler.send_ctx.iface_manager.lock().await;
                         let from_local_client = mgr.is_rpc_instance_client(&message.address);
                         let redistribution = plan_plain_broadcast_redistribution(

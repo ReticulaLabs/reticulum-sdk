@@ -229,9 +229,13 @@ self_referential_transport={}",
         match self.map.get(&announce.destination) {
             None => true,
             Some(entry) => match random_blob {
-                Some(blob) => {
-                    entry.should_accept(announce.destination, hops, blob, incoming_gravity, incoming_bitrate)
-                }
+                Some(blob) => entry.should_accept(
+                    announce.destination,
+                    hops,
+                    blob,
+                    incoming_gravity,
+                    incoming_bitrate,
+                ),
                 None => {
                     if hops > entry.hops {
                         false
@@ -375,7 +379,11 @@ self_referential_transport={}",
         // routing metadata — only the iface lookup should change.
         let (header_type, propagation_type, transport) =
             if packet.header.header_type == HeaderType::Type2 {
-                (packet.header.header_type, packet.header.propagation_type, packet.transport)
+                (
+                    packet.header.header_type,
+                    packet.header.propagation_type,
+                    packet.transport,
+                )
             } else if entry.hops > 1 {
                 log::trace!(
                     "path_table: route dst={} via next-hop={} iface={} ({} hops)",
@@ -448,9 +456,8 @@ impl PathEntry {
             // The same announce emission was already recorded. Accept it
             // if it arrives via a strictly closer (fewer-hop) path, or via
             // a preferred (higher-gravity, then higher-bitrate) interface at
-            // the same hop count. This mirrors the Python reference, which
-            // updates the path when the same announce is received on an
-            // interface with higher gravity (Transport.py:1836-1845).
+            // the same hop count: the path is updated when the same
+            // announce is received on an interface with higher gravity.
             if hops < self.hops {
                 log::trace!(
                     "path_table accept same-emission announce for {} via closer path ({} < {} hops)",
@@ -604,7 +611,14 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         let original = Packet {
             header: Header {
@@ -692,7 +706,14 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, Some(transport), iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            Some(transport),
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         let original = Packet {
             header: Header {
@@ -739,7 +760,14 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         let original = Packet {
             header: Header {
@@ -780,7 +808,14 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
         table.map.get_mut(&destination).unwrap().expires = Instant::now();
 
         assert_eq!(table.remove_stale(|_| true), 1);
@@ -806,7 +841,14 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         assert_eq!(table.remove_stale(|_| false), 1);
         assert_eq!(table.len(), 0);
@@ -831,7 +873,14 @@ mod tests {
             data: Default::default(),
         };
 
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
         table.map.get_mut(&destination).unwrap().expires = Instant::now();
         table.refresh(&destination);
 
@@ -883,12 +932,18 @@ mod tests {
             &announce_with_random_blob(destination, 2, blob),
             None,
             first_iface,
-            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
         table.handle_announce(
             &announce_with_random_blob(destination, 1, blob),
             None,
             second_iface,
-            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         // The same emission arriving via a strictly closer (fewer-hop)
         // path must replace the existing route, so a multi-interface node
@@ -909,12 +964,18 @@ mod tests {
             &announce_with_random_blob(destination, 2, random_blob(1, 100)),
             None,
             first_iface,
-            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
         table.handle_announce(
             &announce_with_random_blob(destination, 1, random_blob(2, 99)),
             None,
             second_iface,
-            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
         assert_eq!(iface, first_iface);
@@ -932,12 +993,18 @@ mod tests {
             &announce_with_random_blob(destination, 1, random_blob(1, 100)),
             None,
             first_iface,
-            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
         table.handle_announce(
             &announce_with_random_blob(destination, 1, random_blob(2, 101)),
             None,
             second_iface,
-            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
         assert_eq!(iface, second_iface);
@@ -1051,7 +1118,14 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         let packet = Packet {
             header: Header {
@@ -1100,7 +1174,14 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, Some(next_hop), iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            Some(next_hop),
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         let packet = Packet {
             header: Header {
@@ -1207,7 +1288,10 @@ mod tests {
             },
             Some(next_hop),
             iface,
-            Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
 
         let packet = Packet {
             header: Header {
@@ -1306,7 +1390,12 @@ mod tests {
         assert_eq!(forwarded.header.destination_type, DestinationType::Group);
     }
 
-    fn install_announce_with_hops(table: &mut PathTable, destination: AddressHash, iface: AddressHash, hops: u8) {
+    fn install_announce_with_hops(
+        table: &mut PathTable,
+        destination: AddressHash,
+        iface: AddressHash,
+        hops: u8,
+    ) {
         let announce = Packet {
             header: Header {
                 packet_type: PacketType::Announce,
@@ -1320,7 +1409,14 @@ mod tests {
             ifac: None,
             data: Default::default(),
         };
-        table.handle_announce(&announce, None, iface, Duration::from_secs(60 * 60 * 24 * 7), 0, None);
+        table.handle_announce(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(60 * 60 * 24 * 7),
+            0,
+            None,
+        );
     }
 
     #[test]

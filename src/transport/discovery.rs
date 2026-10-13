@@ -4,7 +4,7 @@ use ed25519_dalek::Signature;
 use getrandom::SysRng;
 use hkdf::Hkdf;
 use rand_core::{Rng, UnwrapErr};
-use rmpv::{Value, decode::read_value, encode::write_value};
+use rmpv::{decode::read_value, encode::write_value, Value};
 use sha2::{Digest, Sha256};
 use tokio::time;
 
@@ -12,7 +12,7 @@ use crate::{
     buffer::StaticBuffer,
     destination::{DestinationDesc, DestinationName, SingleInputDestination},
     error::RnsError,
-    hash::{AddressHash, HASH_SIZE, Hash},
+    hash::{AddressHash, Hash, HASH_SIZE},
     identity::PrivateIdentity,
     packet::PacketDataBuffer,
 };
@@ -47,10 +47,10 @@ pub const DISCOVERY_MIN_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60
 pub const DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Default proof-of-work difficulty (leading zero bits) for interface
-/// discovery stamps. Must match the Python reference implementation's
-/// `InterfaceAnnouncer.DEFAULT_STAMP_VALUE` (16) for discovery announces
-/// to be accepted by Python peers: a stamp generated with a lower
-/// difficulty is rejected by them.
+/// discovery stamps. This is fixed at 16 by the announce-stamp
+/// specification (`DEFAULT_STAMP_VALUE`) so discovery announces are
+/// accepted by peers: a stamp generated with a lower difficulty is
+/// rejected by them.
 const DEFAULT_STAMP_COST: u8 = 16;
 const WORKBLOCK_EXPAND_ROUNDS: usize = 20;
 const FLAG_SIGNED: u8 = 0b0000_0001;
@@ -58,10 +58,26 @@ const FLAG_ENCRYPTED: u8 = 0b0000_0010;
 
 #[derive(Clone, Debug)]
 pub enum DiscoveryInterfaceKind {
-    TcpServer { reachable_on: String, port: u16 },
-    Backbone { reachable_on: String, port: u16 },
-    RNode { frequency: u64, bandwidth: u32, spreadingfactor: u8, codingrate: u8 },
-    LoRa { frequency: u64, bandwidth: f64, spreadingfactor: u8, codingrate: u8 },
+    TcpServer {
+        reachable_on: String,
+        port: u16,
+    },
+    Backbone {
+        reachable_on: String,
+        port: u16,
+    },
+    RNode {
+        frequency: u64,
+        bandwidth: u32,
+        spreadingfactor: u8,
+        codingrate: u8,
+    },
+    LoRa {
+        frequency: u64,
+        bandwidth: f64,
+        spreadingfactor: u8,
+        codingrate: u8,
+    },
 }
 
 impl DiscoveryInterfaceKind {
@@ -131,13 +147,24 @@ impl DiscoveryInterfaceConfig {
         }
     }
 
-    pub fn rnode<TName>(name: TName, frequency: u64, bandwidth: u32, spreadingfactor: u8, codingrate: u8) -> Self
+    pub fn rnode<TName>(
+        name: TName,
+        frequency: u64,
+        bandwidth: u32,
+        spreadingfactor: u8,
+        codingrate: u8,
+    ) -> Self
     where
         TName: Into<String>,
     {
         Self {
             name: sanitize(&name.into()),
-            kind: DiscoveryInterfaceKind::RNode { frequency, bandwidth, spreadingfactor, codingrate },
+            kind: DiscoveryInterfaceKind::RNode {
+                frequency,
+                bandwidth,
+                spreadingfactor,
+                codingrate,
+            },
             announce_interval: DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL,
             stamp_cost: DEFAULT_STAMP_COST,
             latitude: None,
@@ -148,13 +175,24 @@ impl DiscoveryInterfaceConfig {
         }
     }
 
-    pub fn lora<TName>(name: TName, frequency: u64, bandwidth: f64, spreadingfactor: u8, codingrate: u8) -> Self
+    pub fn lora<TName>(
+        name: TName,
+        frequency: u64,
+        bandwidth: f64,
+        spreadingfactor: u8,
+        codingrate: u8,
+    ) -> Self
     where
         TName: Into<String>,
     {
         Self {
             name: sanitize(&name.into()),
-            kind: DiscoveryInterfaceKind::LoRa { frequency, bandwidth, spreadingfactor, codingrate },
+            kind: DiscoveryInterfaceKind::LoRa {
+                frequency,
+                bandwidth,
+                spreadingfactor,
+                codingrate,
+            },
             announce_interval: DISCOVERY_DEFAULT_ANNOUNCE_INTERVAL,
             stamp_cost: DEFAULT_STAMP_COST,
             latitude: None,
@@ -235,13 +273,23 @@ impl DiscoveryInterfaceConfig {
                 ));
                 info.push((u8_value(KEY_PORT), Value::from(*port)));
             }
-            DiscoveryInterfaceKind::RNode { frequency, bandwidth, spreadingfactor, codingrate } => {
+            DiscoveryInterfaceKind::RNode {
+                frequency,
+                bandwidth,
+                spreadingfactor,
+                codingrate,
+            } => {
                 info.push((u8_value(KEY_FREQUENCY), Value::from(*frequency)));
                 info.push((u8_value(KEY_BANDWIDTH), Value::from(*bandwidth)));
                 info.push((u8_value(KEY_SPREADINGFACTOR), Value::from(*spreadingfactor)));
                 info.push((u8_value(KEY_CODINGRATE), Value::from(*codingrate)));
             }
-            DiscoveryInterfaceKind::LoRa { frequency, bandwidth, spreadingfactor, codingrate } => {
+            DiscoveryInterfaceKind::LoRa {
+                frequency,
+                bandwidth,
+                spreadingfactor,
+                codingrate,
+            } => {
                 info.push((u8_value(KEY_FREQUENCY), Value::from(*frequency)));
                 info.push((u8_value(KEY_BANDWIDTH), Value::from(*bandwidth)));
                 info.push((u8_value(KEY_SPREADINGFACTOR), Value::from(*spreadingfactor)));
@@ -749,13 +797,11 @@ mod tests {
         assert_eq!(decoded.name, "København 測試");
         assert_eq!(decoded.ifac_netname.as_deref(), Some("møøse-net"));
         assert_eq!(decoded.ifac_netkey.as_deref(), Some("nøgle"));
-        assert!(
-            decoded
-                .config_entry
-                .as_deref()
-                .unwrap()
-                .contains("[[København 測試]]")
-        );
+        assert!(decoded
+            .config_entry
+            .as_deref()
+            .unwrap()
+            .contains("[[København 測試]]"));
     }
 
     #[test]
@@ -889,7 +935,10 @@ mod tests {
 
     /// Brute-force a random stamp whose `count_leading_zero_bits` value is
     /// exactly `difficulty`.
-    fn stamp_with_exact_difficulty(workblock: &StaticBuffer<8192>, difficulty: u8) -> [u8; HASH_SIZE] {
+    fn stamp_with_exact_difficulty(
+        workblock: &StaticBuffer<8192>,
+        difficulty: u8,
+    ) -> [u8; HASH_SIZE] {
         let mut rng = UnwrapErr(SysRng);
         loop {
             let mut stamp = [0u8; HASH_SIZE];

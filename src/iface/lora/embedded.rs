@@ -79,7 +79,8 @@ where
             .pin
             .lock()
             .map_err(|_| LoRaError::Gpio("embedded input pin lock poisoned".into()))?;
-        pin.is_high().map_err(|e| LoRaError::Gpio(format!("read failed: {e:?}")))
+        pin.is_high()
+            .map_err(|e| LoRaError::Gpio(format!("read failed: {e:?}")))
     }
 
     fn set_value(&self, _value: bool) -> Result<(), LoRaError> {
@@ -112,9 +113,11 @@ where
             .lock()
             .map_err(|_| LoRaError::Gpio("embedded output pin lock poisoned".into()))?;
         if value {
-            pin.set_high().map_err(|e| LoRaError::Gpio(format!("set_high failed: {e:?}")))
+            pin.set_high()
+                .map_err(|e| LoRaError::Gpio(format!("set_high failed: {e:?}")))
         } else {
-            pin.set_low().map_err(|e| LoRaError::Gpio(format!("set_low failed: {e:?}")))
+            pin.set_low()
+                .map_err(|e| LoRaError::Gpio(format!("set_low failed: {e:?}")))
         }
     }
 }
@@ -129,18 +132,26 @@ pub struct EmbeddedLoRaHw<DEV: 'static, BUSY: 'static, RESET: 'static, DIO1: 'st
     dio1: Option<Arc<Mutex<DIO1>>>,
 }
 
-impl<DEV: 'static, BUSY: 'static, RESET: 'static, DIO1: 'static> EmbeddedLoRaHw<DEV, BUSY, RESET, DIO1> {
+impl<DEV: 'static, BUSY: 'static, RESET: 'static, DIO1: 'static>
+    EmbeddedLoRaHw<DEV, BUSY, RESET, DIO1>
+{
     pub fn new(
         spi: Arc<Mutex<DEV>>,
         busy: Option<Arc<Mutex<BUSY>>>,
         reset: Option<Arc<Mutex<RESET>>>,
         dio1: Option<Arc<Mutex<DIO1>>>,
     ) -> Self {
-        Self { spi, busy, reset, dio1 }
+        Self {
+            spi,
+            busy,
+            reset,
+            dio1,
+        }
     }
 }
 
-impl<DEV: 'static, BUSY: 'static, RESET: 'static, DIO1: 'static> LoRaHwProvider for EmbeddedLoRaHw<DEV, BUSY, RESET, DIO1>
+impl<DEV: 'static, BUSY: 'static, RESET: 'static, DIO1: 'static> LoRaHwProvider
+    for EmbeddedLoRaHw<DEV, BUSY, RESET, DIO1>
 where
     DEV: SpiDevice<Error: core::fmt::Debug> + Send,
     BUSY: InputPin<Error: core::fmt::Debug> + Send,
@@ -151,9 +162,18 @@ where
         Ok((
             Box::new(EmbeddedSpi::new(self.spi.clone())),
             GpioPins {
-                busy: self.busy.as_ref().map(|p| Box::new(EmbeddedInputPin::new(p.clone())) as Box<dyn LoRaGpio>),
-                reset: self.reset.as_ref().map(|p| Box::new(EmbeddedOutputPin::new(p.clone())) as Box<dyn LoRaGpio>),
-                dio1: self.dio1.as_ref().map(|p| Box::new(EmbeddedInputPin::new(p.clone())) as Box<dyn LoRaGpio>),
+                busy: self
+                    .busy
+                    .as_ref()
+                    .map(|p| Box::new(EmbeddedInputPin::new(p.clone())) as Box<dyn LoRaGpio>),
+                reset: self
+                    .reset
+                    .as_ref()
+                    .map(|p| Box::new(EmbeddedOutputPin::new(p.clone())) as Box<dyn LoRaGpio>),
+                dio1: self
+                    .dio1
+                    .as_ref()
+                    .map(|p| Box::new(EmbeddedInputPin::new(p.clone())) as Box<dyn LoRaGpio>),
             },
         ))
     }

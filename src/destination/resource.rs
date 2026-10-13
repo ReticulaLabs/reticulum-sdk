@@ -6,11 +6,11 @@ use getrandom::SysRng;
 use rand_core::{Rng, UnwrapErr};
 use sha2::{Digest, Sha256};
 
-use rmpv::{Value, decode::read_value, encode::write_value};
+use rmpv::{decode::read_value, encode::write_value, Value};
 
 use crate::{
     error::RnsError,
-    hash::{HASH_SIZE, Hash},
+    hash::{Hash, HASH_SIZE},
     packet::{RETICULUM_AES_BLOCK_SIZE, RETICULUM_TOKEN_OVERHEAD},
 };
 
@@ -51,7 +51,7 @@ pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
 /// Compress with bz2 at level 9 (matching Python `bz2.compress`, whose
 /// default level is also 9).
 fn bzip2_compress(data: &[u8]) -> Result<Vec<u8>, RnsError> {
-    use bzip2::{Compression, write::BzEncoder};
+    use bzip2::{write::BzEncoder, Compression};
 
     let mut encoder = BzEncoder::new(Vec::new(), Compression::new(9));
     encoder
@@ -140,9 +140,9 @@ pub struct ResourceAdvertisement {
     pub flags: u8,
     pub segment_index: usize,
     pub total_segments: usize,
-    /// ID of the associated request, as raw bytes. The Python reference uses
-    /// a 16-byte truncated hash here; the exact bytes must be preserved so
-    /// that peers can correlate the resource with its pending request.
+    /// ID of the associated request, as raw bytes. This is a 16-byte
+    /// truncated hash; the exact bytes must be preserved so that peers can
+    /// correlate the resource with its pending request.
     pub request_id: Option<Vec<u8>>,
 }
 
@@ -407,7 +407,7 @@ impl Resource {
     ///
     /// The data is bz2-compressed at level 9 when `auto_compress` is enabled,
     /// the payload fits within `AUTO_COMPRESS_MAX_SIZE` and compression
-    /// actually shrinks it (matching the Python reference). The resource hash
+    /// actually shrinks it. The resource hash
     /// and proof are always computed over the original plaintext. The caller
     /// supplies `encrypt`, which wraps the assembled payload for transmission.
     pub fn new(
@@ -423,7 +423,7 @@ impl Resource {
         let sdu = link_mdu;
 
         // bz2-compress the payload when auto-compression is enabled and the
-        // compressed form is smaller (matching the Python reference). The
+        // compressed form is smaller. The
         // resource hash and proof are still computed over the *original*
         // plaintext, so the receiver can verify after decompressing.
         let (payload, compressed) = if auto_compress && data.len() <= AUTO_COMPRESS_MAX_SIZE {
@@ -1107,9 +1107,8 @@ impl Resource {
         let retries_used = (self.max_retries.saturating_sub(self.retries_left)) as f64;
         let extra_wait = retries_used * PER_RETRY_DELAY;
         // Each outstanding part is expected to take roughly one RTT;
-        // scale by the part timeout factor for a safety margin (the
-        // Python reference reaches the same value when EIFR ≈ one part
-        // per RTT).
+        // scale by the part timeout factor for a safety margin (EIFR ≈ one
+        // part per RTT reaches the same value).
         let expected = self.part_timeout_factor * outstanding * rtt;
         Duration::from_secs_f64(expected + RETRY_GRACE_TIME + extra_wait)
     }
@@ -1317,8 +1316,8 @@ mod tests {
     fn resource_advertisement_pack_unpack_roundtrip() {
         let data = b"Hello, Resource World!";
         let link_mdu = 400;
-        let resource =
-            Resource::new(data, link_mdu, dummy_encrypt, None, false, true).expect("resource creation");
+        let resource = Resource::new(data, link_mdu, dummy_encrypt, None, false, true)
+            .expect("resource creation");
 
         let adv = ResourceAdvertisement::from_resource(&resource);
         let packed = adv.pack(0, link_mdu).expect("pack");
@@ -1340,8 +1339,8 @@ mod tests {
         let original_data = b"Test data!";
         let link_mdu = 400;
 
-        let mut sender =
-            Resource::new(original_data, link_mdu, dummy_encrypt, None, false, true).expect("sender");
+        let mut sender = Resource::new(original_data, link_mdu, dummy_encrypt, None, false, true)
+            .expect("sender");
 
         let adv = ResourceAdvertisement::from_resource(&sender);
         let rtt = Duration::from_millis(50);
@@ -1389,11 +1388,13 @@ mod tests {
         let original_data = b"compress me, I repeat, compress me, I repeat, ".repeat(64);
         let link_mdu = 400;
 
-        let mut sender =
-            Resource::new(&original_data, link_mdu, dummy_encrypt, None, false, true)
-                .expect("sender");
+        let mut sender = Resource::new(&original_data, link_mdu, dummy_encrypt, None, false, true)
+            .expect("sender");
 
-        assert!(sender.is_compressed(), "compressible data should be compressed");
+        assert!(
+            sender.is_compressed(),
+            "compressible data should be compressed"
+        );
 
         let adv = ResourceAdvertisement::from_resource(&sender);
         assert_ne!(adv.flags & 0x02, 0, "compressed flag must be set");
@@ -1426,20 +1427,22 @@ mod tests {
         rng.fill_bytes(&mut data);
         let link_mdu = 400;
 
-        let sender = Resource::new(&data, link_mdu, dummy_encrypt, None, false, true)
-            .expect("sender");
+        let sender =
+            Resource::new(&data, link_mdu, dummy_encrypt, None, false, true).expect("sender");
 
-        assert!(!sender.is_compressed(), "incompressible data must be sent uncompressed");
+        assert!(
+            !sender.is_compressed(),
+            "incompressible data must be sent uncompressed"
+        );
 
         let adv = ResourceAdvertisement::from_resource(&sender);
         assert_eq!(adv.flags & 0x02, 0, "compressed flag must be clear");
     }
 
-    // A bz2 stream produced by Python 3's `bz2.compress(data)` (level 9,
-    // the default), where data is `b"Reticulum resource compression interop
-    // test data! " * 40` (2000 bytes). Used to prove our decompressor accepts
-    // exactly what the Python reference emits, and that our compressor is
-    // byte-identical to it.
+    // A golden bz2 stream (level 9, the `bz2` module default), where data
+    // is `b"Reticulum resource compression interop test data! " * 40`
+    // (2000 bytes). Used to prove our decompressor accepts exactly this
+    // stream, and that our compressor is byte-identical to it.
     const PYTHON_BZ2_GOLDEN: &str = "425a683931415926535937b963f500009f9380600010002e27de003000d8050d34c001434d300014a94608da989813613b13913913f09c09b89a89f44e84f62644c0991351340981322604d04ec4f027813813813027026a2682644d84dc4c89d09b09815604fc27426a26827227827d13f8bb9229c28481bdcb1fa8";
 
     fn decode_hex(hex: &str) -> Vec<u8> {
@@ -1458,8 +1461,8 @@ mod tests {
         assert_eq!(compressed, decode_hex(PYTHON_BZ2_GOLDEN));
 
         // Our decompressor must accept the Python-produced stream.
-        let decompressed = bzip2_decompress(&decode_hex(PYTHON_BZ2_GOLDEN), data.len())
-            .expect("decompress");
+        let decompressed =
+            bzip2_decompress(&decode_hex(PYTHON_BZ2_GOLDEN), data.len()).expect("decompress");
         assert_eq!(decompressed, data);
     }
 
@@ -1478,7 +1481,8 @@ mod tests {
     fn resource_hash_verification() {
         let data = b"Verify my hash!";
         let link_mdu = 200;
-        let resource = Resource::new(data, link_mdu, dummy_encrypt, None, false, true).expect("resource");
+        let resource =
+            Resource::new(data, link_mdu, dummy_encrypt, None, false, true).expect("resource");
 
         // Hash should be SHA-256(original_plaintext || random_hash)
         let mut expected = Sha256::new();
@@ -1523,11 +1527,14 @@ mod tests {
 
         // Force a timeout: the retry budget is consumed and a fresh part
         // request must be produced so the missing parts can be re-fetched.
-        receiver.last_activity =
-            std::time::Instant::now() - Duration::from_secs(3600);
+        receiver.last_activity = std::time::Instant::now() - Duration::from_secs(3600);
         let retries_before = receiver.retries_left;
         let action = receiver.check_timeout().expect("check");
-        assert_eq!(receiver.retries_left, retries_before - 1, "retry budget decremented");
+        assert_eq!(
+            receiver.retries_left,
+            retries_before - 1,
+            "retry budget decremented"
+        );
         match action {
             ResourceTimeoutAction::RetryPartRequest(request) => {
                 assert!(!request.is_empty(), "re-request must carry hashes");
@@ -1563,8 +1570,7 @@ mod tests {
         // a retry), and the final one observes it exhausted.
         let mut failed = false;
         for _ in 0..=receiver.max_retries {
-            receiver.last_activity =
-                std::time::Instant::now() - Duration::from_secs(3600);
+            receiver.last_activity = std::time::Instant::now() - Duration::from_secs(3600);
             let action = receiver.check_timeout().expect("check");
             match action {
                 ResourceTimeoutAction::RetryPartRequest(_) => {
@@ -1578,7 +1584,10 @@ mod tests {
             }
         }
 
-        assert!(failed, "transfer must fail once the retry budget is exhausted");
+        assert!(
+            failed,
+            "transfer must fail once the retry budget is exhausted"
+        );
         assert_eq!(receiver.status(), ResourceStatus::Failed);
     }
 

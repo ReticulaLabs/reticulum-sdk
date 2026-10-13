@@ -1,5 +1,5 @@
-//! A Rust port of the [Reticulum Python reference implementation](https://github.com/markqvist/reticulum),
-//! the cryptography-based networking stack for building unstoppable
+//! A Rust port of [Reticulum](https://github.com/markqvist/reticulum), the
+//! cryptography-based networking stack for building unstoppable
 //! networks with LoRa, Packet Radio, WiFi and everything in between.
 //!
 //! Reticulum is the cryptography-based networking stack for building local

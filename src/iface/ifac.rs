@@ -1,4 +1,4 @@
-use ed25519_dalek::{SIGNATURE_LENGTH, Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -25,14 +25,14 @@ const IFAC_SALT: [u8; 32] = [
 ///
 /// Because the keypair is deterministically derived from the shared access
 /// code, verification of truncated signatures works by re-signing the data
-/// and comparing the last `ifac_len` bytes (the Python reference truncates
-/// from the *end* of the signature). Only full 64-byte signatures use
+/// and comparing the last `ifac_len` bytes (the signature is truncated
+/// from the *end*). Only full 64-byte signatures use
 /// `verify_strict()`.
 ///
 /// In addition to the signature, the whole packet frame is XOR-masked with
 /// an HKDF-SHA256 keystream derived from the IFAC bytes and the full 64-byte
 /// `ifac_key`. This masking is mandatory on the wire and byte-for-byte
-/// matches the Python reference (`Transport.transmit` / `Transport.inbound`).
+/// is byte-for-byte identical to the transmit/inbound wire format.
 #[derive(Clone)]
 pub struct IfacConfig {
     sign_key: SigningKey,
@@ -44,8 +44,7 @@ pub struct IfacConfig {
     ifac_len: usize,
 }
 
-/// Derive the same HKDF-SHA256 stream as the Python reference `hkdf()`
-/// (RNS/Cryptography/HKDF.py): PRK = HMAC(salt, ikm), then standard
+/// Derive the HKDF-SHA256 stream: PRK = HMAC(salt, ikm), then standard
 /// HKDF-Expand with an empty context.
 fn hkdf_stream(salt: &[u8], ikm: &[u8], length: usize) -> Vec<u8> {
     let mut out = vec![0u8; length];
@@ -55,9 +54,8 @@ fn hkdf_stream(salt: &[u8], ikm: &[u8], length: usize) -> Vec<u8> {
 
 impl IfacConfig {
     /// Derive an IFAC identity from a network name and optional key, using
-    /// the exact algorithm from the Python reference implementation
-    /// (`RNS/Interfaces/TCPInterface.py` `TCPServerInterface.incoming_connection`,
-    /// and `RNS/Reticulum.py._synthesize_interface`):
+    /// the exact algorithm from the TCP server / interface synthesis
+    /// specification:
     ///
     /// ```text
     /// ifac_origin       = SHA256(netname_utf8) || SHA256(netkey_utf8)   # omitted if None
@@ -67,9 +65,9 @@ impl IfacConfig {
     /// ```
     ///
     /// The Ed25519 signing key is derived from `ifac_key[32..64]`. The
-    /// X25519 portion (`ifac_key[0..32]`) is what the Python reference
-    /// stores in `interface.ifac_key` and is used to construct
-    /// `RNS.Identity.from_bytes(ifac_key)`.
+    /// X25519 portion (`ifac_key[0..32]`) is what is stored in
+    /// `interface.ifac_key` and is used to construct an `Identity` from
+    /// those key bytes.
     ///
     /// At least one of `netname` / `netkey` must be `Some`. If both are
     /// `None`, the resulting `ifac_origin` is empty and the derived key is
@@ -89,12 +87,10 @@ impl IfacConfig {
         // The Python `hkdf()` is HKDF-SHA256 with `info=None` (empty).
         // HKDF-Expand with an empty info produces a well-defined output
         // for any length, so this match is wire-compatible.
-        let _ = Hkdf::<Sha256>::new(Some(&IFAC_SALT), &ifac_origin_hash)
-            .expand(&[], &mut ifac_key[..]);
+        let _ =
+            Hkdf::<Sha256>::new(Some(&IFAC_SALT), &ifac_origin_hash).expand(&[], &mut ifac_key[..]);
 
-        let sign_seed: [u8; 32] = ifac_key[32..64]
-            .try_into()
-            .expect("hkdf produced 64 bytes");
+        let sign_seed: [u8; 32] = ifac_key[32..64].try_into().expect("hkdf produced 64 bytes");
         let sign_key = SigningKey::from_bytes(&sign_seed);
         let verify_key = sign_key.verifying_key();
         let ifac_len = ifac_len.min(SIGNATURE_LENGTH);
@@ -110,8 +106,8 @@ impl IfacConfig {
     ///
     /// Signs the packet's `signed_data()` (header with IFAC flag cleared,
     /// addresses, context, and data) using the configured Ed25519 key. Stores
-    /// the truncated signature (taking the *last* `ifac_len` bytes, matching
-    /// the Python reference `sign(raw)[-ifac_size:]`) in `packet.ifac` and
+    /// the truncated signature (taking the *last* `ifac_len` bytes, i.e.
+    /// `sign(raw)[-ifac_size:]`) in `packet.ifac` and
     /// sets `ifac_flag` to `Authenticated`.
     pub fn attach(&self, packet: &mut Packet) -> Result<(), RnsError> {
         let signed_data = packet.signed_data()?;
@@ -159,9 +155,8 @@ impl IfacConfig {
         Ok(())
     }
 
-    /// Decode a received IFAC frame, matching the Python reference
-    /// `Transport.inbound()`: check the IFAC flag, unmask the header and
-    /// payload with the HKDF keystream, strip the IFAC field, verify the
+    /// Decode a received IFAC frame: check the IFAC flag, unmask the header
+    /// and payload with the HKDF keystream, strip the IFAC field, verify the
     /// signature, and return the clean packet bytes (IFAC flag cleared,
     /// IFAC field removed) ready for `Packet::deserialize`.
     pub fn decode_frame(&self, frame: &[u8]) -> Result<Vec<u8>, RnsError> {
@@ -240,7 +235,7 @@ impl IfacConfig {
             // Truncated IFAC: re-sign and compare the suffix. Both sides
             // share the same signing key (derived from the access code), so
             // the verifier can deterministically reconstruct the full
-            // signature. The Python reference truncates from the end
+            // signature. Truncation takes from the end
             // (`sign(raw)[-ifac_size:]`), so the last bytes are compared.
             let expected = self.sign_key.sign(signed_data);
             let expected_bytes = expected.to_bytes();
@@ -306,8 +301,8 @@ mod tests {
         assert_eq!(config.ifac_len, 0);
     }
 
-    /// Test vector verified against the Python reference implementation
-    /// (`RNS.Interfaces.TCPInterface` `TCPServerInterface.incoming_connection`):
+    /// Test vector for `TCPServerInterface.incoming_connection` interface
+    /// synthesis:
     ///
     /// For `netname="test", netkey=None`:
     ///   ifac_origin       = SHA256("test")                              # 9f86d081...
@@ -534,9 +529,8 @@ mod tests {
             .expect("verify after deserialization");
     }
 
-    /// Full end-to-end wire-format compatibility test against values
-    /// computed with the Python reference implementation
-    /// (`Transport.transmit` / `Transport.inbound`):
+    /// Full end-to-end wire-format compatibility test against the
+    /// transmit/inbound wire values:
     ///
     /// For `netname="test", ifac_size=8` and a packet
     /// `flags=0x00, hops=3, dest=0011...eeff, ctx=0x00, data="hello ifac"`:
@@ -590,18 +584,24 @@ mod tests {
         let len = output.offset();
 
         // Byte 0 must carry the IFAC flag before masking.
-        assert_eq!(frame[0] & 0x80, 0x80, "IFAC flag must be set in header byte");
+        assert_eq!(
+            frame[0] & 0x80,
+            0x80,
+            "IFAC flag must be set in header byte"
+        );
 
-        config
-            .mask_frame(&mut frame[..len])
-            .expect("mask frame");
+        config.mask_frame(&mut frame[..len]).expect("mask frame");
 
         let expected = vec![
             0xa7, 0xb4, 0x39, 0xb7, 0xc5, 0x51, 0x78, 0xfa, 0x48, 0x01, 0xc9, 0xea, 0x78, 0xbf,
             0xb8, 0xc4, 0xab, 0xfe, 0xce, 0x7c, 0xfd, 0xc6, 0x82, 0xda, 0x8a, 0xa4, 0xb3, 0x69,
             0xa3, 0x67, 0x94, 0x4e, 0x3b, 0x69, 0x1d, 0xb2, 0x3b,
         ];
-        assert_eq!(&frame[..len], expected.as_slice(), "masked frame must match Python");
+        assert_eq!(
+            &frame[..len],
+            expected.as_slice(),
+            "masked frame must match Python"
+        );
 
         // Now decode it back (Python receiver side).
         let clean = config.decode_frame(&frame[..len]).expect("decode frame");

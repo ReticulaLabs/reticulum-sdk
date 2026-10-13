@@ -1,8 +1,8 @@
 use core::cmp;
 use core::fmt;
 
-use crypto_common::OutputSizeUser;
 use crypto_common::typenum::Unsigned;
+use crypto_common::OutputSizeUser;
 use rand_core::CryptoRng;
 use sha2::{Digest, Sha256};
 
@@ -189,8 +189,8 @@ impl fmt::Display for Hash {
 #[cfg(test)]
 mod tests {
 
-    use rand_core::UnwrapErr;
     use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     use crate::hash::AddressHash;
 
@@ -225,8 +225,7 @@ mod tests {
         let original_address_hash = AddressHash::new_from_rand(&mut rng);
         let upper = original_address_hash.to_hex_string().to_uppercase();
 
-        let actual_address_hash =
-            AddressHash::new_from_hex_string(&upper).expect("valid hash");
+        let actual_address_hash = AddressHash::new_from_hex_string(&upper).expect("valid hash");
 
         assert_eq!(
             actual_address_hash.as_slice(),

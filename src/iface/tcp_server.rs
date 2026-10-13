@@ -113,9 +113,8 @@ impl TcpServer {
 
         // Share the server's IFAC configuration with every spawned client
         // connection. Runtime changes via `set_ifac_config` therefore apply
-        // to newly-accepted clients (matching the Python reference, which
-        // copies `ifac_size`/`ifac_netname`/`ifac_netkey` to spawned
-        // TCPClient interfaces).
+        // to newly-accepted clients. The spawned `TcpClient` interfaces
+        // copy `ifac_size` / `ifac_netname` / `ifac_netkey` from the server.
         let ifac_config = context.channel.ifac_config.clone();
 
         let (_, tx_channel) = context.channel.split();

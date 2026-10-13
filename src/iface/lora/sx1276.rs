@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use super::{
-    GpioPins, LoRaChipset, LoRaConfig, LoRaError, LoRaGpio, LoRaSpi, ReceivedPacket,
-};
+use super::{GpioPins, LoRaChipset, LoRaConfig, LoRaError, LoRaGpio, LoRaSpi, ReceivedPacket};
 
 // ── Registers ──────────────────────────────────────────────────────────────
 
@@ -250,12 +248,7 @@ impl SX1276 {
 
     // ── Modulation parameters ──────────────────────────────────────────────
 
-    fn set_modulation_params(
-        &mut self,
-        sf: u8,
-        bw_khz: u32,
-        cr: u8,
-    ) -> Result<(), LoRaError> {
+    fn set_modulation_params(&mut self, sf: u8, bw_khz: u32, cr: u8) -> Result<(), LoRaError> {
         let bw_code = lora_bandwidth_code(bw_khz);
 
         // RegModemConfig1: BW[7:4], CR[3:1], ImplicitHdr[0]
@@ -427,12 +420,24 @@ impl SX1276 {
     /// Decode the IRQ-flags word to a list of symbolic bit names.
     pub fn decode_device_errors(err: u16) -> Vec<&'static str> {
         let mut bits = Vec::new();
-        if err & (IRQ_RX_TIMEOUT as u16) != 0 { bits.push("RX_TIMEOUT"); }
-        if err & (IRQ_CRC_ERR as u16) != 0 { bits.push("CRC_ERR"); }
-        if err & (IRQ_VALID_HEADER as u16) != 0 { bits.push("VALID_HEADER"); }
-        if err & (IRQ_CAD_DONE as u16) != 0 { bits.push("CAD_DONE"); }
-        if err & (IRQ_FHSS_CHANGE as u16) != 0 { bits.push("FHSS_CHANGE"); }
-        if err & (IRQ_CAD_DETECTED as u16) != 0 { bits.push("CAD_DETECTED"); }
+        if err & (IRQ_RX_TIMEOUT as u16) != 0 {
+            bits.push("RX_TIMEOUT");
+        }
+        if err & (IRQ_CRC_ERR as u16) != 0 {
+            bits.push("CRC_ERR");
+        }
+        if err & (IRQ_VALID_HEADER as u16) != 0 {
+            bits.push("VALID_HEADER");
+        }
+        if err & (IRQ_CAD_DONE as u16) != 0 {
+            bits.push("CAD_DONE");
+        }
+        if err & (IRQ_FHSS_CHANGE as u16) != 0 {
+            bits.push("FHSS_CHANGE");
+        }
+        if err & (IRQ_CAD_DETECTED as u16) != 0 {
+            bits.push("CAD_DETECTED");
+        }
         bits
     }
 
@@ -446,14 +451,14 @@ impl SX1276 {
         let op_mode = self.read_register(REG_OP_MODE)?;
         let mode = op_mode & 0x07;
         let chip_mode: u8 = match mode {
-            MODE_SLEEP => 0x00,             // SLEEP (no SX1262 equivalent)
-            MODE_STDBY => 0x02,             // STDBY -> STBY_RC
-            0x02 => 0x04,                   // FSTX -> FS
-            MODE_TX => 0x06,                // TX
-            0x04 => 0x04,                   // FSRX -> FS
-            MODE_RX_CONTINUOUS => 0x05,     // RX continuous
-            0x06 => 0x05,                   // RX single
-            _ => 0x05,                      // CAD / unknown -> RX-like
+            MODE_SLEEP => 0x00,         // SLEEP (no SX1262 equivalent)
+            MODE_STDBY => 0x02,         // STDBY -> STBY_RC
+            0x02 => 0x04,               // FSTX -> FS
+            MODE_TX => 0x06,            // TX
+            0x04 => 0x04,               // FSRX -> FS
+            MODE_RX_CONTINUOUS => 0x05, // RX continuous
+            0x06 => 0x05,               // RX single
+            _ => 0x05,                  // CAD / unknown -> RX-like
         };
         Ok(chip_mode << 4)
     }

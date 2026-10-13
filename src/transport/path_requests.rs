@@ -7,8 +7,8 @@ use tokio::time::{Duration, Instant};
 
 use crate::destination::DestinationName;
 use crate::destination::PlainInputDestination;
-use crate::hash::ADDRESS_HASH_SIZE;
 use crate::hash::AddressHash;
+use crate::hash::ADDRESS_HASH_SIZE;
 use crate::identity::EmptyIdentity;
 use crate::packet::ContextFlag;
 use crate::packet::DestinationType;
@@ -328,11 +328,9 @@ mod tests {
         let iface = AddressHash::new_from_slice(b"requesting-iface");
         let tag = b"fixed-tag".to_vec();
 
-        assert!(
-            testee
-                .generate_recursive(&destination, iface, Some(tag))
-                .is_some()
-        );
+        assert!(testee
+            .generate_recursive(&destination, iface, Some(tag))
+            .is_some());
         assert_eq!(testee.take_discovery(&destination), Some(iface));
         assert_eq!(testee.take_discovery(&destination), None);
     }
@@ -343,16 +341,12 @@ mod tests {
         let destination = AddressHash::new_from_slice(b"destination");
         let iface = AddressHash::new_from_slice(b"requesting-iface");
 
-        assert!(
-            testee
-                .generate_recursive(&destination, iface, None)
-                .is_some()
-        );
-        assert!(
-            testee
-                .generate_recursive(&destination, iface, None)
-                .is_none()
-        );
+        assert!(testee
+            .generate_recursive(&destination, iface, None)
+            .is_some());
+        assert!(testee
+            .generate_recursive(&destination, iface, None)
+            .is_none());
     }
 
     #[test]

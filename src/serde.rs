@@ -3,8 +3,8 @@ use crate::{
     error::RnsError,
     hash::AddressHash,
     packet::{
-        Header, HeaderType, IfacFlag, PACKET_IFAC_MAX_LENGTH, Packet, PacketContext,
-        PacketDataBuffer, PacketIfac,
+        Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer, PacketIfac,
+        PACKET_IFAC_MAX_LENGTH,
     },
 };
 
@@ -142,9 +142,9 @@ mod tests {
         error::RnsError,
         hash::AddressHash,
         packet::{
-            ContextFlag, DestinationType, Header, HeaderType, IfacFlag, PACKET_IFAC_MAX_LENGTH,
-            PACKET_MDU, Packet, PacketContext, PacketDataBuffer, PacketIfac, PacketType,
-            PropagationType, RETICULUM_MTU,
+            ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
+            PacketDataBuffer, PacketIfac, PacketType, PropagationType, PACKET_IFAC_MAX_LENGTH,
+            PACKET_MDU, RETICULUM_MTU,
         },
         test_vectors,
     };

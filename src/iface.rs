@@ -1616,9 +1616,8 @@ impl InterfaceManager {
     /// Spawn an interface with an explicit Interface Access Code
     /// configuration. This is used by interfaces that spawn child
     /// interfaces (e.g. `TcpServer` spawning per-connection `TcpClient`s)
-    /// so the child inherits the parent's IFAC configuration, matching the
-    /// Python reference behaviour (`TCPInterface.incoming_connection` copies
-    /// `ifac_size` / `ifac_netname` / `ifac_netkey` to spawned clients).
+    /// so the child inherits the parent's IFAC configuration: `ifac_size` /
+    /// `ifac_netname` / `ifac_netkey` are copied to spawned clients.
     pub fn spawn_with_ifac_config<T: Interface, F, R>(
         &mut self,
         inner: T,

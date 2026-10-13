@@ -9,8 +9,8 @@ use crate::hash::AddressHash;
 use crate::hash::Hash;
 
 /// Compute the destination hash for the blackhole info service associated
-/// with a given source identity. Matches the Python reference:
-/// `RNS.Destination.hash_from_name_and_identity("rnstransport.info.blackhole", identity_hash)`.
+/// with a given source identity, i.e. the name-and-identity hash of
+/// `"rnstransport.info.blackhole"`.
 pub fn blackhole_destination_hash(identity_hash: &AddressHash) -> AddressHash {
     let name = DestinationName::new("rnstransport", "info.blackhole");
     let hash = Hash::new(

@@ -58,8 +58,7 @@ impl ReverseTable {
         self.0.insert(truncated_packet_hash, entry);
     }
 
-    /// Handle a received proof. Like the Python reference
-    /// (`Transport.py:2338-2347`), the reverse entry is consumed whenever a
+    /// Handle a received proof. The reverse entry is consumed whenever a
     /// proof for its destination is seen, and the proof is only forwarded
     /// back to the previous hop if it arrived on the same interface the
     /// original packet was forwarded out on. A proof arriving on any other
@@ -94,7 +93,9 @@ mod tests {
     use super::ReverseTable;
     use crate::{
         hash::AddressHash,
-        packet::{DestinationType, Header, IfacFlag, Packet, PacketContext, PacketDataBuffer, PacketType},
+        packet::{
+            DestinationType, Header, IfacFlag, Packet, PacketContext, PacketDataBuffer, PacketType,
+        },
     };
 
     #[test]

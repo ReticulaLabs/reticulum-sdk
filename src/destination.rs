@@ -1,7 +1,7 @@
 pub mod link;
 pub mod resource;
 
-use ed25519_dalek::{SIGNATURE_LENGTH, Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
 use getrandom::SysRng;
 use rand_core::{CryptoRng, UnwrapErr};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -11,10 +11,10 @@ use core::{fmt, marker::PhantomData};
 use crate::{
     error::RnsError,
     hash::{AddressHash, Hash},
-    identity::{EmptyIdentity, HashIdentity, Identity, PUBLIC_KEY_LENGTH, PrivateIdentity},
+    identity::{EmptyIdentity, HashIdentity, Identity, PrivateIdentity, PUBLIC_KEY_LENGTH},
     packet::{
-        self, ContextFlag, DestinationType, ENCRYPTED_PACKET_MDU, Header, HeaderType, IfacFlag,
-        Packet, PacketContext, PacketDataBuffer, PacketType, PropagationType,
+        self, ContextFlag, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
+        PacketDataBuffer, PacketType, PropagationType, ENCRYPTED_PACKET_MDU,
         RETICULUM_AES_BLOCK_SIZE, RETICULUM_EC_PUBLIC_KEY_SIZE, RETICULUM_TOKEN_OVERHEAD,
     },
 };
@@ -563,7 +563,7 @@ pub type PlainOutputDestination = Destination<EmptyIdentity, Output, Plain>;
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{SIGNATURE_LENGTH, Signature};
+    use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
     use getrandom::SysRng;
     use rand_core::UnwrapErr;
     use sha2::Digest;
@@ -571,14 +571,14 @@ mod tests {
 
     use crate::buffer::OutputBuffer;
     use crate::hash::{AddressHash, Hash};
-    use crate::identity::{PUBLIC_KEY_LENGTH, PrivateIdentity};
+    use crate::identity::{PrivateIdentity, PUBLIC_KEY_LENGTH};
     use crate::packet::{
-        ContextFlag, ENCRYPTED_PACKET_MDU, PacketContext, PacketDataBuffer, PacketType,
+        ContextFlag, PacketContext, PacketDataBuffer, PacketType, ENCRYPTED_PACKET_MDU,
     };
     use crate::serde::Serialize;
     use crate::test_vectors;
 
-    use super::{DestinationAnnounce, DestinationName, RAND_HASH_LENGTH, SingleInputDestination};
+    use super::{DestinationAnnounce, DestinationName, SingleInputDestination, RAND_HASH_LENGTH};
 
     fn python_announce_rand_hash() -> [u8; RAND_HASH_LENGTH] {
         let timestamp = test_vectors::FIXED_ANNOUNCE_TIMESTAMP.to_be_bytes();

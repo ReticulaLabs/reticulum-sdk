@@ -128,8 +128,10 @@ impl LinkTable {
         // remaining_hops)` (Transport.py:1643-1644).  The previous hardcoded
         // 600s kept stale entries around for ~10 minutes, re-forwarding link
         // request retries long after the destination stopped responding.
-        let proof_timeout =
-            now + Duration::from_secs(super::DEFAULT_PER_HOP_TIMEOUT_SECS * remaining_hops.max(1) as u64);
+        let proof_timeout = now
+            + Duration::from_secs(
+                super::DEFAULT_PER_HOP_TIMEOUT_SECS * remaining_hops.max(1) as u64,
+            );
 
         let entry = LinkEntry {
             timestamp: now,
@@ -193,15 +195,13 @@ impl LinkTable {
         let outbound_iface = if entry.next_hop_iface == entry.received_from {
             // The link is carried on a single shared medium, so the
             // receiving and outbound interface are the same. Direction
-            // doesn't matter: simply repeat the packet on that interface,
-            // matching the Python reference (Transport.py "Link transport
-            // handling"). This also covers the common single-interface
+            // doesn't matter: simply repeat the packet on that interface.
+            // This also covers the common single-interface
             // node, where `received_on` always equals the shared interface
             // — packets must NOT be dropped just because they arrived on
             // the very interface we would transmit them on (loop prevention
             // is handled by the hop-count checks below).
-            if packet.header.hops == entry.remaining_hops
-                || packet.header.hops == entry.taken_hops
+            if packet.header.hops == entry.remaining_hops || packet.header.hops == entry.taken_hops
             {
                 Some(entry.next_hop_iface)
             } else {
@@ -412,7 +412,7 @@ impl LinkTable {
         let now = Instant::now();
 
         for (link_id, entry) in &self.0 {
-                if entry.validated {
+            if entry.validated {
                 if entry.timestamp + max_age <= now {
                     log::debug!(
                         "link_table: remove stale validated entry for link {} (idle for {}s, forwarded {}x)",
@@ -807,7 +807,10 @@ mod tests {
         // Message proofs must not have validated the entry or changed the
         // hop counts (only an LRPROOF does that).
         let entry = table.0.get(&link_id).unwrap();
-        assert!(!entry.validated, "message proof must not validate the entry");
+        assert!(
+            !entry.validated,
+            "message proof must not validate the entry"
+        );
         assert_eq!(entry.taken_hops, 1);
         assert_eq!(entry.remaining_hops, 2);
 

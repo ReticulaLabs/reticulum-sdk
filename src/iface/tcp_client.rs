@@ -449,8 +449,8 @@ fn minimum_decoded_packet_len(data: &[u8]) -> usize {
             RETICULUM_MAX_HEADER_SIZE
         }
         // Header-only packets (empty data) are valid; accept the full
-        // Type1 header size (matching the header-only Type2 floor above
-        // and the Python reference, which has no minimum at all).
+        // Type1 header size (matching the header-only Type2 floor above;
+        // the protocol defines no minimum payload size).
         _ => RETICULUM_HEADER_MINSIZE,
     }
 }

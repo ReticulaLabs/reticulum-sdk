@@ -1,20 +1,20 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, Signature, SigningKey};
+use ed25519_dalek::{Signature, SigningKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use getrandom::SysRng;
 use rand_core::UnwrapErr;
-use rmpv::{Value, decode::read_value, encode::write_value};
+use rmpv::{decode::read_value, encode::write_value, Value};
 use sha2::{Digest, Sha256};
 use x25519_dalek::StaticSecret;
 
 use crate::{
     buffer::OutputBuffer,
     error::RnsError,
-    hash::{ADDRESS_HASH_SIZE, AddressHash, HASH_SIZE, Hash},
+    hash::{AddressHash, Hash, ADDRESS_HASH_SIZE, HASH_SIZE},
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
-        DestinationType, Header, PACKET_MDU, Packet, PacketContext, PacketDataBuffer, PacketType,
-        RETICULUM_AES_BLOCK_SIZE, RETICULUM_MTU, RETICULUM_TOKEN_OVERHEAD, compute_link_mdu,
+        compute_link_mdu, DestinationType, Header, Packet, PacketContext, PacketDataBuffer,
+        PacketType, PACKET_MDU, RETICULUM_AES_BLOCK_SIZE, RETICULUM_MTU, RETICULUM_TOKEN_OVERHEAD,
     },
 };
 
@@ -204,18 +204,13 @@ pub struct LinkRequest {
     /// Both SDK peers derive the same value, so it is safe to echo back
     /// with `response_packet` when talking to another SDK client.
     pub request_id: AddressHash,
-    /// Request id using the Python reference convention. For inline
-    /// requests this is the first 16 bytes of SHA-256 over
-    /// (header flags | context | ciphertext); for resource-based requests
-    /// it is the first 16 bytes of SHA-256 over the packed msgpack request.
-    /// The Python client correlates responses against this value, so
-    /// applications serving Python clients must echo these exact bytes
-    /// (e.g. via `response_packet_raw`).
+    /// Request id. For inline requests this is the first 16 bytes of
+    /// SHA-256 over (header flags | context | ciphertext);
+    /// for resource-based requests it is the first 16 bytes of SHA-256
+    /// over the packed msgpack request.
     pub request_id_raw: Vec<u8>,
     pub path_hash: AddressHash,
-    /// Raw path hash bytes as received on the wire, left-aligned. The
-    /// Python reference hashes the request path into a 16-byte truncated
-    /// hash, which is what applications should match against.
+    /// Raw path hash bytes as received on the wire, left-aligned.
     pub path_hash_raw: Vec<u8>,
     pub requested_at: f64,
     pub data: Value,
@@ -427,7 +422,10 @@ impl Link {
         let mut link = Self {
             id: link_id,
             destination,
-            priv_identity: PrivateIdentity::new(StaticSecret::random_from_rng(&mut rng), signing_key),
+            priv_identity: PrivateIdentity::new(
+                StaticSecret::random_from_rng(&mut rng),
+                signing_key,
+            ),
             peer_identity,
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
@@ -713,9 +711,8 @@ impl Link {
             PacketType::Data => return self.handle_data_packet(packet, out_link),
             PacketType::Proof => {
                 // Resource proofs are PROOF packets with a RESOURCE_PRF context
-                // (matching the Python reference). Route them to the resource
-                // handler; link-request and message proofs stay in
-                // handle_proof_packet.
+                // Route them to the resource handler; link-request and message
+                // proofs stay in handle_proof_packet.
                 if packet.context == PacketContext::ResourceProof {
                     return self.handle_resource_packet(packet);
                 }
@@ -729,9 +726,9 @@ impl Link {
         match packet.context {
             PacketContext::Resource | PacketContext::ResourceProof => {
                 // Resource parts and proofs are never encrypted at the packet
-                // layer (matching the Python reference): the resource takes
-                // care of its own encryption on the whole stream, and each
-                // part packet carries a raw slice of that encrypted stream.
+                // layer: the resource takes care of its own encryption on the
+                // whole stream, and each part packet carries a raw slice of that
+                // encrypted stream.
                 // Resource proofs are likewise sent unencrypted. Advancing
                 // the link ratchet is handled by the other encrypted contexts.
                 log::trace!(
@@ -818,15 +815,11 @@ impl Link {
     /// Build a resource-context packet (e.g. a resource part, advertisement,
     /// request, hashmap update or proof blob) encrypted and addressed to this
     /// link's peer. The payload must fit within the link MDU.
-    pub fn resource_packet(
-        &self,
-        context: PacketContext,
-        data: &[u8],
-    ) -> Result<Packet, RnsError> {
+    pub fn resource_packet(&self, context: PacketContext, data: &[u8]) -> Result<Packet, RnsError> {
         self.encrypted_data_packet(data, context)
     }
 
-    /// Build a raw resource part packet (matching the Python reference).
+    /// Build a raw resource part packet.
     ///
     /// Resource part packets are never encrypted at the packet layer: the
     /// resource takes care of its own encryption on the whole stream and
@@ -836,7 +829,7 @@ impl Link {
         self.raw_data_packet(data, PacketContext::Resource, PacketType::Data)
     }
 
-    /// Build a raw resource proof packet (matching the Python reference).
+    /// Build a raw resource proof packet.
     ///
     /// Resource proofs are sent unencrypted over the link as PROOF packets
     /// with a RESOURCE_PRF context. The payload must fit within the link MDU.
@@ -877,7 +870,7 @@ impl Link {
 
     /// Maximum Data Unit for this link, computed from the negotiated path MTU.
     /// This is the largest plaintext payload that can be encrypted into a single
-    /// link packet. Uses AES-block-aligned arithmetic like the Python reference.
+    /// link packet. Uses AES-block-aligned arithmetic.
     pub fn mdu(&self) -> usize {
         compute_link_mdu(self.mtu)
     }
@@ -1156,16 +1149,12 @@ impl Link {
 
     /// Build a response packet using raw request-id bytes as-is.
     ///
-    /// The Python reference correlates responses against the request id it
-    /// derives from the request (either from the transmitted packet or from
-    /// the packed request payload), which may differ from this SDK's own
-    /// request id convention. Passing the raw bytes here allows applications
-    /// to interoperate with both implementations.
-    pub fn response_packet_raw(
-        &self,
-        request_id: &[u8],
-        data: Value,
-    ) -> Result<Packet, RnsError> {
+    /// Responses are correlated against the request id derived from
+    /// the request (either from the transmitted packet or from the packed
+    /// request payload), which may differ from this SDK's own request id
+    /// convention. Passing the raw bytes here allows applications to use
+    /// either convention.
+    pub fn response_packet_raw(&self, request_id: &[u8], data: Value) -> Result<Packet, RnsError> {
         let response = Value::Array(vec![Value::Binary(request_id.to_vec()), data]);
         let packed_response = encode_msgpack(&response)?;
         if packed_response.len() > self.mdu() {
@@ -1665,14 +1654,13 @@ fn decode_link_request(
     })
 }
 
-/// Compute the request id the way the Python reference does for inline
-/// requests: the first 16 bytes of SHA-256 over the packet's hashable part
-/// (header flags | destination | context | ciphertext), matching
-/// `Packet.getTruncatedHash()`. Python sends requests either inline in a
-/// packet (in which case the request id is derived from the transmitted
-/// packet hashable part) or as a resource (in which case it is derived
-/// from the packed request payload, computed by the caller from the
-/// reassembled data).
+/// Compute the request id for inline requests: the first 16 bytes of
+/// SHA-256 over the packet's hashable part (header flags | destination |
+/// context | ciphertext), matching `Packet.getTruncatedHash()`. Requests are
+/// sent either inline in a packet (in which case the request id is derived
+/// from the transmitted packet hashable part) or as a resource (in which
+/// case it is derived from the packed request payload, computed by the
+/// caller from the reassembled data).
 fn python_request_id(packet: &Packet) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update([packet.header.to_meta() & 0b0000_1111]);
@@ -1685,7 +1673,7 @@ fn python_request_id(packet: &Packet) -> Vec<u8> {
 
 /// Convert raw request path-hash bytes into an address hash.
 ///
-/// The Python reference sends the full 16-byte truncated hash of the
+/// The wire format carries the full 16-byte truncated hash of the
 /// request path. The value is copied as-is when it matches the address
 /// size; anything shorter is left-aligned and zero-padded so the leading
 /// bytes remain comparable.
@@ -1730,14 +1718,14 @@ mod tests {
     use crate::error::RnsError;
     use crate::hash::{AddressHash, ADDRESS_HASH_SIZE};
     use crate::identity::PrivateIdentity;
-    use crate::packet::{DestinationType, LINK_PACKET_MDU, PacketContext, PacketType};
+    use crate::packet::{DestinationType, PacketContext, PacketType, LINK_PACKET_MDU};
     use crate::serde::Serialize;
     use crate::test_vectors;
     use sha2::{Digest, Sha256};
 
     use super::{
-        ChannelEnvelope, ChannelMessage, KEEPALIVE_INTERVAL, LINK_MTU_SIZE, Link, LinkEvent,
-        LinkHandleResult, LinkStatus,
+        ChannelEnvelope, ChannelMessage, Link, LinkEvent, LinkHandleResult, LinkStatus,
+        KEEPALIVE_INTERVAL, LINK_MTU_SIZE,
     };
     use std::time::{Duration, Instant};
 
@@ -2029,9 +2017,7 @@ mod tests {
 
         assert_eq!(
             raw,
-            vec![
-                0x12, 0x34, 0x00, 0x02, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'
-            ]
+            vec![0x12, 0x34, 0x00, 0x02, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o']
         );
         assert_eq!(ChannelEnvelope::unpack(&raw).expect("unpacked"), envelope);
         assert!(ChannelEnvelope::unpack(&raw[..raw.len() - 1]).is_err());
@@ -2235,9 +2221,8 @@ mod tests {
 
         // Force the stall to have expired, then a subsequent arrival
         // triggers recovery and flushes the buffered packets.
-        in_link.channel_rx_stall_since = Some(
-            Instant::now() - super::CHANNEL_REORDER_TIMEOUT - Duration::from_secs(1),
-        );
+        in_link.channel_rx_stall_since =
+            Some(Instant::now() - super::CHANNEL_REORDER_TIMEOUT - Duration::from_secs(1));
         assert!(matches!(
             in_link.handle_packet(&packets[6], false),
             LinkHandleResult::MessageReceived(_)
@@ -2497,8 +2482,8 @@ mod tests {
             .resource_proof_packet(&proof_data)
             .expect("resource proof packet");
 
-        // Matching the Python reference, resource proofs are PROOF packets
-        // with a RESOURCE_PRF context, sent unencrypted over the link.
+        // Resource proofs are PROOF packets with a RESOURCE_PRF
+        // context, sent unencrypted over the link.
         assert_eq!(proof.header.packet_type, PacketType::Proof);
         assert_eq!(proof.context, PacketContext::ResourceProof);
         assert_eq!(proof.destination, out_link.id);

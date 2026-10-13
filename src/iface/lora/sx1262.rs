@@ -1,8 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{
-    GpioPins, LoRaChipset, LoRaConfig, LoRaError, LoRaGpio, LoRaSpi, ReceivedPacket,
-};
+use super::{GpioPins, LoRaChipset, LoRaConfig, LoRaError, LoRaGpio, LoRaSpi, ReceivedPacket};
 
 // ── Command opcodes ───────────────────────────────────────────────────────
 
@@ -211,10 +209,7 @@ impl SX1262 {
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or_else(|| max_busy.as_millis().max(200) as u64);
-                std::thread::sleep(std::cmp::max(
-                    self.command_delay,
-                    Duration::from_millis(ms),
-                ));
+                std::thread::sleep(std::cmp::max(self.command_delay, Duration::from_millis(ms)));
                 Ok(())
             }
         }
@@ -257,7 +252,11 @@ impl SX1262 {
         let ih = if cfg.implicit_header { 1.0 } else { 0.0 };
         // Low-data-rate optimization applies when the symbol time would
         // exceed ~16 ms (SF11/SF12 at 125 kHz).
-        let de = if sf >= 11 && bw_hz <= 125_000.0 { 1.0 } else { 0.0 };
+        let de = if sf >= 11 && bw_hz <= 125_000.0 {
+            1.0
+        } else {
+            0.0
+        };
         let symbol_time = ((1u64 << sf) as f64) / bw_hz;
         let n_preamble = cfg.effective_preamble_length() as f64 + 4.25;
         let numerator = 8.0 * payload_len as f64 - 4.0 * sf as f64 + 28.0 + 16.0 * crc - 20.0 * ih;
@@ -332,7 +331,11 @@ impl SX1262 {
         log::info!(
             "sx1262: probe_sleep: status during wake xact = 0x{:02X} -> chip was {}",
             rx[1],
-            if was_asleep { "ASLEEP (fresh POR)" } else { "AWAKE (warm/stuck)" }
+            if was_asleep {
+                "ASLEEP (fresh POR)"
+            } else {
+                "AWAKE (warm/stuck)"
+            }
         );
         Ok(was_asleep)
     }
@@ -366,13 +369,16 @@ impl SX1262 {
     pub fn hardware_reset(&mut self) -> Result<(), LoRaError> {
         match &self.reset {
             Some(reset) => {
-                reset.set_value(true)
+                reset
+                    .set_value(true)
                     .map_err(|e| LoRaError::Gpio(format!("reset high: {}", e)))?;
                 std::thread::sleep(Duration::from_millis(10));
-                reset.set_value(false)
+                reset
+                    .set_value(false)
                     .map_err(|e| LoRaError::Gpio(format!("reset low: {}", e)))?;
                 std::thread::sleep(Duration::from_millis(10));
-                reset.set_value(true)
+                reset
+                    .set_value(true)
                     .map_err(|e| LoRaError::Gpio(format!("reset high: {}", e)))?;
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -410,8 +416,6 @@ impl SX1262 {
         self.wait_ready_with_max_busy(max_busy)?;
         Ok(())
     }
-
-
 
     fn read_command(
         &mut self,
@@ -459,7 +463,10 @@ impl SX1262 {
         let cr_code = lora_coding_rate_code(cr);
         let ldro = if needs_ldro(sf, bw_hz) { 0x01 } else { 0x00 };
         // SX1262 expects 8 bytes: sf, bw, cr, ldro, reserved=0,0,0,0
-        self.write_command(CMD_SET_MODULATION_PARAMS, &[sf, bw, cr_code, ldro, 0, 0, 0, 0])
+        self.write_command(
+            CMD_SET_MODULATION_PARAMS,
+            &[sf, bw, cr_code, ldro, 0, 0, 0, 0],
+        )
     }
 
     fn set_packet_params(
@@ -480,7 +487,9 @@ impl SX1262 {
                 payload_len,
                 crc,
                 iq,
-                0, 0, 0,
+                0,
+                0,
+                0,
             ],
         )?;
 
@@ -498,7 +507,11 @@ impl SX1262 {
             } else {
                 self.write_command(CMD_SET_PA_CONFIG, &[0x04, 0x00, 0x01, 0x01])?;
             }
-            let power = if clamped >= 14 { 14u8 } else { clamped.max(-17) as u8 };
+            let power = if clamped >= 14 {
+                14u8
+            } else {
+                clamped.max(-17) as u8
+            };
             self.write_register(REG_OCP, &[0x10])?;
             self.write_command(CMD_SET_TX_PARAMS, &[power, RAMP_800U])
         } else {
@@ -540,7 +553,10 @@ impl SX1262 {
             }
         };
         // paLut: always 0x01 (reserved)
-        self.write_command(CMD_SET_PA_CONFIG, &[pa_duty_cycle, hp_max, device_sel, 0x01])
+        self.write_command(
+            CMD_SET_PA_CONFIG,
+            &[pa_duty_cycle, hp_max, device_sel, 0x01],
+        )
     }
 
     fn set_buffer_base_address(&mut self) -> Result<(), LoRaError> {
@@ -551,7 +567,10 @@ impl SX1262 {
     }
 
     fn set_sync_word(&mut self, word: u16) -> Result<(), LoRaError> {
-        self.write_register(REG_LORA_SYNC_WORD_MSB, &[(word >> 8) as u8, (word & 0xFF) as u8])
+        self.write_register(
+            REG_LORA_SYNC_WORD_MSB,
+            &[(word >> 8) as u8, (word & 0xFF) as u8],
+        )
     }
 
     fn set_dio_irq_params(&mut self, dio1_enabled: bool) -> Result<(), LoRaError> {
@@ -596,9 +615,7 @@ impl SX1262 {
         // not stable within this window the chip latches XOSC_START_ERR and
         // aborts the STBY_XOSC transition. Core1262 modules need a generous
         // timeout (51.2ms is not enough and TX is then silently rejected).
-        let delay: u32 = (startup_delay.as_millis().clamp(1, 1_000_000) as u32
-            * 1000)
-            / 16;
+        let delay: u32 = (startup_delay.as_millis().clamp(1, 1_000_000) as u32 * 1000) / 16;
         self.write_command(
             CMD_SET_DIO3_AS_TCXO_CTRL,
             &[code, (delay >> 16) as u8, (delay >> 8) as u8, delay as u8],
@@ -627,15 +644,14 @@ impl SX1262 {
         let (f1, f2) = calibrate_image_bands(freq_hz);
         // SX1262 CalibrateImage takes 2 bytes: frequency band start and end.
         // Also gated by the TCXO ramp on some boards, so use the full budget.
-        self.write_command_with_max_busy(
-            CMD_CALIBRATE_IMAGE,
-            &[f1, f2],
-            self.calibrate_max_busy(),
-        )
+        self.write_command_with_max_busy(CMD_CALIBRATE_IMAGE, &[f1, f2], self.calibrate_max_busy())
     }
 
     fn clear_irq_status(&mut self, mask: u16) -> Result<(), LoRaError> {
-        self.write_command(CMD_CLEAR_IRQ_STATUS, &[(mask >> 8) as u8, (mask & 0xFF) as u8])
+        self.write_command(
+            CMD_CLEAR_IRQ_STATUS,
+            &[(mask >> 8) as u8, (mask & 0xFF) as u8],
+        )
     }
 
     fn read_buffer(&mut self, offset: u8, count: usize) -> Result<Vec<u8>, LoRaError> {
@@ -717,7 +733,8 @@ impl SX1262 {
     /// Quick SPI ping: read a register and verify the chip responds with
     /// valid data (not all-zeros or all-ones).
     fn ping(&mut self) -> Result<(), LoRaError> {
-        let data = self.read_command(CMD_READ_REGISTER, 2, &REG_LORA_SYNC_WORD_MSB.to_be_bytes())?;
+        let data =
+            self.read_command(CMD_READ_REGISTER, 2, &REG_LORA_SYNC_WORD_MSB.to_be_bytes())?;
         if data.len() < 2 {
             return Err(LoRaError::Chipset(
                 "SPI ping: chip did not respond (no data)".into(),
@@ -735,9 +752,12 @@ impl SX1262 {
     }
 
     fn validate_communication(&mut self, sync_word: u16) -> Result<(), LoRaError> {
-        let data = self.read_command(CMD_READ_REGISTER, 2, &REG_LORA_SYNC_WORD_MSB.to_be_bytes())?;
+        let data =
+            self.read_command(CMD_READ_REGISTER, 2, &REG_LORA_SYNC_WORD_MSB.to_be_bytes())?;
         if data.len() < 2 {
-            return Err(LoRaError::Chipset("SPI validation failed: no data received".into()));
+            return Err(LoRaError::Chipset(
+                "SPI validation failed: no data received".into(),
+            ));
         }
         let read_word = (data[0] as u16) << 8 | data[1] as u16;
         if read_word != sync_word {
@@ -815,18 +835,11 @@ impl SX1262 {
     /// or marginal TCXO. On success any latched XOSC/PLL startup error is
     /// cleared so later checks aren't misread. This is the software
     /// equivalent of waiting for BUSY to release (no BUSY line is wired).
-    pub fn enter_standby_xosc(
-        &mut self,
-        startup_delay: Duration,
-    ) -> Result<(), LoRaError> {
+    pub fn enter_standby_xosc(&mut self, startup_delay: Duration) -> Result<(), LoRaError> {
         let timeout = startup_delay + Duration::from_millis(100);
         let max_busy = startup_delay + Duration::from_millis(100);
         for attempt in 0..4 {
-            self.write_command_with_max_busy(
-                CMD_SET_STANDBY,
-                &[STANDBY_XOSC],
-                max_busy,
-            )?;
+            self.write_command_with_max_busy(CMD_SET_STANDBY, &[STANDBY_XOSC], max_busy)?;
             if self.wait_for_standby_xosc(timeout)? {
                 let _ = self.clear_device_errors();
                 return Ok(());
@@ -910,14 +923,30 @@ impl LoRaChipset for SX1262 {
             Ok(err) => {
                 if err != 0 {
                     let mut bits = Vec::new();
-                    if err & 0x20 != 0 { bits.push("XOSC_START_ERR"); }
-                    if err & 0x40 != 0 { bits.push("PLL_LOCK_ERR"); }
-                    if err & 0x100 != 0 { bits.push("PA_RAMP_ERR"); }
-                    if err & 0x01 != 0 { bits.push("RC64K_CALIB_ERR"); }
-                    if err & 0x02 != 0 { bits.push("RC13M_CALIB_ERR"); }
-                    if err & 0x04 != 0 { bits.push("PLL_CALIB_ERR"); }
-                    if err & 0x08 != 0 { bits.push("ADC_CALIB_ERR"); }
-                    if err & 0x10 != 0 { bits.push("IMG_CALIB_ERR"); }
+                    if err & 0x20 != 0 {
+                        bits.push("XOSC_START_ERR");
+                    }
+                    if err & 0x40 != 0 {
+                        bits.push("PLL_LOCK_ERR");
+                    }
+                    if err & 0x100 != 0 {
+                        bits.push("PA_RAMP_ERR");
+                    }
+                    if err & 0x01 != 0 {
+                        bits.push("RC64K_CALIB_ERR");
+                    }
+                    if err & 0x02 != 0 {
+                        bits.push("RC13M_CALIB_ERR");
+                    }
+                    if err & 0x04 != 0 {
+                        bits.push("PLL_CALIB_ERR");
+                    }
+                    if err & 0x08 != 0 {
+                        bits.push("ADC_CALIB_ERR");
+                    }
+                    if err & 0x10 != 0 {
+                        bits.push("IMG_CALIB_ERR");
+                    }
                     log::warn!(
                         "sx1262: device errors after STDBY_XOSC = 0x{err:04X} ({})",
                         bits.join(", "),
@@ -1100,7 +1129,9 @@ impl LoRaChipset for SX1262 {
             self.clear_irq_status(0xFFFF)?;
             self.write_command(CMD_SET_STANDBY, &[STANDBY_RC])?;
             self.tx_active = false;
-            return Err(LoRaError::Chipset("TX never started — chip rejected CMD_SET_TX".into()));
+            return Err(LoRaError::Chipset(
+                "TX never started — chip rejected CMD_SET_TX".into(),
+            ));
         }
 
         Ok(())
@@ -1131,11 +1162,7 @@ impl LoRaChipset for SX1262 {
         // window (measured ~311 ms on this hardware vs the 320 ms delay).
         // The short 200 ms default `wait_ready` budget times out here, so
         // use the XOSC budget.
-        self.write_command_with_max_busy(
-            CMD_SET_RX,
-            &[0xFF, 0xFF, 0xFF],
-            self.xosc_max_busy(),
-        )?;
+        self.write_command_with_max_busy(CMD_SET_RX, &[0xFF, 0xFF, 0xFF], self.xosc_max_busy())?;
 
         self.rx_active = true;
         self.tx_active = false;
@@ -1225,8 +1252,7 @@ impl LoRaChipset for SX1262 {
         if irq_status & (IRQ_HEADER_ERR | IRQ_CRC_ERR) != 0 {
             std::thread::sleep(Duration::from_millis(100));
         }
-        if irq_status
-            & (IRQ_RX_DONE | IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_HEADER_ERR | IRQ_CRC_ERR)
+        if irq_status & (IRQ_RX_DONE | IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_HEADER_ERR | IRQ_CRC_ERR)
             != 0
         {
             self.start_receive()?;

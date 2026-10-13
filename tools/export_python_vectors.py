@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Export deterministic Reticulum wire-format vectors from the Python reference implementation.
+Export deterministic Reticulum wire-format vectors from the upstream implementation.
 
 Usage:
   python3 tools/export_python_vectors.py
