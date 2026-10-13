@@ -1,4 +1,4 @@
-# Contributing to Reticulum-rs
+# Contributing to the reticulum-sdk
 
 We welcome and value all kinds of contributions to **reticulum-sdk**. These are our guidelines to make collaboration easier.
 
