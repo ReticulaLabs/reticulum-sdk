@@ -355,8 +355,9 @@ impl SX1276 {
     // ── Preamble ───────────────────────────────────────────────────────────
 
     fn set_preamble_length(&mut self, symbols: u16) -> Result<(), LoRaError> {
-        // The chip preamble count is (register_value + 4) symbols,
-        // so we store (wanted – 4).
+        // SX1276 `RegPreamble` holds (register_value + 4) symbols, so store
+        // (wanted – 4). This used to be dead code never called from `init`,
+        // leaving the chip's reset default of 0x08 (12 symbols) in place.
         let count = symbols.saturating_sub(4);
         self.write_register(REG_PREAMBLE_MSB, (count >> 8) as u8)?;
         self.write_register(REG_PREAMBLE_LSB, (count & 0xFF) as u8)
@@ -554,6 +555,9 @@ impl LoRaChipset for SX1276 {
         // Sync word (8-bit, mapped from 16-bit config)
         let sync_byte = Self::sync_word_byte(config.sync_word);
         self.write_register(REG_SYNC_WORD, sync_byte)?;
+
+        // Preamble length (was previously left at the chip reset default)
+        self.set_preamble_length(config.effective_preamble_length())?;
 
         // CRC
         self.set_crc(config.crc_enabled)?;

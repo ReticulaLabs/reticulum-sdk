@@ -259,7 +259,7 @@ impl SX1262 {
         // exceed ~16 ms (SF11/SF12 at 125 kHz).
         let de = if sf >= 11 && bw_hz <= 125_000.0 { 1.0 } else { 0.0 };
         let symbol_time = ((1u64 << sf) as f64) / bw_hz;
-        let n_preamble = cfg.preamble_length as f64 + 4.25;
+        let n_preamble = cfg.effective_preamble_length() as f64 + 4.25;
         let numerator = 8.0 * payload_len as f64 - 4.0 * sf as f64 + 28.0 + 16.0 * crc - 20.0 * ih;
         let denominator = 4.0 * (sf as f64 - 2.0 * de);
         let n_payload = 8.0 + (numerator / denominator).ceil().max(0.0) * cr;
@@ -965,7 +965,13 @@ impl LoRaChipset for SX1262 {
         let header_mode = if config.implicit_header { 0x01 } else { 0x00 };
         let crc = if config.crc_enabled { 0x01 } else { 0x00 };
         let iq = if config.iq_inverted { 0x01 } else { 0x00 };
-        self.set_packet_params(config.preamble_length, header_mode, 0xFF, crc, iq)?;
+        self.set_packet_params(
+            config.effective_preamble_length(),
+            header_mode,
+            0xFF,
+            crc,
+            iq,
+        )?;
 
         self.config = Some(config.clone());
 
@@ -1029,7 +1035,13 @@ impl LoRaChipset for SX1262 {
         let header_mode = if cfg.implicit_header { 0x01 } else { 0x00 };
         let crc = if cfg.crc_enabled { 0x01 } else { 0x00 };
         let iq = if cfg.iq_inverted { 0x01 } else { 0x00 };
-        self.set_packet_params(cfg.preamble_length, header_mode, payload.len() as u8, crc, iq)?;
+        self.set_packet_params(
+            cfg.effective_preamble_length(),
+            header_mode,
+            payload.len() as u8,
+            crc,
+            iq,
+        )?;
         log::debug!(
             "sx1262: tx step status 0x{:02X} (after SetPacketParams)",
             self.get_status().unwrap_or(0)
@@ -1109,7 +1121,7 @@ impl LoRaChipset for SX1262 {
 
         // Set packet params (payload len 0xFF, ignored in explicit header mode)
         // NOTE: IQ polarity errata fix is applied inside set_packet_params.
-        self.set_packet_params(cfg.preamble_length, header_mode, 0xFF, crc, iq)?;
+        self.set_packet_params(cfg.effective_preamble_length(), header_mode, 0xFF, crc, iq)?;
 
         // RX timeout workaround
         self.fix_rx_timeout()?;

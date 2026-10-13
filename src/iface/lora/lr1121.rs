@@ -1670,7 +1670,13 @@ impl LoRaChipset for LR1121 {
         let header_mode = if cfg.implicit_header { 0x01 } else { 0x00 };
         let crc = if cfg.crc_enabled { 0x01 } else { 0x00 };
         let iq = if cfg.iq_inverted { 0x01 } else { 0x00 };
-        self.set_packet_params(cfg.preamble_length, header_mode, payload.len() as u8, crc, iq)?;
+        self.set_packet_params(
+            cfg.effective_preamble_length(),
+            header_mode,
+            payload.len() as u8,
+            crc,
+            iq,
+        )?;
 
         // Apply high ACP workaround for compliant TX spectrum
         self.apply_high_acp_workaround()?;
@@ -1700,7 +1706,7 @@ impl LoRaChipset for LR1121 {
         let crc = if cfg.crc_enabled { 0x01 } else { 0x00 };
         let iq = if cfg.iq_inverted { 0x01 } else { 0x00 };
 
-        self.set_packet_params(cfg.preamble_length, header_mode, 0xFF, crc, iq)?;
+        self.set_packet_params(cfg.effective_preamble_length(), header_mode, 0xFF, crc, iq)?;
 
         // Apply high ACP workaround for sensitive RX
         self.apply_high_acp_workaround()?;

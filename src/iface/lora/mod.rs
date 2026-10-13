@@ -33,6 +33,100 @@ const CR_MAX: u8 = 8;
 
 pub const DEFAULT_SYNC_WORD: u16 = 0x1424;
 
+/// Preamble parameters for the LoRa air interface.
+///
+/// The preamble is not a free tuning knob: a receiver must lock onto it to
+/// acquire frequency and symbol timing before it can match the sync word, so
+/// a preamble that is too short makes an otherwise well-formed packet read as
+/// noise. The target is therefore a *duration* rather than a fixed symbol
+/// count, so the preamble still lasts long enough in wall-clock terms at low
+/// spreading factors, and the symbol count is derived from the symbol time.
+///
+/// On a fast link the target is shortened: there, CSMA channel access rather
+/// than receiver lock is the binding constraint, so some margin is traded for
+/// throughput. The result is floored at [`MIN_PREAMBLE_LENGTH`].
+
+/// Minimum preamble length, in symbols. Treated as a hard floor.
+pub const MIN_PREAMBLE_LENGTH: u16 = 18;
+
+/// Target preamble duration, in ms, on a normal-rate link.
+pub const PREAMBLE_TARGET_MS: f64 = 24.0;
+
+/// Reduction applied to [`PREAMBLE_TARGET_MS`] on a fast link.
+pub const PREAMBLE_FAST_DELTA_MS: f64 = 18.0;
+
+/// Bitrate above which the fast-link preamble shortening applies.
+pub const FAST_THRESHOLD_BPS: f64 = 30_000.0;
+
+/// Symbol duration in ms for a LoRa configuration.
+fn symbol_time_ms(spreading_factor: u8, bandwidth_hz: f64) -> f64 {
+    let sf = spreading_factor.clamp(5, 12) as f64;
+    let bw = if bandwidth_hz > 0.0 { bandwidth_hz } else { 1.0 };
+    (1u64 << sf as u64) as f64 / bw * 1000.0
+}
+
+/// Payload bitrate in bps for a LoRa configuration (same formula the
+/// interface reports via [`crate::iface::Interface::bitrate`]).
+fn payload_bitrate_bps(spreading_factor: u8, bandwidth_hz: f64, coding_rate: u8) -> f64 {
+    let sf = spreading_factor as f64;
+    let cr = coding_rate.max(4) as f64;
+    let bw_khz = bandwidth_hz / 1000.0;
+    if sf <= 0.0 || cr <= 0.0 || bw_khz <= 0.0 {
+        return 0.0;
+    }
+    // NB: 2^sf, not sf^2.
+    sf * ((4.0 / cr) / (2.0_f64.powf(sf) / bw_khz)) * 1000.0
+}
+
+/// Preamble length for a configuration, in symbols.
+///
+/// Targets a preamble of [`PREAMBLE_TARGET_MS`] (less
+/// [`PREAMBLE_FAST_DELTA_MS`] on a fast link), converts that duration to
+/// symbols at the current symbol time, and clamps up to
+/// [`MIN_PREAMBLE_LENGTH`].
+pub fn reticulum_preamble_length(
+    spreading_factor: u8,
+    bandwidth_hz: f64,
+    coding_rate: u8,
+) -> u16 {
+    let sym_ms = symbol_time_ms(spreading_factor, bandwidth_hz);
+    if sym_ms <= 0.0 {
+        return MIN_PREAMBLE_LENGTH;
+    }
+    let target_ms = if payload_bitrate_bps(spreading_factor, bandwidth_hz, coding_rate)
+        > FAST_THRESHOLD_BPS
+    {
+        PREAMBLE_TARGET_MS - PREAMBLE_FAST_DELTA_MS
+    } else {
+        PREAMBLE_TARGET_MS
+    };
+    let symbols = (target_ms / sym_ms).ceil();
+    if symbols < MIN_PREAMBLE_LENGTH as f64 {
+        MIN_PREAMBLE_LENGTH
+    } else {
+        symbols as u16
+    }
+}
+
+/// Default preamble length for a configuration, derived from its link
+/// parameters.
+pub fn default_preamble_length(config: &LoRaConfig) -> u16 {
+    reticulum_preamble_length(
+        config.spreading_factor,
+        config.bandwidth,
+        config.coding_rate,
+    )
+}
+
+/// Effective preamble length for this configuration: the explicit override if
+/// one was set, otherwise derived from the link parameters.
+impl LoRaConfig {
+    pub fn effective_preamble_length(&self) -> u16 {
+        self.preamble_length
+            .unwrap_or_else(|| default_preamble_length(self))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LoRa hardware abstraction
 // ---------------------------------------------------------------------------
@@ -372,7 +466,10 @@ pub struct LoRaConfig {
     pub coding_rate: u8,
     pub tx_power: i8,
     pub sync_word: u16,
-    pub preamble_length: u16,
+    /// Preamble length in symbols. `None` derives it from the configured
+    /// spreading factor / bandwidth / coding rate (see
+    /// [`reticulum_preamble_length`]); `Some(n)` pins it explicitly.
+    pub preamble_length: Option<u16>,
     pub crc_enabled: bool,
     pub implicit_header: bool,
     pub iq_inverted: bool,
@@ -426,7 +523,7 @@ impl LoRaConfig {
             coding_rate,
             tx_power,
             sync_word: DEFAULT_SYNC_WORD,
-            preamble_length: 8,
+            preamble_length: None,
             crc_enabled: true,
             implicit_header: false,
             iq_inverted: false,
@@ -466,6 +563,16 @@ impl LoRaConfig {
 
     pub fn with_crc(mut self, enabled: bool) -> Self {
         self.crc_enabled = enabled;
+        self
+    }
+
+    /// Pin the LoRa preamble length, in symbols, overriding the value derived
+    /// from the link parameters.
+    ///
+    /// Normally leave this unset so the preamble tracks the spreading factor
+    /// and bandwidth; see [`reticulum_preamble_length`].
+    pub fn with_preamble_length(mut self, symbols: u16) -> Self {
+        self.preamble_length = Some(symbols);
         self
     }
 
@@ -1018,3 +1125,4 @@ impl<C: LoRaChipset> Interface for LoRaInterface<C> {
         Some(sf * ((4.0 / cr) / (2.0_f64.powf(sf) / (bw / 1000.0))) * 1000.0)
     }
 }
+
