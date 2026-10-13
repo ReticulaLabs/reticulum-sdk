@@ -53,6 +53,31 @@ const REG_EVENT_MASK: u16 = 0x0944;
 // SX1262 FIFO is 256 bytes; payload length field in SetPacketParams is 8 bits.
 const MAX_PAYLOAD_LEN: usize = 255;
 
+// ── SPI transaction size budget ────────────────────────────────────────────
+// Every SPI command must be clocked with NSS held low from the first byte to
+// the last: the SX1262 latches nothing until NSS rises again, and treats the
+// byte after that rising edge as the start of a *new* command.
+//
+// Not every `embedded-hal` SPI backend honours that. esp-idf-hal's
+// `SpiDevice::transfer()` splits a transfer into chunks of the bus's
+// `max_transfer_sz` (64 bytes unless the bus was configured with DMA) and runs
+// each chunk as its own transaction, and `spi_create_transaction` never sets
+// `SPI_TRANS_CS_KEEP_ACTIVE` — so NSS goes high between chunks. A single
+// oversized `transfer()` therefore becomes several truncated commands: the
+// tail is executed as garbage opcodes and nothing comes back.
+//
+// `WriteBuffer` and `ReadBuffer` are the only commands that grow with the
+// payload, and both carry a FIFO offset, so this driver chunks them itself and
+// keeps every other command well inside the budget. The largest remaining
+// command is 10 bytes (SetPacketParams).
+//
+// Lower it if your SPI backend chunks more aggressively than this: the extra
+// transactions cost bus overhead only, never airtime.
+pub const SX1262_MAX_SPI_COMMAND: usize = 64;
+
+const FIFO_WRITE_CHUNK: usize = SX1262_MAX_SPI_COMMAND - 2; // opcode + offset
+const FIFO_READ_CHUNK: usize = SX1262_MAX_SPI_COMMAND - 3; // opcode + offset + NOP
+
 // ── Packet types ──────────────────────────────────────────────────────────
 
 const PACKET_TYPE_LORA: u8 = 0x01;
@@ -654,8 +679,43 @@ impl SX1262 {
         )
     }
 
+    /// Write `payload` into the FIFO starting at `offset`, in as many
+    /// `WriteBuffer` commands as the SPI transaction budget requires.
+    ///
+    /// Chunking is a correctness requirement, not an optimisation — see
+    /// [`SX1262_MAX_SPI_COMMAND`]. `WriteBuffer` takes a FIFO offset, so the
+    /// split is invisible to the chip: it sees one contiguous payload.
+    fn write_buffer(&mut self, offset: u8, payload: &[u8]) -> Result<(), LoRaError> {
+        let mut written = 0;
+        while written < payload.len() {
+            let chunk = (payload.len() - written).min(FIFO_WRITE_CHUNK);
+            let mut args = Vec::with_capacity(chunk + 1);
+            args.push(offset.wrapping_add(written as u8));
+            args.extend_from_slice(&payload[written..written + chunk]);
+            self.write_command(CMD_WRITE_BUFFER, &args)?;
+            written += chunk;
+        }
+        Ok(())
+    }
+
+    /// Read `count` bytes from the FIFO starting at `offset`, in as many
+    /// `ReadBuffer` commands as the SPI transaction budget requires.
+    ///
+    /// Like [`Self::write_buffer`], this exists because a single oversized
+    /// transfer cannot survive an NSS gap between chunks. Without it the tail
+    /// of every received frame comes back as whatever the chip clocked out
+    /// while executing the continuation bytes as opcodes.
     fn read_buffer(&mut self, offset: u8, count: usize) -> Result<Vec<u8>, LoRaError> {
-        self.read_command(CMD_READ_BUFFER, count, &[offset])
+        let mut out = Vec::with_capacity(count);
+        let mut done = 0;
+        while done < count {
+            let chunk = (count - done).min(FIFO_READ_CHUNK);
+            let data =
+                self.read_command(CMD_READ_BUFFER, chunk, &[offset.wrapping_add(done as u8)])?;
+            out.extend_from_slice(&data);
+            done += chunk;
+        }
+        Ok(out)
     }
 
     fn get_rx_buffer_status(&mut self) -> Result<(usize, u8), LoRaError> {
@@ -1051,10 +1111,8 @@ impl LoRaChipset for SX1262 {
             self.get_status().unwrap_or(0)
         );
 
-        // Write payload to TX FIFO at offset 0
-        let mut write_args = vec![0x00];
-        write_args.extend_from_slice(payload);
-        self.write_command(CMD_WRITE_BUFFER, &write_args)?;
+        // Write payload to the TX FIFO at offset 0
+        self.write_buffer(0x00, payload)?;
         log::debug!(
             "sx1262: tx step status 0x{:02X} (after WriteBuffer)",
             self.get_status().unwrap_or(0)
@@ -1226,6 +1284,9 @@ impl LoRaChipset for SX1262 {
         // Handle RX done
         if irq_status & IRQ_RX_DONE != 0 {
             let (payload_len, start_ptr) = self.get_rx_buffer_status()?;
+            log::info!(
+                "sx1262: RX_DONE len={payload_len} start={start_ptr} irq=0x{irq_status:04X}",
+            );
             if payload_len > 0 {
                 let payload = self.read_buffer(start_ptr, payload_len)?;
                 let (rssi, snr, _signal_rssi) = self.get_packet_status()?;
@@ -1284,5 +1345,246 @@ impl LoRaChipset for SX1262 {
 impl Drop for SX1262 {
     fn drop(&mut self) {
         let _ = self.write_command(CMD_SET_STANDBY, &[STANDBY_RC]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    /// BUSY reads low (chip idle) so every bounded wait returns immediately
+    /// and the tests don't spend seconds asleep.
+    struct IdleBusy;
+
+    impl LoRaGpio for IdleBusy {
+        fn get_value(&self) -> Result<bool, LoRaError> {
+            Ok(false)
+        }
+        fn set_value(&self, _value: bool) -> Result<(), LoRaError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeState {
+        fifo: Vec<u8>,
+        fifo_len: usize,
+        irq: u16,
+        regs: Vec<u8>,
+        longest_xfer: usize,
+    }
+
+    /// Just enough SX1262 to exercise the FIFO paths: a FIFO, an IRQ word and
+    /// a register file.
+    ///
+    /// Each `xfer` is treated as exactly one SPI command, i.e. one NSS-low
+    /// window — which is the whole point. A backend that splits a transfer
+    /// (esp-idf-hal's `SpiDevice::transfer` chunks at the bus's
+    /// `max_transfer_sz` and drops NSS between chunks) therefore shows up here
+    /// as a command whose arguments or data run off the end of the transfer,
+    /// exactly as it would on real silicon.
+    struct FakeRadio(Arc<Mutex<FakeState>>);
+
+    impl FakeRadio {
+        fn new() -> Self {
+            let mut state = FakeState::default();
+            state.fifo = vec![0u8; 256];
+            state.regs = vec![0u8; 256];
+            FakeRadio(Arc::new(Mutex::new(state)))
+        }
+        /// Number of argument bytes and response bytes for a command, which the
+        /// driver clocks out as opcode, arguments, and — only for commands with
+        /// a response — one NOP before the response. So a command occupies
+        /// `1 + args + (resp > 0) * (1 + resp)` bytes on the wire, and its
+        /// response starts at wire byte `2 + args`.
+        fn signature(opcode: u8, rest: usize) -> Option<(usize, usize)> {
+            Some(match opcode {
+                CMD_WRITE_BUFFER | CMD_WRITE_REGISTER => (rest, 0),
+                CMD_READ_BUFFER => (1, rest.checked_sub(2)?),
+                CMD_READ_REGISTER => (2, rest.checked_sub(3)?),
+                CMD_SET_PACKET_PARAMS => (9, 0),
+                CMD_SET_DIO_IRQ_PARAMS => (8, 0),
+                CMD_SET_PA_CONFIG => (4, 0),
+                CMD_SET_DIO3_AS_TCXO_CTRL => (4, 0),
+                CMD_SET_RF_FREQUENCY => (4, 0),
+                CMD_SET_MODULATION_PARAMS => (4, 0),
+                CMD_SET_TX_PARAMS => (2, 0),
+                CMD_SET_BUFFER_BASE_ADDRESS => (2, 0),
+                CMD_SET_STANDBY
+                | CMD_SET_SLEEP
+                | CMD_SET_PACKET_TYPE
+                | CMD_SET_FS
+                | CMD_SET_REGULATOR_MODE
+                | CMD_SET_DIO2_AS_RF_SWITCH_CTRL
+                | CMD_CALIBRATE
+                | CMD_CLEAR_IRQ_STATUS
+                | CMD_CLEAR_DEVICE_ERRORS => (rest, 0),
+                CMD_SET_TX | CMD_SET_RX => (3, 0),
+                CMD_CALIBRATE_IMAGE => (2, 0),
+                CMD_GET_RX_BUFFER_STATUS => (0, 2),
+                CMD_GET_PACKET_STATUS => (0, 3),
+                CMD_GET_IRQ_STATUS | CMD_GET_DEVICE_ERRORS => (0, 2),
+                CMD_GET_STATUS | CMD_GET_RSSI_INST => (0, 1),
+                _ => return None,
+            })
+        }
+    }
+
+    impl LoRaSpi for FakeRadio {
+        fn xfer(&mut self, tx_buf: &[u8], rx_buf: &mut [u8]) -> Result<(), LoRaError> {
+            let mut state = self.0.lock().unwrap();
+            state.longest_xfer = state.longest_xfer.max(tx_buf.len());
+
+            let opcode = tx_buf[0];
+            let (args_len, resp_len) = FakeRadio::signature(opcode, tx_buf.len() - 1)
+                .ok_or_else(|| LoRaError::Spi(format!("unknown opcode 0x{opcode:02X}")))?;
+            let wire_len = 1 + args_len + usize::from(resp_len > 0) * (1 + resp_len);
+            let wire_ok = tx_buf.len() == wire_len && rx_buf.len() == wire_len;
+            if !wire_ok {
+                return Err(LoRaError::Spi(format!(
+                    "command 0x{opcode:02X} split by the SPI backend: {} bytes on the wire, \
+                     but it needs {wire_len} in one NSS window",
+                    tx_buf.len()
+                )));
+            }
+            let args = &tx_buf[1..1 + args_len];
+            let resp: &mut [u8] = if resp_len == 0 {
+                &mut []
+            } else {
+                &mut rx_buf[2 + args_len..2 + args_len + resp_len]
+            };
+
+            match tx_buf[0] {
+                CMD_WRITE_BUFFER => {
+                    let offset = args[0] as usize;
+                    state.fifo[offset..offset + args.len() - 1].copy_from_slice(&args[1..]);
+                }
+                CMD_READ_BUFFER => {
+                    let offset = args[0] as usize;
+                    resp.copy_from_slice(&state.fifo[offset..offset + resp.len()]);
+                }
+                CMD_WRITE_REGISTER => {
+                    let addr = u16::from_be_bytes([args[0], args[1]]);
+                    state.regs[(addr & 0xFF) as usize] = args[2];
+                }
+                CMD_READ_REGISTER => {
+                    let addr = u16::from_be_bytes([args[0], args[1]]);
+                    for (i, byte) in resp.iter_mut().enumerate() {
+                        *byte = state.regs[(addr as usize + i) & 0xFF];
+                    }
+                }
+                CMD_GET_STATUS => resp[0] = 0x30, // chip mode STDBY_XOSC
+                CMD_GET_IRQ_STATUS => {
+                    resp[..2].copy_from_slice(&state.irq.to_be_bytes());
+                }
+                CMD_CLEAR_IRQ_STATUS => {
+                    state.irq &= !u16::from_be_bytes([args[0], args[1]]);
+                }
+                CMD_GET_RX_BUFFER_STATUS => {
+                    resp[0] = state.fifo_len as u8;
+                    resp[1] = 0; // RX starts at FIFO offset 0
+                }
+                // The chip raises TX_DONE once it leaves the TX window.
+                CMD_SET_TX => state.irq = IRQ_TX_DONE,
+                CMD_SET_RX => state.irq &= !IRQ_RX_DONE,
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    /// A chipset wired to a [`FakeRadio`], plus a handle onto the radio's state
+    /// so tests can inspect it after the chipset has taken ownership.
+    fn chipset() -> (SX1262, Arc<Mutex<FakeState>>) {
+        let radio = FakeRadio::new();
+        let state = radio.0.clone();
+
+        let mut gpio = GpioPins::none();
+        gpio.busy = Some(Box::new(IdleBusy));
+
+        let mut chipset = SX1262::new(Box::new(radio), gpio);
+        chipset.config = Some(
+            LoRaConfig::new("", 869_525_000, 125_000.0, 14, 8, 5)
+                .with_tcxo_voltage(1.8)
+                .with_tcxo_startup_delay(Duration::from_millis(1)),
+        );
+        (chipset, state)
+    }
+
+    /// Every SPI command must fit inside one NSS-low window, and a full-size
+    /// frame must still reach the FIFO intact.
+    #[test]
+    fn transmit_keeps_fifo_writes_within_one_spi_transaction() {
+        let (mut chipset, state) = chipset();
+        let payload: Vec<u8> = (0..MAX_PAYLOAD_LEN as u8).collect();
+
+        // Drop the chipset before inspecting the result: a failing transmit
+        // leaves the fake radio's mutex poisoned, and SX1262::drop talks to the
+        // chip, which would turn a clean failure into an abort.
+        let result = chipset.transmit(&payload);
+        drop(chipset);
+        result.expect("transmit");
+
+        let state = state.lock().unwrap();
+        assert!(
+            state.longest_xfer <= SX1262_MAX_SPI_COMMAND,
+            "longest SPI transaction was {} bytes, budget is {SX1262_MAX_SPI_COMMAND} — \
+             the SPI backend is splitting commands and the chip will see NSS gaps",
+            state.longest_xfer
+        );
+        assert_eq!(
+            &state.fifo[..payload.len()],
+            &payload[..],
+            "payload did not land in the FIFO contiguously"
+        );
+    }
+
+    /// The mirror image: a full-size frame must come back out of the FIFO
+    /// intact, not truncated at the first NSS gap.
+    #[test]
+    fn receive_keeps_fifo_reads_within_one_spi_transaction() {
+        let (mut chipset, state) = chipset();
+        let payload: Vec<u8> = (0..MAX_PAYLOAD_LEN as u8).collect();
+
+        {
+            let mut state = state.lock().unwrap();
+            state.fifo[..payload.len()].copy_from_slice(&payload);
+            state.fifo_len = payload.len();
+            state.irq = IRQ_RX_DONE;
+        }
+
+        let packets = chipset.process_irq().expect("process_irq");
+
+        assert_eq!(packets.len(), 1, "expected one received frame");
+        assert_eq!(
+            packets[0].payload, payload,
+            "received frame came back truncated"
+        );
+        assert!(
+            state.lock().unwrap().longest_xfer <= SX1262_MAX_SPI_COMMAND,
+            "longest SPI transaction exceeded the {SX1262_MAX_SPI_COMMAND} byte budget"
+        );
+    }
+
+    /// A round trip through the same command path both ways, which is the
+    /// shape an actual on-air frame takes.
+    #[test]
+    fn fifo_round_trip_survives_a_64_byte_spi_budget() {
+        let (mut chipset, state) = chipset();
+        let payload: Vec<u8> = (0..=255u8).collect();
+
+        chipset.transmit(&payload[..255]).expect("transmit");
+
+        // Hand the transmitted frame straight back as if it had arrived.
+        {
+            let mut state = state.lock().unwrap();
+            state.fifo_len = 255;
+            state.irq = IRQ_RX_DONE;
+        }
+
+        let packets = chipset.process_irq().expect("process_irq");
+        assert_eq!(packets[0].payload, payload[..255]);
     }
 }

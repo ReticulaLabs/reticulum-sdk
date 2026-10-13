@@ -989,6 +989,15 @@ impl<C: LoRaChipset + 'static> LoRaInterface<C> {
                                 };
                                 match decode_rx(ifac_config.as_ref(), &framed) {
                                     Ok(packet) => {
+                                        log::info!(
+                                            "lora_interface: rx {} bytes hdr={:#04X} ptype={:?} dst={} hops={} ctx={:?}",
+                                            framed.len(),
+                                            pkt.payload.first().copied().unwrap_or(0),
+                                            packet.header.packet_type,
+                                            packet.destination,
+                                            packet.header.hops,
+                                            packet.context,
+                                        );
                                         stats.record_rx_packet();
                                         let _ = rx_channel
                                             .send(RxMessage {

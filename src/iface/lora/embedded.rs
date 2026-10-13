@@ -24,6 +24,29 @@
 //! let config = LoRaConfig::new("", 868_000_000, 125_000.0, 14, 7, 5)
 //!     .with_embedded_hw(hw);
 //! ```
+//!
+//! # SPI transaction size
+//!
+//! LoRa chipsets are driven with chip-select held low for the whole of every
+//! SPI command: the SX126x in particular latches nothing until NSS rises, and
+//! reads the byte after that rising edge as the start of a *new* command.
+//!
+//! Some HALs honour that and some do not. esp-idf-hal's
+//! [`SpiDevice::transfer`] splits a transfer into chunks of the bus's
+//! `max_transfer_sz` — 64 bytes unless the bus was configured with DMA — and
+//! runs each chunk as its own transaction without `SPI_TRANS_CS_KEEP_ACTIVE`,
+//! so NSS goes high between them. A single oversized `transfer()` is therefore
+//! delivered to the radio as several truncated commands.
+//!
+//! [`EmbeddedSpi`] does not rely on the HAL to respect that. The SX1262 driver
+//! chunks its two payload-sized commands itself and keeps every other command
+//! short, so a 64-byte transfer budget is enough. The SX1276 and LR1121 drivers
+//! cannot do this: their FIFOs are not addressable by offset, so they emit a
+//! single `WriteFifo`/`ReadFifo` of up to 255/508 bytes and need a bus that can
+//! complete that in one transaction (`SpiDriverConfig::new().dma(Dma::Channel2(512))`
+//! on esp-idf-hal).
+//!
+//! [`SpiDevice::transfer`]: embedded_hal::spi::SpiDevice::transfer
 
 use std::sync::{Arc, Mutex};
 
