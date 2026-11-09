@@ -427,8 +427,11 @@ impl SendCtx {
         let pt = self.path_table.read().unwrap();
         let (packet, maybe_iface) = pt.handle_packet(packet);
         let tx_type = if let Some(iface) = maybe_iface {
+            let refresh_due = pt.refresh_due(&destination);
             drop(pt);
-            self.path_table.write().unwrap().refresh(&destination);
+            if refresh_due {
+                self.path_table.write().unwrap().refresh(&destination);
+            }
             TxMessageType::Direct(iface)
         } else {
             TxMessageType::Broadcast(None)
@@ -3528,7 +3531,15 @@ async fn send_to_next_hop(
     already_cached: bool,
 ) {
     let dst = packet.destination;
-    handler.send_ctx.path_table.write().unwrap().refresh(&dst);
+    let refresh_due = handler
+        .send_ctx
+        .path_table
+        .read()
+        .unwrap()
+        .refresh_due(&dst);
+    if refresh_due {
+        handler.send_ctx.path_table.write().unwrap().refresh(&dst);
+    }
     let message = TxMessage {
         tx_type: TxMessageType::Direct(iface),
         packet,

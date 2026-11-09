@@ -13,6 +13,14 @@ use crate::{
 const MAX_RANDOM_BLOBS: usize = 64;
 const ANNOUNCE_RANDOM_BLOB_OFFSET: usize = PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH;
 
+/// Minimum interval between expiry refreshes on an actively used path.
+///
+/// Forwarding a packet previously took the path-table write lock on every
+/// packet just to extend a multi-day expiry.  Refreshing at most once per
+/// second preserves "active paths stay alive" while leaving the table
+/// effectively read-only on the forwarding hot path.
+const PATH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 type RandomBlob = [u8; RAND_HASH_LENGTH];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -309,6 +317,17 @@ self_referential_transport={}",
         }
     }
 
+    /// Whether an actively used path is due for an expiry refresh.
+    ///
+    /// Hot-path forwarding checks this under the existing read lock and only
+    /// takes the write lock when a refresh is actually due.
+    pub fn refresh_due(&self, destination: &AddressHash) -> bool {
+        self.map
+            .get(destination)
+            .map(|entry| entry.timestamp.elapsed() >= PATH_REFRESH_INTERVAL)
+            .unwrap_or(false)
+    }
+
     /// In-place update of a path's hop count, used for link-proof rebalancing.
     ///
     /// When a link-request proof (LRPROOF) is received for a destination, the
@@ -582,7 +601,7 @@ fn timebase_from_random_blob(random_blob: RandomBlob) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::PathTable;
+    use super::{PATH_REFRESH_INTERVAL, PathTable};
     use crate::{
         hash::AddressHash,
         packet::{
@@ -1417,6 +1436,28 @@ mod tests {
             0,
             None,
         );
+    }
+
+    #[test]
+    fn refresh_due_is_throttled() {
+        let destination = AddressHash::new_from_slice(b"refresh-destination");
+        let iface = AddressHash::new_from_slice(b"refresh-iface");
+        let mut table = PathTable::new(false);
+
+        install_announce_with_hops(&mut table, destination, iface, 1);
+
+        // A freshly installed path is not due for another refresh.
+        assert!(!table.refresh_due(&destination));
+        assert!(!table.refresh_due(&AddressHash::new_from_slice(b"unknown")));
+
+        // Once the interval has elapsed, the path is due and a refresh resets
+        // the throttle without changing any other routing state.
+        table.map.get_mut(&destination).unwrap().timestamp =
+            Instant::now() - PATH_REFRESH_INTERVAL - Duration::from_millis(1);
+        assert!(table.refresh_due(&destination));
+
+        table.refresh(&destination);
+        assert!(!table.refresh_due(&destination));
     }
 
     #[test]
