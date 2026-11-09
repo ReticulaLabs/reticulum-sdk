@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use portable_atomic::AtomicU64;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -1109,14 +1109,27 @@ struct AnnouncePacer {
 
 struct AnnouncePacerState {
     announce_allowed_at: Instant,
-    announce_queue: VecDeque<AddressHash>,
+    /// Hop-prioritized queue of queued announces.  The tuple orders by hop
+    /// count first, then by the destination's original enqueue order, so the
+    /// lowest-hop announce is selected in O(log n) without scanning the queue.
+    announce_queue: BTreeSet<(u8, u64, AddressHash)>,
     /// Queued announce messages alongside the pacing interval computed
     /// at enqueue time, so the dequeue path can read it without re-
     /// acquiring the channel_load mutex inside wait_time().
-    announce_data: HashMap<AddressHash, (TxMessage, Duration)>,
+    announce_data: HashMap<AddressHash, QueuedAnnounce>,
+    next_order: u64,
     timer_active: bool,
     next_queue_warn_at: Instant,
     last_queue_warn_len: usize,
+}
+
+struct QueuedAnnounce {
+    message: TxMessage,
+    wait_time: Duration,
+    hops: u8,
+    /// First-enqueue order, preserved across updates so packets at the same
+    /// hop count retain FIFO ordering, matching the previous VecDeque queue.
+    order: u64,
 }
 
 impl AnnouncePacer {
@@ -1128,8 +1141,9 @@ impl AnnouncePacer {
             iface: None,
             state: Arc::new(tokio::sync::Mutex::new(AnnouncePacerState {
                 announce_allowed_at: Instant::now(),
-                announce_queue: VecDeque::new(),
+                announce_queue: BTreeSet::new(),
                 announce_data: HashMap::new(),
+                next_order: 0,
                 timer_active: false,
                 next_queue_warn_at: Instant::now(),
                 last_queue_warn_len: 0,
@@ -1214,14 +1228,45 @@ impl AnnouncePacer {
         }
 
         let dest = message.packet.destination;
-        if state.announce_data.contains_key(&dest) {
-            state.announce_data.insert(dest, (message, wait_time));
-        } else if state.announce_queue.len() < MAX_QUEUED_ANNOUNCES {
-            state.announce_queue.push_back(dest);
-            state.announce_data.insert(dest, (message, wait_time));
+        let hops = message.packet.header.hops;
+
+        if let Some((old_hops, order)) = state
+            .announce_data
+            .get(&dest)
+            .map(|entry| (entry.hops, entry.order))
+        {
+            // Update in place.  Keep the original enqueue order to preserve
+            // FIFO ordering among packets at the same hop count.  Only touch
+            // the priority queue when the hop count actually changes.
+            if old_hops != hops {
+                state.announce_queue.remove(&(old_hops, order, dest));
+                state.announce_queue.insert((hops, order, dest));
+            }
+            state.announce_data.insert(
+                dest,
+                QueuedAnnounce {
+                    message,
+                    wait_time,
+                    hops,
+                    order,
+                },
+            );
+        } else if state.announce_data.len() < MAX_QUEUED_ANNOUNCES {
+            let order = state.next_order;
+            state.next_order = state.next_order.wrapping_add(1);
+            state.announce_queue.insert((hops, order, dest));
+            state.announce_data.insert(
+                dest,
+                QueuedAnnounce {
+                    message,
+                    wait_time,
+                    hops,
+                    order,
+                },
+            );
         }
 
-        let qlen = state.announce_queue.len();
+        let qlen = state.announce_data.len();
         if qlen >= QUEUE_WARN_THRESHOLD
             && qlen > state.last_queue_warn_len
             && now >= state.next_queue_warn_at
@@ -1275,26 +1320,17 @@ async fn process_announce_queue(
                 continue;
             }
 
-            // Pop the queued announce with the lowest hop count,
-            // matching Python's hop-prioritized announce queue.
-            let min_idx = state.announce_queue.iter().enumerate().filter_map(|(i, dest)| {
-                state.announce_data.get(dest).map(|(msg, _)| (i, msg.packet.header.hops))
-            }).min_by_key(|&(_, hops)| hops);
+            // Pop the queued announce with the lowest hop count, matching
+            // Python's hop-prioritized announce queue.  The BTreeSet orders by
+            // (hops, enqueue order), so this is O(log n) instead of scanning
+            // every queued destination.
+            let next_key = state.announce_queue.pop_first();
+            let next = next_key.and_then(|(_, _, dest)| state.announce_data.remove(&dest));
 
-            match min_idx {
-                Some((idx, _)) => {
-                    if let Some(dest) = state.announce_queue.remove(idx) {
-                        if let Some((message, wait_time)) = state.announce_data.remove(&dest) {
-                            state.announce_allowed_at = now + wait_time;
-                            Some(message)
-                        } else {
-                            state.timer_active = false;
-                            None
-                        }
-                    } else {
-                        state.timer_active = false;
-                        None
-                    }
+            match next {
+                Some(queued) => {
+                    state.announce_allowed_at = now + queued.wait_time;
+                    Some(queued.message)
                 }
                 None => {
                     state.timer_active = false;
@@ -3074,6 +3110,65 @@ mod tests {
 
         assert_eq!(receiver.try_recv().unwrap().packet.data.as_slice(), &[2]);
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn announce_queue_dequeues_lowest_hops_first() {
+        let mut manager = InterfaceManager::new(1);
+        let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
+        let mut receiver = channel.tx_channel;
+
+        // First announce is sent immediately and opens a pacing window.
+        manager.send(announce(1, 1, &[0])).await;
+        assert_eq!(receiver.try_recv().unwrap().packet.data.as_slice(), &[0]);
+
+        // Queue one announce per hop count, deliberately out of hop order.
+        manager.send(announce(2, 5, &[2])).await;
+        manager.send(announce(3, 1, &[3])).await;
+        manager.send(announce(4, 3, &[4])).await;
+        assert_eq!(manager.queue_lengths().await.interfaces[0].announce, 3);
+
+        // Lowest hop count drains first, then next-lowest, then highest.
+        for expected in [3u8, 4, 2] {
+            time::advance(Duration::from_secs(1)).await;
+            task::yield_now().await;
+            assert_eq!(
+                receiver.try_recv().unwrap().packet.data.as_slice(),
+                &[expected]
+            );
+        }
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn announce_queue_rebuckets_updated_destination_by_hop() {
+        let mut manager = InterfaceManager::new(1);
+        let pacer = AnnouncePacer::new(10_000.0, DEFAULT_ANNOUNCE_CAP);
+        let channel = manager.new_channel_with_pacer(4, Some(pacer), false, None, None, None, None, InterfaceMode::Full, 0, true, false, true, Arc::new(Mutex::new(0.0)), Arc::new(AtomicU64::new(0)), String::new(), String::new());
+        let mut receiver = channel.tx_channel;
+
+        manager.send(announce(1, 1, &[0])).await;
+        assert_eq!(receiver.try_recv().unwrap().packet.data.as_slice(), &[0]);
+
+        manager.send(announce(2, 5, &[0x20])).await;
+        manager.send(announce(3, 3, &[3])).await;
+
+        // Destination 2 is updated with a lower hop count: it must move to
+        // the front of the hop ordering with its latest payload.
+        manager.send(announce(2, 1, &[0x22])).await;
+        assert_eq!(manager.queue_lengths().await.interfaces[0].announce, 2);
+
+        time::advance(Duration::from_secs(1)).await;
+        task::yield_now().await;
+        assert_eq!(
+            receiver.try_recv().unwrap().packet.data.as_slice(),
+            &[0x22]
+        );
+
+        time::advance(Duration::from_secs(1)).await;
+        task::yield_now().await;
+        assert_eq!(receiver.try_recv().unwrap().packet.data.as_slice(), &[3]);
     }
 
     // ------------------------------------------------------------------
