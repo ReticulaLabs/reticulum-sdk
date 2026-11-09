@@ -330,6 +330,7 @@ async fn read_loop<R>(
                                     } else {
                                         log::warn!("kiss_interface: couldn't decode packet");
                                     }
+                                    decoder.recycle(data);
                                 }
                                 Some(KissEvent::Ready) => {
                                     let _ = ready_send.send(()).await;
@@ -537,6 +538,15 @@ impl KissDecoder {
             self.escape = false;
             self.command = CMD_UNKNOWN;
             self.data.clear();
+        }
+    }
+
+    /// Return a completed frame's allocation to the decoder so the next frame
+    /// can reuse it instead of growing a fresh Vec from zero.
+    fn recycle(&mut self, mut data: Vec<u8>) {
+        data.clear();
+        if data.capacity() > self.data.capacity() {
+            self.data = data;
         }
     }
 }

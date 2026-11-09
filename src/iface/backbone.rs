@@ -552,12 +552,12 @@ impl BackboneClient {
                                         while let Some(frame) = Hdlc::find(&frame_buffer[consumed..]) {
                                             let start = consumed + frame.0;
                                             let end = consumed + frame.1;
-                                            let frame_bytes = frame_buffer[start..end + 1].to_vec();
+                                            let frame_len = end - start + 1;
                                             consumed = end + 1;
 
-                                            hdlc_rx_buffer.resize(frame_bytes.len(), 0);
+                                            hdlc_rx_buffer.resize(frame_len, 0);
                                             let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
-                                            match Hdlc::decode(&frame_bytes, &mut output) {
+                                            match Hdlc::decode(&frame_buffer[start..end + 1], &mut output) {
                                                 Ok(decoded_len) => {
                                                     let decoded = output.as_slice();
                                                     let min_decoded_len = minimum_decoded_packet_len(decoded);
@@ -618,7 +618,7 @@ impl BackboneClient {
                                                         frame.1,
                                                         frame.1 - frame.0 + 1,
                                                         err,
-                                                        hex_preview(&frame_bytes, DECODE_FAILURE_HEX_PREVIEW_LEN),
+                                                        hex_preview(&frame_buffer[start..end + 1], DECODE_FAILURE_HEX_PREVIEW_LEN),
                                                     );
                                                 }
                                             }

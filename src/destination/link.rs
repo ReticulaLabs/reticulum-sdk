@@ -124,6 +124,11 @@ impl LinkPayload {
         }
     }
 
+    /// Construct a payload by taking ownership of an existing buffer.
+    pub fn from_vec(buffer: Vec<u8>) -> Self {
+        Self { buffer }
+    }
+
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
@@ -543,8 +548,8 @@ impl Link {
                 if let Ok(plain_text) = self.decrypt_into_owned(packet.data.as_slice()) {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
-                    self.post_event(LinkEvent::Data(Box::new(LinkPayload::new_from_vec(
-                        &plain_text,
+                    self.post_event(LinkEvent::Data(Box::new(LinkPayload::from_vec(
+                        plain_text,
                     ))));
 
                     let proof = if self.proves_messages {
@@ -624,7 +629,7 @@ impl Link {
                         None
                     };
                     if let Some(ref tx) = self.channel_tx {
-                        let _ = tx.send(plain_text.clone());
+                        let _ = tx.send(plain_text);
                         self.request_time = Instant::now();
                         return LinkHandleResult::MessageReceived(proof);
                     }

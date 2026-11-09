@@ -4,7 +4,9 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::error::RnsError;
-use crate::packet::{Header, IfacFlag, Packet, PacketIfac};
+use crate::packet::{
+    Header, IfacFlag, PACKET_IFAC_MAX_LENGTH, Packet, PacketIfac, RETICULUM_MTU,
+};
 
 /// IFAC derivation salt, matching `RNS.Reticulum.IFAC_SALT` in the Python
 /// reference implementation (`RNS/Reticulum.py`).
@@ -46,11 +48,13 @@ pub struct IfacConfig {
 
 /// Derive the HKDF-SHA256 stream: PRK = HMAC(salt, ikm), then standard
 /// HKDF-Expand with an empty context.
-fn hkdf_stream(salt: &[u8], ikm: &[u8], length: usize) -> Vec<u8> {
-    let mut out = vec![0u8; length];
-    let _ = Hkdf::<Sha256>::new(Some(salt), ikm).expand(&[], &mut out[..]);
-    out
+fn hkdf_stream_into(salt: &[u8], ikm: &[u8], out: &mut [u8]) {
+    let _ = Hkdf::<Sha256>::new(Some(salt), ikm).expand(&[], out);
 }
+
+/// Stack capacity for the IFAC XOR mask.  A normal Reticulum frame fits here,
+/// so the common path needs no heap allocation for the keystream.
+const IFAC_MASK_STACK_LEN: usize = RETICULUM_MTU + PACKET_IFAC_MAX_LENGTH;
 
 impl IfacConfig {
     /// Derive an IFAC identity from a network name and optional key, using
@@ -142,7 +146,15 @@ impl IfacConfig {
         }
 
         let ifac = &frame[2..2 + self.ifac_len];
-        let mask = hkdf_stream(&self.ifac_key, ifac, frame.len());
+        let mut stack_mask = [0u8; IFAC_MASK_STACK_LEN];
+        let mut heap_mask = Vec::new();
+        let mask: &mut [u8] = if frame.len() <= IFAC_MASK_STACK_LEN {
+            &mut stack_mask[..frame.len()]
+        } else {
+            heap_mask.resize(frame.len(), 0);
+            &mut heap_mask[..]
+        };
+        hkdf_stream_into(&self.ifac_key, ifac, mask);
 
         for (i, byte) in frame.iter_mut().enumerate() {
             if i == 0 {
@@ -168,21 +180,26 @@ impl IfacConfig {
         }
 
         let ifac = &frame[2..2 + self.ifac_len];
-        let mask = hkdf_stream(&self.ifac_key, ifac, frame.len());
-
-        let mut unmasked = frame.to_vec();
-        for (i, byte) in unmasked.iter_mut().enumerate() {
-            if i <= 1 || i > self.ifac_len + 1 {
-                *byte ^= mask[i];
-            }
-        }
+        let mut stack_mask = [0u8; IFAC_MASK_STACK_LEN];
+        let mut heap_mask = Vec::new();
+        let mask: &mut [u8] = if frame.len() <= IFAC_MASK_STACK_LEN {
+            &mut stack_mask[..frame.len()]
+        } else {
+            heap_mask.resize(frame.len(), 0);
+            &mut heap_mask[..]
+        };
+        hkdf_stream_into(&self.ifac_key, ifac, mask);
 
         // Re-assemble the packet without the IFAC field, with the IFAC
         // flag cleared, exactly like Python's `new_header + raw[2+ifac_size:]`.
+        // Unmask directly into the output instead of making an intermediate
+        // copy of the whole frame.
         let mut clean = Vec::with_capacity(frame.len() - self.ifac_len);
-        clean.push(unmasked[0] & 0x7f);
-        clean.push(unmasked[1]);
-        clean.extend_from_slice(&unmasked[2 + self.ifac_len..]);
+        clean.push((frame[0] ^ mask[0]) & 0x7f);
+        clean.push(frame[1] ^ mask[1]);
+        for i in (2 + self.ifac_len)..frame.len() {
+            clean.push(frame[i] ^ mask[i]);
+        }
 
         // The signature is over the clean packet; truncated from the end.
         let expected = self.sign_key.sign(&clean);
@@ -480,6 +497,47 @@ mod tests {
 
         let result = config.verify_packet(&packet);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_frame_handles_frames_larger_than_stack_mask() {
+        use crate::buffer::OutputBuffer;
+        use crate::serde::Serialize;
+
+        let config = IfacConfig::derive(Some("large_frame"), None, 16);
+        let payload = vec![0x5a; IFAC_MASK_STACK_LEN + 64];
+
+        let mut packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type1,
+                propagation_type: PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 0,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: AddressHash::new([0x09; 16]),
+            transport: None,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(&payload),
+        };
+
+        config.attach(&mut packet).expect("attach ifac");
+
+        let mut buf = vec![0u8; IFAC_MASK_STACK_LEN + 256];
+        let mut output = OutputBuffer::new(&mut buf);
+        packet.serialize(&mut output).expect("serialize");
+        let frame_len = output.offset();
+
+        let mut frame = buf[..frame_len].to_vec();
+        config.mask_frame(&mut frame).expect("mask frame");
+        let clean = config.decode_frame(&frame).expect("decode frame");
+
+        // The decoded frame has the IFAC field removed and the IFAC flag
+        // cleared; its payload length must survive the heap-mask fallback.
+        assert_eq!(clean.len(), frame_len - config.ifac_len());
     }
 
     #[test]

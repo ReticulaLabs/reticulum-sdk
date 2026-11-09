@@ -666,6 +666,7 @@ async fn read_loop(
                                     }
                                     Err(_) => log::warn!("modem73_interface: couldn't decode packet"),
                                 }
+                                decoder.recycle(data);
                             }
                         }
                     }
@@ -810,6 +811,15 @@ impl KissDecoder {
         }
         self.data.push(byte);
         None
+    }
+
+    /// Return a completed frame's allocation to the decoder so the next frame
+    /// can reuse it instead of growing a fresh Vec from zero.
+    fn recycle(&mut self, mut data: Vec<u8>) {
+        data.clear();
+        if data.capacity() > self.data.capacity() {
+            self.data = data;
+        }
     }
 }
 

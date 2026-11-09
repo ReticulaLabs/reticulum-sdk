@@ -278,6 +278,15 @@ impl HdlcDecoder {
             self.data.clear();
         }
     }
+
+    /// Return a completed frame's allocation to the decoder so the next frame
+    /// can reuse it instead of growing a fresh Vec from zero.
+    fn recycle(&mut self, mut frame: Vec<u8>) {
+        frame.clear();
+        if frame.capacity() > self.data.capacity() {
+            self.data = frame;
+        }
+    }
 }
 
 async fn read_loop<R>(
@@ -317,6 +326,7 @@ async fn read_loop<R>(
                                 } else {
                                     log::warn!("serial_interface: couldn't decode packet");
                                 }
+                                decoder.recycle(frame);
                             }
                         }
                     }
@@ -374,6 +384,7 @@ async fn read_loop_byte<R>(
                                     } else {
                                         log::warn!("serial_interface: couldn't decode packet");
                                     }
+                                    decoder.recycle(frame);
                                 }
                             }
                         }

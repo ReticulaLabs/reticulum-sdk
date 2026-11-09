@@ -594,6 +594,15 @@ impl KissDecoder {
         self.payload.push(byte);
         None
     }
+
+    /// Return a completed frame's payload allocation to the decoder so the
+    /// next frame can reuse it instead of growing a fresh Vec from zero.
+    fn recycle(&mut self, mut payload: Vec<u8>) {
+        payload.clear();
+        if payload.capacity() > self.payload.capacity() {
+            self.payload = payload;
+        }
+    }
 }
 
 async fn open_serial(config: &RNodeConfig) -> Result<SerialStream, tokio_serial::Error> {
@@ -841,7 +850,7 @@ async fn read_loop<R>(
                         for &byte in &buffer[..n] {
                             if let Some(frame) = decoder.push(byte) {
                                 if !handle_frame(
-                                    frame,
+                                    &frame,
                                     iface_address,
                                     &rx_channel,
                                     &state,
@@ -853,6 +862,7 @@ async fn read_loop<R>(
                                     stop.cancel();
                                     break;
                                 }
+                                decoder.recycle(frame.payload);
                             }
                         }
                     }
@@ -872,7 +882,7 @@ async fn read_loop<R>(
 }
 
 async fn handle_frame(
-    frame: KissFrame,
+    frame: &KissFrame,
     iface_address: crate::hash::AddressHash,
     rx_channel: &crate::iface::InterfaceRxSender,
     state: &Arc<tokio::sync::Mutex<RNodeState>>,
@@ -925,7 +935,7 @@ async fn handle_frame(
 }
 
 async fn update_command_state(
-    frame: KissFrame,
+    frame: &KissFrame,
     state: &Arc<tokio::sync::Mutex<RNodeState>>,
     ready: &Arc<Notify>,
 ) -> bool {
@@ -1338,7 +1348,7 @@ mod tests {
 
         assert!(
             update_command_state(
-                KissFrame {
+                &KissFrame {
                     command: kiss::CMD_STAT_RSSI,
                     payload: vec![200],
                 },
@@ -1349,7 +1359,7 @@ mod tests {
         );
         assert!(
             update_command_state(
-                KissFrame {
+                &KissFrame {
                     command: kiss::CMD_STAT_SNR,
                     payload: vec![0xf8],
                 },
@@ -1360,7 +1370,7 @@ mod tests {
         );
         assert!(
             update_command_state(
-                KissFrame {
+                &KissFrame {
                     command: kiss::CMD_STAT_CHTM,
                     payload: vec![
                         0x04, 0xd2, 0x09, 0xc4, 0x00, 0x64, 0x00, 0xc8, 180, 120, 0xff
@@ -1373,7 +1383,7 @@ mod tests {
         );
         assert!(
             update_command_state(
-                KissFrame {
+                &KissFrame {
                     command: kiss::CMD_STAT_BAT,
                     payload: vec![0x02, 150],
                 },
@@ -1384,7 +1394,7 @@ mod tests {
         );
         assert!(
             update_command_state(
-                KissFrame {
+                &KissFrame {
                     command: kiss::CMD_STAT_TEMP,
                     payload: vec![145],
                 },
@@ -1416,7 +1426,7 @@ mod tests {
 
         assert!(
             update_command_state(
-                KissFrame {
+                &KissFrame {
                     command: kiss::CMD_ERROR,
                     payload: vec![kiss::ERROR_MEMORY_LOW],
                 },
@@ -1427,7 +1437,7 @@ mod tests {
         );
         assert!(
             !update_command_state(
-                KissFrame {
+                &KissFrame {
                     command: kiss::CMD_ERROR,
                     payload: vec![kiss::ERROR_TXFAILED],
                 },
