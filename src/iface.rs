@@ -1927,6 +1927,35 @@ impl InterfaceManager {
         Some(iface)
     }
 
+    /// The interfaces a message can be transmitted on.  For a `Direct`
+    /// message this is the single target interface, resolved through the
+    /// index instead of scanning all interfaces; broadcasts still iterate
+    /// the full set.
+    fn candidate_ifaces(&self, tx_type: TxMessageType) -> &[LocalInterface] {
+        match tx_type {
+            TxMessageType::Direct(address) => {
+                if let Some(&idx) = self.iface_index.get(&address) {
+                    if let Some(iface) = self
+                        .ifaces
+                        .get(idx)
+                        .filter(|iface| iface.address == address)
+                    {
+                        return std::slice::from_ref(iface);
+                    }
+                }
+
+                // Defensive fallback: the index should always be in sync, but
+                // preserve the old linear-lookup behaviour if it is not.
+                self.ifaces
+                    .iter()
+                    .find(|iface| iface.address == address)
+                    .map(std::slice::from_ref)
+                    .unwrap_or(&[])
+            }
+            _ => &self.ifaces,
+        }
+    }
+
     /// Return whether the interface at `address` has recursive path
     /// requests enabled.  Returns `false` if the interface is not found
     /// or cancelled.  Matches Python's `Interface.recursive_prs`.
@@ -2104,7 +2133,7 @@ impl InterfaceManager {
     /// hold the `InterfaceManager` lock and block other interfaces.
     pub async fn send_pacing_delay(&self, message: &TxMessage) -> Duration {
         let mut max_wait = Duration::ZERO;
-        for iface in &self.ifaces {
+        for iface in self.candidate_ifaces(message.tx_type) {
             let should_send = match message.tx_type {
                 TxMessageType::Broadcast(Some(address)) => address != iface.address,
                 TxMessageType::Broadcast(None) | TxMessageType::BroadcastFrom(_) => true,
@@ -2170,7 +2199,7 @@ impl InterfaceManager {
         };
         let is_local = self.is_local_destination(&message.packet.destination);
 
-        for iface in &self.ifaces {
+        for iface in self.candidate_ifaces(message.tx_type) {
             let should_send = match message.tx_type {
                 TxMessageType::Broadcast(Some(address)) => address != iface.address,
                 TxMessageType::Broadcast(None) | TxMessageType::BroadcastFrom(_) => true,
@@ -3345,6 +3374,35 @@ mod tests {
 
         // Without IFAC configured, a frame carrying the IFAC flag is dropped.
         assert!(decode_rx(None, &frame[..len]).is_err());
+    }
+
+    #[test]
+    fn candidate_ifaces_resolves_direct_messages_through_index() {
+        let h = ModeTestHarness::new();
+        let full = h.ifaces[0].1;
+        let ap = h.ifaces[3].1;
+
+        let direct = h.mgr.candidate_ifaces(TxMessageType::Direct(full));
+        assert_eq!(direct.len(), 1, "a direct message has one candidate");
+        assert_eq!(direct[0].address, full);
+
+        let direct = h.mgr.candidate_ifaces(TxMessageType::Direct(ap));
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].address, ap);
+
+        let unknown = AddressHash::new([0xff; 16]);
+        assert!(
+            h.mgr
+                .candidate_ifaces(TxMessageType::Direct(unknown))
+                .is_empty(),
+            "an unknown direct target has no candidates"
+        );
+
+        assert_eq!(
+            h.mgr.candidate_ifaces(TxMessageType::Broadcast(None)).len(),
+            4,
+            "broadcasts still consider every interface"
+        );
     }
 
     #[tokio::test]
