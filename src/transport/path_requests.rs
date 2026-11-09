@@ -33,6 +33,9 @@ pub type TagBytes = Vec<u8>;
 const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const PATH_REQUEST_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DISCOVERY_PATH_REQUEST_TAGS: usize = 32_000;
+/// Stale discovery-order entries tolerated beyond the live discovery map size
+/// before the queue is compacted.
+const DISCOVERY_ORDER_COMPACT_SLACK: usize = 1024;
 
 pub fn create_random_tag() -> TagBytes {
     let mut rng = UnwrapErr(SysRng);
@@ -49,6 +52,9 @@ pub struct PathRequest {
 pub struct DiscoveryPathRequest {
     pub timeout: Instant,
     pub requesting_iface: AddressHash,
+    /// Monotonically increasing insertion stamp, used to discard stale
+    /// expiry-queue entries when a destination is requested again.
+    seq: u64,
 }
 
 impl PathRequest {
@@ -102,6 +108,11 @@ pub struct PathRequests {
     transport_id: Option<AddressHash>,
     controlled_destination: PlainInputDestination,
     discovery: BTreeMap<AddressHash, DiscoveryPathRequest>,
+    /// Insertion-ordered `(seq, destination)` queue for pending discovery
+    /// requests.  All entries use the same fixed timeout, so insertion order
+    /// is also expiry order.
+    discovery_order: VecDeque<(u64, AddressHash)>,
+    next_discovery_seq: u64,
 }
 
 impl PathRequests {
@@ -113,6 +124,8 @@ impl PathRequests {
             transport_id,
             controlled_destination: create_path_request_destination(),
             discovery: BTreeMap::new(),
+            discovery_order: VecDeque::new(),
+            next_discovery_seq: 0,
         }
     }
 
@@ -144,14 +157,64 @@ impl PathRequests {
     fn release_expired(&mut self) {
         let now = Instant::now();
 
-        self.cache.retain(|_, expires| *expires > now);
-        self.discovery.retain(|_, request| request.timeout > now);
-
+        // Cache entries use a fixed gate timeout, so insertion order is also
+        // expiry order.  Expire from the front rather than sweeping the whole
+        // map (which can hold MAX_DISCOVERY_PATH_REQUEST_TAGS entries).
         while let Some(tag) = self.cache_order.front() {
-            if self.cache.contains_key(tag) {
+            let expired = match self.cache.get(tag) {
+                Some(expires) => *expires <= now,
+                // Entry removed by `enforce_cache_limit` or a test mutation.
+                None => true,
+            };
+
+            if !expired {
                 break;
             }
-            self.cache_order.pop_front();
+
+            if let Some(tag) = self.cache_order.pop_front() {
+                self.cache.remove(&tag);
+            }
+        }
+
+        // Pending discovery requests also use a fixed timeout.  The stamp
+        // lets us skip queue entries superseded by a later request for the
+        // same destination.
+        while let Some(&(seq, destination)) = self.discovery_order.front() {
+            let (expired, live) = match self.discovery.get(&destination) {
+                Some(request) if request.seq == seq => (request.timeout <= now, true),
+                // Superseded by a later insertion, or already taken.
+                _ => (true, false),
+            };
+
+            if !expired {
+                break;
+            }
+
+            self.discovery_order.pop_front();
+            if live {
+                self.discovery.remove(&destination);
+            }
+        }
+
+        self.maybe_compact_discovery_order();
+    }
+
+    /// Drop superseded/taken discovery entries once they outnumber the live
+    /// map by a comfortable margin.  Rebuilding is O(n log n) but rare, so
+    /// steady-state decoding stays O(1) amortised.
+    fn maybe_compact_discovery_order(&mut self) {
+        let threshold = self
+            .discovery
+            .len()
+            .saturating_add(DISCOVERY_ORDER_COMPACT_SLACK);
+        if self.discovery_order.len() > threshold {
+            let mut entries: Vec<(u64, AddressHash)> = self
+                .discovery
+                .iter()
+                .map(|(destination, request)| (request.seq, *destination))
+                .collect();
+            entries.sort_unstable_by_key(|(seq, _)| *seq);
+            self.discovery_order = entries.into();
         }
     }
 
@@ -223,19 +286,26 @@ impl PathRequests {
 
         // TODO implement announce queue and announce cap, reject requests based on that
 
+        self.next_discovery_seq = self.next_discovery_seq.wrapping_add(1);
+        let seq = self.next_discovery_seq;
+
         self.discovery.insert(
             *destination,
             DiscoveryPathRequest {
                 timeout: now + PATH_REQUEST_TIMEOUT,
                 requesting_iface,
+                seq,
             },
         );
+        self.discovery_order.push_back((seq, *destination));
+        self.maybe_compact_discovery_order();
 
         true
     }
 
     pub fn take_discovery(&mut self, destination: &AddressHash) -> Option<AddressHash> {
         let request = self.discovery.remove(destination)?;
+        self.maybe_compact_discovery_order();
 
         if request.timeout > Instant::now() {
             Some(request.requesting_iface)
@@ -363,6 +433,80 @@ mod tests {
         *testee.cache.get_mut(&cache_key).expect("cache entry") = Instant::now();
 
         assert!(testee.decode(packet.data.as_slice()).is_some());
+    }
+
+    #[test]
+    fn expired_cache_entry_is_released_without_sweeping_live_entries() {
+        let mut testee = PathRequests::new("", None);
+        let destination = AddressHash::new_from_slice(b"destination");
+        let first_tag = b"first-tag".to_vec();
+        let second_tag = b"second-tag".to_vec();
+
+        let first = testee.generate(&destination, Some(first_tag.clone()));
+        let second = testee.generate(&destination, Some(second_tag));
+        assert!(testee.decode(first.data.as_slice()).is_some());
+        assert!(testee.decode(second.data.as_slice()).is_some());
+
+        // Expire only the oldest cache entry.
+        let first_key = (destination, first_tag);
+        *testee.cache.get_mut(&first_key).expect("first cached") = Instant::now();
+
+        // The next decode releases expired entries from the queue front.
+        let third = testee.generate(&destination, Some(b"third-tag".to_vec()));
+        assert!(testee.decode(third.data.as_slice()).is_some());
+
+        assert!(!testee.cache.contains_key(&first_key));
+        assert_eq!(testee.cache.len(), 2);
+        assert_eq!(testee.cache_order.len(), 2);
+    }
+
+    #[test]
+    fn discovery_expiry_skips_superseded_queue_entries() {
+        let mut testee = PathRequests::new("", None);
+        let first = AddressHash::new_from_slice(b"discovery-first");
+        let second = AddressHash::new_from_slice(b"discovery-second");
+        let iface = AddressHash::new_from_slice(b"requesting-iface");
+
+        assert!(testee.generate_recursive(&first, iface, None).is_some());
+        assert!(testee.generate_recursive(&second, iface, None).is_some());
+
+        // Expire the first discovery request, then request it again.  This
+        // leaves the original queue entry superseded by the new generation.
+        testee.discovery.get_mut(&first).unwrap().timeout = Instant::now();
+        assert!(testee.generate_recursive(&first, iface, None).is_some());
+
+        // Expire the second request.  Sweeping must drop the stale first
+        // generation and the expired second request, but keep the live
+        // re-requested first destination.
+        testee.discovery.get_mut(&second).unwrap().timeout = Instant::now();
+        testee.release_expired();
+
+        assert_eq!(testee.pending_discovery_len(), 1);
+        assert!(testee.discovery.contains_key(&first));
+        assert!(!testee.discovery.contains_key(&second));
+        assert_eq!(testee.discovery_order.len(), 1);
+    }
+
+    #[test]
+    fn discovery_order_is_compacted_after_repeated_takes() {
+        let mut testee = PathRequests::new("", None);
+        let iface = AddressHash::new_from_slice(b"requesting-iface");
+
+        for i in 0..(DISCOVERY_ORDER_COMPACT_SLACK + 8) {
+            let destination = AddressHash::new_from_slice(&i.to_be_bytes());
+            assert!(
+                testee
+                    .generate_recursive(&destination, iface, None)
+                    .is_some()
+            );
+            assert_eq!(testee.take_discovery(&destination), Some(iface));
+        }
+
+        assert_eq!(testee.pending_discovery_len(), 0);
+        assert!(
+            testee.discovery_order.len() <= DISCOVERY_ORDER_COMPACT_SLACK,
+            "stale discovery queue entries must be compacted"
+        );
     }
 
     #[test]
