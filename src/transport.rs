@@ -440,6 +440,10 @@ impl SendCtx {
 
     async fn send_packet(&self, name: &str, packet: Packet) {
         let message = self.prepare(packet);
+        self.send_prepared(name, message).await;
+    }
+
+    async fn send_prepared(&self, name: &str, message: TxMessage) {
         match message.tx_type {
             TxMessageType::Direct(iface) => {
                 log::trace!(
@@ -459,6 +463,19 @@ impl SendCtx {
             }
         }
 
+        self.send_cached(message).await;
+    }
+
+    /// Send a message that has not yet been recorded in the duplicate cache.
+    async fn send(&self, message: TxMessage) {
+        self.packet_cache.lock().unwrap().update(&message.packet);
+        self.send_cached(message).await;
+    }
+
+    /// Send a message whose hash is already present in the duplicate cache
+    /// (either inserted by the inbound duplicate filter or by `prepare`).
+    /// Avoids hashing and refreshing the same entry a second time.
+    async fn send_cached(&self, message: TxMessage) {
         // Compute pacing delay before locking so the sleep does not
         // block the InterfaceManager for other interfaces.
         let wait = {
@@ -471,28 +488,26 @@ impl SendCtx {
         self.iface_manager.lock().await.send_flush(message).await;
     }
 
-    async fn send(&self, message: TxMessage) {
-        self.packet_cache.lock().unwrap().update(&message.packet);
-
-        let wait = {
-            let mgr = self.iface_manager.lock().await;
-            mgr.send_pacing_delay(&message).await
-        };
-        if wait > Duration::ZERO {
-            sleep_pacing(wait).await;
-        }
-        self.iface_manager.lock().await.send_flush(message).await;
-    }
-
+    /// Route a locally generated packet and record it in the duplicate cache.
+    /// Use [`PendingSends::push_cached`] when queueing the result: the cache
+    /// entry is already present, so the eventual flush must not update it
+    /// again.
     fn prepare_send_packet(&self, packet: Packet) -> TxMessage {
         self.prepare(packet)
     }
 }
 
+/// A queued outbound message plus whether its hash is already recorded in the
+/// transport's duplicate cache.
+struct PendingSend {
+    message: TxMessage,
+    already_cached: bool,
+}
+
 /// Accumulates outbound messages during packet processing so they can be
 /// flushed after the `TransportHandler` lock is released.
 struct PendingSends {
-    messages: Vec<TxMessage>,
+    messages: Vec<PendingSend>,
 }
 
 impl PendingSends {
@@ -502,13 +517,32 @@ impl PendingSends {
         }
     }
 
+    /// Queue a newly generated packet that still needs a duplicate-cache
+    /// entry when it is flushed.
     fn push(&mut self, msg: TxMessage) {
-        self.messages.push(msg);
+        self.messages.push(PendingSend {
+            message: msg,
+            already_cached: false,
+        });
+    }
+
+    /// Queue a packet whose hash was already inserted into the duplicate
+    /// cache (the inbound filter, or `SendCtx::prepare_send_packet`).  This
+    /// avoids re-hashing and re-updating the same entry on flush.
+    fn push_cached(&mut self, msg: TxMessage) {
+        self.messages.push(PendingSend {
+            message: msg,
+            already_cached: true,
+        });
     }
 
     async fn flush(self, send_ctx: &SendCtx) {
-        for msg in self.messages {
-            send_ctx.send(msg).await;
+        for pending in self.messages {
+            if pending.already_cached {
+                send_ctx.send_cached(pending.message).await;
+            } else {
+                send_ctx.send(pending.message).await;
+            }
         }
     }
 }
@@ -3337,7 +3371,7 @@ async fn handle_proof(
                     .unwrap()
                     .insert(packet.destination, iface);
                 let rtt_packet = link.create_rtt();
-                pending.push(handler.send_ctx.prepare_send_packet(rtt_packet));
+                pending.push_cached(handler.send_ctx.prepare_send_packet(rtt_packet));
 
                 if handler.config.path_rebalance
                     && packet.context == crate::packet::PacketContext::LinkRequestProof
@@ -3380,7 +3414,7 @@ async fn handle_proof(
                 "relay_lrproof",
             );
         }
-        pending.push(TxMessage {
+        pending.push_cached(TxMessage {
             tx_type: TxMessageType::Direct(outcome.propagation.1),
             packet: outcome.propagation.0,
         });
@@ -3389,7 +3423,7 @@ async fn handle_proof(
     let maybe_packet = handler.reverse_table.handle_proof(packet, iface);
 
     if let Some((packet, iface)) = maybe_packet {
-        pending.push(TxMessage {
+        pending.push_cached(TxMessage {
             tx_type: TxMessageType::Direct(iface),
             packet,
         });
@@ -3491,13 +3525,19 @@ async fn send_to_next_hop(
     handler: &TransportHandler,
     pending: &mut PendingSends,
     iface: AddressHash,
+    already_cached: bool,
 ) {
     let dst = packet.destination;
     handler.send_ctx.path_table.write().unwrap().refresh(&dst);
-    pending.push(TxMessage {
+    let message = TxMessage {
         tx_type: TxMessageType::Direct(iface),
         packet,
-    });
+    };
+    if already_cached {
+        pending.push_cached(message);
+    } else {
+        pending.push(message);
+    }
 }
 
 /// Returns `(true, Some(...))` if the keepalive was handled and needs
@@ -3575,7 +3615,7 @@ async fn handle_data(
                         link.id(),
                     );
                     let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
-                    pending.push(handler.send_ctx.prepare_send_packet(packet));
+                    pending.push_cached(handler.send_ctx.prepare_send_packet(packet));
                 }
                 LinkHandleResult::MessageReceived(Some(proof)) => {
                     log::trace!(
@@ -3583,7 +3623,7 @@ async fn handle_data(
                         handler.config.name,
                         link.id(),
                     );
-                    pending.push(handler.send_ctx.prepare_send_packet(proof));
+                    pending.push_cached(handler.send_ctx.prepare_send_packet(proof));
                 }
                 LinkHandleResult::MessageReceived(None) => {
                     log::trace!(
@@ -3638,7 +3678,7 @@ async fn handle_data(
         {
             let (keepalive, fwd) = handle_keepalive_response(packet, handler).await;
             if let Some(fwd) = fwd {
-                pending.push(fwd);
+                pending.push_cached(fwd);
             }
             if keepalive {
                 return;
@@ -3647,7 +3687,7 @@ async fn handle_data(
 
         if let Some((packet, iface)) = handler.link_table.handle_packet(packet, iface) {
             let destination = packet.destination;
-            pending.push(TxMessage {
+            pending.push_cached(TxMessage {
                 tx_type: TxMessageType::Direct(iface),
                 packet,
             });
@@ -3666,7 +3706,7 @@ async fn handle_data(
         if let Some(lookup) = lookup {
             let sent = match resolve_next_hop(handler, packet, Some(lookup)) {
                 Some((packet, iface)) => {
-                    send_to_next_hop(packet, handler, pending, iface).await;
+                    send_to_next_hop(packet, handler, pending, iface, true).await;
                     true
                 }
                 None => false,
@@ -3750,7 +3790,7 @@ async fn handle_data(
                     // can be routed back to the sender. The proof must arrive
                     // on the same interface the packet was forwarded out on.
                     handler.reverse_table.add(&packet, iface, outbound_iface);
-                    send_to_next_hop(packet, handler, pending, outbound_iface).await;
+                    send_to_next_hop(packet, handler, pending, outbound_iface, true).await;
                     true
                 }
                 None => {
@@ -4354,7 +4394,7 @@ async fn handle_link_request_as_destination(
                         existing.id()
                     );
                     let prove_packet = existing.prove();
-                    pending.push(handler.send_ctx.prepare_send_packet(prove_packet));
+                    pending.push_cached(handler.send_ctx.prepare_send_packet(prove_packet));
                     existing.mark_activity();
                     return;
                 }
@@ -4384,7 +4424,7 @@ async fn handle_link_request_as_destination(
                     link.prove_messages(true);
                 }
                 let prove_packet = link.prove();
-                pending.push(handler.send_ctx.prepare_send_packet(prove_packet));
+                pending.push_cached(handler.send_ctx.prepare_send_packet(prove_packet));
 
                 let link_id = *link.id();
                 log::debug!(
@@ -4509,7 +4549,12 @@ async fn handle_link_request_as_intermediate(
         }
     };
 
-    send_to_next_hop(forwarded, handler, pending, next_hop_iface).await;
+    // The path-MTU clamp may rewrite the link-request signalling bytes, which
+    // changes the packet hash.  If the forwarded packet is byte-identical to
+    // the inbound request, its hash is already in the duplicate cache (the
+    // inbound filter inserted it); otherwise it needs its own cache entry.
+    let already_cached = forwarded.data.as_slice() == packet.data.as_slice();
+    send_to_next_hop(forwarded, handler, pending, next_hop_iface, already_cached).await;
 }
 
 async fn clamp_link_request_mtu(
@@ -4664,7 +4709,7 @@ async fn handle_check_links(
                         );
                         None
                     }) {
-                        pending.push(handler.send_ctx.prepare_send_packet(packet));
+                        pending.push_cached(handler.send_ctx.prepare_send_packet(packet));
                     }
                     links_to_remove.push(*link_entry.0);
                 }
@@ -4723,7 +4768,7 @@ async fn handle_check_links(
                             );
                             None
                         }) {
-                            pending.push(handler.send_ctx.prepare_send_packet(packet));
+                            pending.push_cached(handler.send_ctx.prepare_send_packet(packet));
                         }
                         links_to_remove.push(*link_entry.0);
                         out_link_ids_to_remove.push(*link.id());
@@ -4769,7 +4814,11 @@ async fn handle_check_links(
                         link.id()
                     );
                     let current_mtu = link.mtu();
-                    pending.push(handler.send_ctx.prepare_send_packet(link.request(Some(current_mtu))));
+                    pending.push_cached(
+                        handler
+                            .send_ctx
+                            .prepare_send_packet(link.request(Some(current_mtu))),
+                    );
                 }
 
                 if link.elapsed() > INTERVAL_OUTPUT_LINK_TRIED {
@@ -4881,7 +4930,11 @@ async fn handle_keep_links(
                 link.id(),
             );
 
-            pending.push(handler.send_ctx.prepare_send_packet(link.keep_alive_packet(KEEP_ALIVE_REQUEST)));
+            pending.push_cached(
+                handler
+                    .send_ctx
+                    .prepare_send_packet(link.keep_alive_packet(KEEP_ALIVE_REQUEST)),
+            );
             link.mark_keepalive_sent();
         }
     }
@@ -4962,7 +5015,7 @@ async fn handle_discovery(
         }
     };
 
-    pending.push(handler.send_ctx.prepare_send_packet(packet));
+    pending.push_cached(handler.send_ctx.prepare_send_packet(packet));
 }
 
 async fn retransmit_announces(
@@ -5107,6 +5160,11 @@ async fn manage_transport(
                         continue;
                     }
 
+                    // The packet hash is now recorded in the duplicate cache.
+                    // Handlers that forward or otherwise retransmit this exact
+                    // packet (same hash) must queue it with `push_cached` so
+                    // the cache is not hashed and updated a second time on
+                    // flush.  Newly generated packets use the regular `push`.
                     if handler.config.broadcast && should_rebroadcast_inbound_packet(&packet) {
                         // Plain first-hop broadcasts are not inserted into
                         // transport.  Repeat them locally: broadcasts from
@@ -5124,7 +5182,7 @@ async fn manage_transport(
                         );
                         drop(mgr);
                         for msg in redistribution {
-                            pending.push(msg);
+                            pending.push_cached(msg);
                         }
                     }
 
@@ -6956,7 +7014,7 @@ mod tests {
             1,
             "expected exactly one path response"
         );
-        let response = &pending.messages[0].packet;
+        let response = &pending.messages[0].message.packet;
         assert_eq!(response.context, PacketContext::PathResponse);
         assert_eq!(response.destination, address);
 
@@ -7024,7 +7082,7 @@ mod tests {
         }
 
         assert_eq!(pending.messages.len(), 1);
-        let (_, emitted) = DestinationAnnounce::validate(&pending.messages[0].packet)
+        let (_, emitted) = DestinationAnnounce::validate(&pending.messages[0].message.packet)
             .expect("path response validates");
         assert!(emitted.is_empty());
     }
@@ -7697,8 +7755,8 @@ mod tests {
             1,
             "first link request must be forwarded"
         );
-        assert_eq!(pending.messages[0].tx_type, TxMessageType::Direct(egress_iface));
-        assert_eq!(pending.messages[0].packet.transport, Some(next_hop));
+        assert_eq!(pending.messages[0].message.tx_type, TxMessageType::Direct(egress_iface));
+        assert_eq!(pending.messages[0].message.packet.transport, Some(next_hop));
 
         // The same link request arrives again, looped back through a stale
         // path with one additional hop taken. It must be dropped, not
