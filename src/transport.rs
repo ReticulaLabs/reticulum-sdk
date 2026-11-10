@@ -3230,6 +3230,14 @@ impl TransportHandler {
     }
 
     async fn filter_duplicate_packets(&mut self, packet: &Packet) -> bool {
+        self.filter_duplicate_packets_detailed(packet).await.0
+    }
+
+    /// Duplicate filter that also reports whether this exact packet hash was
+    /// newly recorded. `allowed` is the existing filter result; `is_new` is
+    /// false for a repeat sighting that was nevertheless allowed through
+    /// (for example a single-destination announce heard on another interface).
+    async fn filter_duplicate_packets_detailed(&mut self, packet: &Packet) -> (bool, bool) {
         let mut allow_duplicate = false;
 
         match packet.header.packet_type {
@@ -3265,7 +3273,7 @@ impl TransportHandler {
             self.packets_dropped_duplicate += 1;
         }
 
-        is_new || allow_duplicate
+        (is_new || allow_duplicate, is_new)
     }
 
     /// Forward `packet` to all non-hot (below egress PR threshold)
@@ -3897,10 +3905,10 @@ async fn handle_announce(
     iface: AddressHash,
     snr: Option<f32>,
     rssi: Option<i16>,
-) {
+) -> bool {
     if handler.has_destination(&packet.destination) {
         // destination is local
-        return;
+        return false;
     }
 
     // The announce's ingress burst-limiting state is recorded inside
@@ -3950,7 +3958,7 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
                 handler.config.name,
                 identity_hash,
             );
-            return;
+            return false;
         }
 
         // Ingress burst limiting only applies to destinations that are not
@@ -3980,7 +3988,7 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
                         handler.config.name,
                         packet.destination,
                     );
-                    return;
+                    return false;
                 }
             }
         }
@@ -4018,7 +4026,7 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
                     &packet.destination,
                     blocked_until.as_secs(),
                 );
-                return;
+                return false;
             }
         }
 
@@ -4174,12 +4182,15 @@ is_path_response={}",
                 }
             }
         }
+
+        path_updated
     } else {
         log::debug!(
             "tp({}): dropped invalid announce for dst={}",
             handler.config.name,
             packet.destination,
         );
+        false
     }
 }
 
@@ -4431,6 +4442,16 @@ fn should_rebroadcast_inbound_packet(packet: &Packet) -> bool {
         && packet.header.packet_type == PacketType::Data
         && packet.header.destination_type == DestinationType::Plain
         && packet.header.hops == 1
+}
+
+/// Whether an inbound announce should be mirrored to attached RPC clients.
+///
+/// Mirror every newly observed emission once, and mirror repeat sightings only
+/// when they updated the path table (for example the same emission arriving
+/// over a shorter route). Without this, a single announce is replayed to every
+/// local client once per interface it is heard on.
+fn should_mirror_announce_to_rpc_clients(is_new_packet: bool, path_updated: bool) -> bool {
+    is_new_packet || path_updated
 }
 
 /// Plan the redistribution of a first-hop plain broadcast: a broadcast
@@ -5226,6 +5247,10 @@ async fn manage_transport(
                 // Outbound sends are accumulated and flushed after the lock is released.
                 let mut pending = PendingSends::new();
                 let transport_id;
+                // Kept outside the handler-lock scope so the RPC announce
+                // mirror can be gated after the lock is released.
+                let packet_is_new;
+                let mut announce_path_updated = false;
                 {
                     let mut handler = handler.lock().await;
                     transport_id = *handler.config.identity.address_hash();
@@ -5249,7 +5274,10 @@ async fn manage_transport(
                         continue;
                     }
 
-                    if !handler.filter_duplicate_packets(&packet).await {
+                    let (packet_allowed, is_new_packet) =
+                        handler.filter_duplicate_packets_detailed(&packet).await;
+                    packet_is_new = is_new_packet;
+                    if !packet_allowed {
                         log::trace!(
                             "tp({}): dropping duplicate packet: dst={}, ctx={:?}, type={:?}",
                             tp_name,
@@ -5293,7 +5321,15 @@ async fn manage_transport(
                     match packet.header.packet_type {
                         PacketType::Announce => {
                             handler.packets_received_by_type.announce += 1;
-                            handle_announce(&packet, &mut *handler, &mut pending, message.address, snr, rssi).await
+                            announce_path_updated = handle_announce(
+                                &packet,
+                                &mut *handler,
+                                &mut pending,
+                                message.address,
+                                snr,
+                                rssi,
+                            )
+                            .await;
                         }
                         PacketType::LinkRequest => {
                             handler.packets_received_by_type.link_request += 1;
@@ -5320,7 +5356,15 @@ async fn manage_transport(
 
                 // Forward announces to rpc clients without holding
                 // either the handler or iface_manager lock.
-                if packet.header.packet_type == PacketType::Announce {
+                //
+                // Mirror each emission once per packet hash, and also mirror a
+                // repeat sighting when it improved the path table (for example
+                // the same announce arriving over a shorter route). This keeps
+                // local clients converged without replaying the same announce
+                // for every interface it arrives on.
+                if packet.header.packet_type == PacketType::Announce
+                    && should_mirror_announce_to_rpc_clients(packet_is_new, announce_path_updated)
+                {
                     let clients = packet_send_ctx
                         .iface_manager
                         .lock()
@@ -6710,6 +6754,16 @@ mod tests {
         assert_eq!(encoded, vec![0x06]);
     }
 
+    #[test]
+    fn announce_mirror_gating_uses_new_or_path_update() {
+        assert!(should_mirror_announce_to_rpc_clients(true, false));
+        assert!(should_mirror_announce_to_rpc_clients(false, true));
+        assert!(
+            !should_mirror_announce_to_rpc_clients(false, false),
+            "duplicate announce that did not improve the path must not be mirrored"
+        );
+    }
+
     #[tokio::test]
     async fn drop_duplicates() {
         let mut config: TransportConfig = Default::default();
@@ -6731,20 +6785,26 @@ mod tests {
         // hash is already known (matching Python's packet_filter): the
         // hash excludes the hop count, so the same emission heard on a
         // second interface must still reach the path table and echo logic.
+        let (allowed, is_new) = handler
+            .lock()
+            .await
+            .filter_duplicate_packets_detailed(&announce)
+            .await;
+        assert!(allowed, "first SINGLE announce must be accepted");
+        assert!(is_new, "first sighting must be reported as new");
+
+        let (allowed, is_new) = handler
+            .lock()
+            .await
+            .filter_duplicate_packets_detailed(&announce)
+            .await;
         assert!(
-            handler
-                .lock()
-                .await
-                .filter_duplicate_packets(&announce)
-                .await
+            allowed,
+            "duplicate SINGLE announces must be re-processed, not dropped"
         );
         assert!(
-            handler
-                .lock()
-                .await
-                .filter_duplicate_packets(&announce)
-                .await,
-            "duplicate SINGLE announces must be re-processed, not dropped"
+            !is_new,
+            "repeat sighting must not be mirrored as a new announce"
         );
 
         // Non-SINGLE announce types are still deduplicated by the packet
