@@ -33,6 +33,25 @@ pub type TagBytes = Vec<u8>;
 const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const PATH_REQUEST_GATE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DISCOVERY_PATH_REQUEST_TAGS: usize = 32_000;
+
+/// Minimum spacing between recursive path requests for the same destination,
+/// regardless of the request tag.
+///
+/// Reticulum path requests carry a random tag, so keying duplicate suppression
+/// on `(destination, tag)` alone lets a peer force a fresh network-wide search
+/// simply by varying the tag. This window suppresses repeat searches for the
+/// same destination even when the tag changes.
+pub const DEFAULT_RECURSIVE_PR_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Sustained global budget for recursive path requests, in requests/second.
+///
+/// This bounds the total recursive-discovery fan-out of a transport node no
+/// matter how many distinct destinations its peers ask about.
+pub const DEFAULT_RECURSIVE_PR_BUDGET_PER_SEC: f64 = 5.0;
+
+/// Burst capacity for the global recursive path-request budget.
+pub const DEFAULT_RECURSIVE_PR_BURST: f64 = 10.0;
+
 /// Stale discovery-order entries tolerated beyond the live discovery map size
 /// before the queue is compacted.
 const DISCOVERY_ORDER_COMPACT_SLACK: usize = 1024;
@@ -113,6 +132,21 @@ pub struct PathRequests {
     /// is also expiry order.
     discovery_order: VecDeque<(u64, AddressHash)>,
     next_discovery_seq: u64,
+
+    /// Minimum spacing between recursive path requests for one destination,
+    /// independent of the request tag.
+    recursive_min_interval: Duration,
+    /// Sustained global recursive path-request budget (requests/second).
+    recursive_budget_per_sec: f64,
+    /// Maximum number of tokens the global budget can accumulate.
+    recursive_burst: f64,
+    /// Currently available global budget tokens.
+    recursive_tokens: f64,
+    /// Last time the global budget was refilled.
+    recursive_refilled_at: Instant,
+    /// Last time a recursive path request was emitted per destination.
+    /// Entries older than `recursive_min_interval` are pruned.
+    last_recursive: BTreeMap<AddressHash, Instant>,
 }
 
 impl PathRequests {
@@ -126,7 +160,54 @@ impl PathRequests {
             discovery: BTreeMap::new(),
             discovery_order: VecDeque::new(),
             next_discovery_seq: 0,
+            recursive_min_interval: DEFAULT_RECURSIVE_PR_INTERVAL,
+            recursive_budget_per_sec: DEFAULT_RECURSIVE_PR_BUDGET_PER_SEC,
+            recursive_burst: DEFAULT_RECURSIVE_PR_BURST,
+            recursive_tokens: DEFAULT_RECURSIVE_PR_BURST,
+            recursive_refilled_at: Instant::now(),
+            last_recursive: BTreeMap::new(),
         }
+    }
+
+    /// Override the recursive path-request limits.
+    ///
+    /// A zero `min_interval` disables the per-destination window. A
+    /// non-finite `budget_per_sec`, or a `burst` of zero or less, disables the
+    /// global token bucket. Intended for tests and specialised deployments.
+    pub fn set_recursive_limits(
+        &mut self,
+        min_interval: Duration,
+        budget_per_sec: f64,
+        burst: f64,
+    ) {
+        self.recursive_min_interval = min_interval;
+        self.recursive_budget_per_sec = budget_per_sec;
+        self.recursive_burst = burst;
+        self.recursive_tokens = if burst.is_finite() {
+            burst.max(0.0)
+        } else {
+            0.0
+        };
+        self.recursive_refilled_at = Instant::now();
+    }
+
+    /// Builder form of [`Self::set_recursive_limits`].
+    #[cfg(test)]
+    pub fn with_recursive_limits(
+        mut self,
+        min_interval: Duration,
+        budget_per_sec: f64,
+        burst: f64,
+    ) -> Self {
+        self.set_recursive_limits(min_interval, budget_per_sec, burst);
+        self
+    }
+
+    /// Number of destinations currently inside the per-destination recursive
+    /// path-request suppression window.
+    #[cfg(test)]
+    pub fn recursive_suppression_len(&self) -> usize {
+        self.last_recursive.len()
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Option<PathRequest> {
@@ -196,6 +277,15 @@ impl PathRequests {
             }
         }
 
+        // Drop suppression entries once they fall outside the window. The map
+        // is bounded by the number of distinct destinations requested during
+        // one interval, so this sweep is cheap.
+        if !self.recursive_min_interval.is_zero() {
+            self.last_recursive.retain(|_, last| {
+                now.saturating_duration_since(*last) < self.recursive_min_interval
+            });
+        }
+
         self.maybe_compact_discovery_order();
     }
 
@@ -236,7 +326,7 @@ impl PathRequests {
             data.write(transport_id.as_slice());
         }
 
-        data.write(tag.unwrap_or_else(|| create_random_tag()).as_slice());
+        data.write(tag.unwrap_or_else(create_random_tag).as_slice());
 
         log::trace!(
             "path_requests({}): generate destination={} data_len={} raw_data={:02x?}",
@@ -246,7 +336,7 @@ impl PathRequests {
             data.as_slice(),
         );
 
-        let destination = self.controlled_destination.desc.address_hash.clone();
+        let destination = self.controlled_destination.desc.address_hash;
 
         Packet {
             header: Header {
@@ -260,9 +350,33 @@ impl PathRequests {
             },
             ifac: None,
             destination,
-            transport: self.transport_id.clone(),
+            // Type1 packets do not carry a transport header on the wire. Keep
+            // the local transport ID here for parity with previous behaviour.
+            transport: self.transport_id,
             context: PacketContext::None,
             data,
+        }
+    }
+
+    /// Try to consume one token from the global recursive path-request
+    /// budget. Returns `false` when the budget is exhausted.
+    fn consume_recursive_budget(&mut self, now: Instant) -> bool {
+        // A non-finite budget (or a non-positive burst) disables the limiter.
+        if !self.recursive_budget_per_sec.is_finite() || self.recursive_burst <= 0.0 {
+            return true;
+        }
+
+        let elapsed = now.saturating_duration_since(self.recursive_refilled_at);
+        self.recursive_refilled_at = now;
+        self.recursive_tokens = (self.recursive_tokens
+            + elapsed.as_secs_f64() * self.recursive_budget_per_sec)
+            .min(self.recursive_burst);
+
+        if self.recursive_tokens >= 1.0 {
+            self.recursive_tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 
@@ -273,18 +387,54 @@ impl PathRequests {
     ) -> bool {
         let now = Instant::now();
 
-        if let Some(timeout) = self.discovery.get(destination) {
-            if timeout.timeout > now {
+        if self
+            .discovery
+            .get(destination)
+            .is_some_and(|timeout| timeout.timeout > now)
+        {
+            log::debug!(
+                "tp({}): rejecting discovery path request for destination {} as a request is already pending",
+                self.name,
+                destination
+            );
+            return false;
+        }
+
+        // Suppress repeat searches for the same destination even when the
+        // caller supplies a fresh random tag.
+        let last_recursive = if self.recursive_min_interval.is_zero() {
+            None
+        } else {
+            self.last_recursive.get(destination).copied()
+        };
+        if let Some(last) = last_recursive {
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed < self.recursive_min_interval {
                 log::debug!(
-                    "tp({}): rejecting discovery path request for destination {} as a request is already pending",
+                    "tp({}): suppressing recursive path request for {} ({}s < {}s window)",
                     self.name,
-                    destination
+                    destination,
+                    elapsed.as_secs(),
+                    self.recursive_min_interval.as_secs(),
                 );
                 return false;
             }
         }
 
-        // TODO implement announce queue and announce cap, reject requests based on that
+        // Global budget: bound the total recursive fan-out regardless of how
+        // many distinct destinations peers ask about.
+        if !self.consume_recursive_budget(now) {
+            log::debug!(
+                "tp({}): suppressing recursive path request for {} (global budget exhausted)",
+                self.name,
+                destination,
+            );
+            return false;
+        }
+
+        if !self.recursive_min_interval.is_zero() {
+            self.last_recursive.insert(*destination, now);
+        }
 
         self.next_discovery_seq = self.next_discovery_seq.wrapping_add(1);
         let seq = self.next_discovery_seq;
@@ -325,10 +475,12 @@ impl PathRequests {
         tag: Option<TagBytes>,
     ) -> Option<Packet> {
         if self.allow_recursive(destination, requesting_iface) {
-            log::trace!(
-                "tp({}): sending discovery path request for {}",
+            log::debug!(
+                "tp({}): sending recursive path request target={} ingress={} tag={:02x?}",
                 self.name,
-                destination
+                destination,
+                requesting_iface,
+                tag,
             );
 
             Some(self.generate(destination, tag))
@@ -420,6 +572,83 @@ mod tests {
     }
 
     #[test]
+    fn recursive_path_request_is_suppressed_for_same_destination_with_new_tag() {
+        let mut testee = PathRequests::new("", None);
+        let destination = AddressHash::new_from_slice(b"destination");
+        let iface = AddressHash::new_from_slice(b"requesting-iface");
+
+        assert!(testee
+            .generate_recursive(&destination, iface, Some(b"tag-a".to_vec()))
+            .is_some());
+        // A fresh random tag must not bypass the per-destination window.
+        assert!(testee
+            .generate_recursive(&destination, iface, Some(b"tag-b".to_vec()))
+            .is_none());
+        assert_eq!(testee.recursive_suppression_len(), 1);
+    }
+
+    #[test]
+    fn recursive_path_request_window_expires() {
+        let mut testee = PathRequests::new("", None);
+        let destination = AddressHash::new_from_slice(b"destination");
+        let iface = AddressHash::new_from_slice(b"requesting-iface");
+
+        assert!(testee
+            .generate_recursive(&destination, iface, None)
+            .is_some());
+        // Clear the pending discovery entry so only the suppression window
+        // remains to be tested.
+        assert_eq!(testee.take_discovery(&destination), Some(iface));
+
+        // Pretend the previous search happened just outside the window.
+        *testee.last_recursive.get_mut(&destination).unwrap() =
+            Instant::now() - DEFAULT_RECURSIVE_PR_INTERVAL;
+        assert!(testee
+            .generate_recursive(&destination, iface, None)
+            .is_some());
+    }
+
+    #[test]
+    fn recursive_suppression_entries_are_pruned() {
+        let mut testee = PathRequests::new("", None);
+        let destination = AddressHash::new_from_slice(b"destination");
+        let iface = AddressHash::new_from_slice(b"requesting-iface");
+
+        assert!(testee
+            .generate_recursive(&destination, iface, None)
+            .is_some());
+        *testee.last_recursive.get_mut(&destination).unwrap() =
+            Instant::now() - DEFAULT_RECURSIVE_PR_INTERVAL;
+
+        testee.release_expired();
+        assert_eq!(testee.recursive_suppression_len(), 0);
+    }
+
+    #[test]
+    fn recursive_path_request_budget_is_enforced() {
+        // One request/second sustained with a burst of one: the second
+        // distinct destination in the same instant is rejected, and accepted
+        // once the bucket has refilled.
+        let mut testee = PathRequests::new("", None)
+            .with_recursive_limits(Duration::ZERO, 1.0, 1.0);
+        let first = AddressHash::new_from_slice(b"budget-first");
+        let second = AddressHash::new_from_slice(b"budget-second");
+        let iface = AddressHash::new_from_slice(b"requesting-iface");
+
+        assert!(testee
+            .generate_recursive(&first, iface, None)
+            .is_some());
+        assert!(testee
+            .generate_recursive(&second, iface, None)
+            .is_none());
+
+        testee.recursive_refilled_at = Instant::now() - Duration::from_secs(2);
+        assert!(testee
+            .generate_recursive(&second, iface, None)
+            .is_some());
+    }
+
+    #[test]
     fn duplicate_path_request_is_allowed_after_gate_timeout() {
         let mut testee = PathRequests::new("", None);
         let destination = AddressHash::new_from_slice(b"destination");
@@ -462,18 +691,27 @@ mod tests {
 
     #[test]
     fn discovery_expiry_skips_superseded_queue_entries() {
-        let mut testee = PathRequests::new("", None);
+        // Disable the new per-destination window: this test deliberately
+        // re-requests the same destination immediately after expiring it.
+        let mut testee = PathRequests::new("", None)
+            .with_recursive_limits(Duration::ZERO, f64::INFINITY, f64::INFINITY);
         let first = AddressHash::new_from_slice(b"discovery-first");
         let second = AddressHash::new_from_slice(b"discovery-second");
         let iface = AddressHash::new_from_slice(b"requesting-iface");
 
-        assert!(testee.generate_recursive(&first, iface, None).is_some());
-        assert!(testee.generate_recursive(&second, iface, None).is_some());
+        assert!(testee
+            .generate_recursive(&first, iface, None)
+            .is_some());
+        assert!(testee
+            .generate_recursive(&second, iface, None)
+            .is_some());
 
         // Expire the first discovery request, then request it again.  This
         // leaves the original queue entry superseded by the new generation.
         testee.discovery.get_mut(&first).unwrap().timeout = Instant::now();
-        assert!(testee.generate_recursive(&first, iface, None).is_some());
+        assert!(testee
+            .generate_recursive(&first, iface, None)
+            .is_some());
 
         // Expire the second request.  Sweeping must drop the stale first
         // generation and the expired second request, but keep the live
@@ -489,7 +727,10 @@ mod tests {
 
     #[test]
     fn discovery_order_is_compacted_after_repeated_takes() {
-        let mut testee = PathRequests::new("", None);
+        // Many distinct destinations in a tight loop: exercise queue
+        // compaction without the global budget rejecting them.
+        let mut testee = PathRequests::new("", None)
+            .with_recursive_limits(Duration::ZERO, f64::INFINITY, f64::INFINITY);
         let iface = AddressHash::new_from_slice(b"requesting-iface");
 
         for i in 0..(DISCOVERY_ORDER_COMPACT_SLACK + 8) {

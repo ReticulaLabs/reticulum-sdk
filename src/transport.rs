@@ -9,6 +9,9 @@ use hmac::{Hmac, Mac};
 use link_table::AddLinkRequest;
 use link_table::LinkTable;
 use packet_cache::PacketCache;
+use path_requests::DEFAULT_RECURSIVE_PR_BUDGET_PER_SEC;
+use path_requests::DEFAULT_RECURSIVE_PR_BURST;
+use path_requests::DEFAULT_RECURSIVE_PR_INTERVAL;
 use path_requests::PathRequests;
 use path_requests::TagBytes;
 use path_requests::create_path_request_destination;
@@ -260,6 +263,21 @@ pub struct TransportConfig {
     /// signals it in the link request; intermediate transport nodes clamp the
     /// value to the minimum of all interfaces along the path.
     link_mtu_discovery: bool,
+
+    /// Minimum spacing between recursive path requests for the same
+    /// destination, regardless of the request tag. Suppresses repeat
+    /// network-wide searches driven by varying the random tag.
+    /// Defaults to 60 seconds; zero disables the window.
+    recursive_path_request_interval: Duration,
+
+    /// Sustained global budget for recursive path requests, in requests per
+    /// second. Bounds a transport node's recursive-discovery fan-out no matter
+    /// how many distinct destinations peers ask about. Defaults to 5/s.
+    recursive_path_request_budget: f64,
+
+    /// Burst capacity for the global recursive path-request budget.
+    /// Defaults to 10 requests; zero or less disables the limiter.
+    recursive_path_request_burst: f64,
 
     /// Capacity of the internal tokio broadcast channels that deliver
     /// transport events (announces, link events, received data, receipts,
@@ -666,6 +684,9 @@ impl TransportConfig {
             blackhole_sources: vec![],
             blackhole_update_interval: Duration::from_secs(60 * 60),
             link_mtu_discovery: true,
+            recursive_path_request_interval: DEFAULT_RECURSIVE_PR_INTERVAL,
+            recursive_path_request_budget: DEFAULT_RECURSIVE_PR_BUDGET_PER_SEC,
+            recursive_path_request_burst: DEFAULT_RECURSIVE_PR_BURST,
             rpc_instance: false,
             require_rpc_instance: false,
             rpc_instance_type: RpcInstanceType::Tcp,
@@ -742,6 +763,34 @@ impl TransportConfig {
 
     pub fn set_link_mtu_discovery(&mut self, link_mtu_discovery: bool) {
         self.link_mtu_discovery = link_mtu_discovery;
+    }
+
+    /// Configure recursive path-request suppression and the global budget.
+    ///
+    /// `interval` is the minimum spacing between recursive searches for the
+    /// same destination regardless of tag. `budget_per_sec` is the sustained
+    /// global request rate, and `burst` is the token-bucket capacity. Pass a
+    /// zero interval to disable the per-destination window, and a non-finite
+    /// budget (or zero burst) to disable the global limiter.
+    pub fn set_recursive_path_request_limits(
+        &mut self,
+        interval: Duration,
+        budget_per_sec: f64,
+        burst: f64,
+    ) {
+        self.recursive_path_request_interval = interval;
+        self.recursive_path_request_budget = budget_per_sec;
+        self.recursive_path_request_burst = burst;
+    }
+
+    /// Current recursive path-request limits as
+    /// `(per_destination_interval, global_budget_per_sec, burst)`.
+    pub fn recursive_path_request_limits(&self) -> (Duration, f64, f64) {
+        (
+            self.recursive_path_request_interval,
+            self.recursive_path_request_budget,
+            self.recursive_path_request_burst,
+        )
     }
 
     /// Set the capacity of internal broadcast event channels.
@@ -881,6 +930,9 @@ impl Default for TransportConfig {
             blackhole_sources: vec![],
             blackhole_update_interval: Duration::from_secs(60 * 60),
             link_mtu_discovery: true,
+            recursive_path_request_interval: DEFAULT_RECURSIVE_PR_INTERVAL,
+            recursive_path_request_budget: DEFAULT_RECURSIVE_PR_BUDGET_PER_SEC,
+            recursive_path_request_burst: DEFAULT_RECURSIVE_PR_BURST,
             rpc_instance: false,
             require_rpc_instance: false,
             rpc_instance_type: RpcInstanceType::Tcp,
@@ -929,7 +981,12 @@ impl Transport {
         } else {
             None
         };
-        let path_requests = PathRequests::new(config.name.as_str(), transport_id);
+        let mut path_requests = PathRequests::new(config.name.as_str(), transport_id);
+        path_requests.set_recursive_limits(
+            config.recursive_path_request_interval,
+            config.recursive_path_request_budget,
+            config.recursive_path_request_burst,
+        );
 
         let path_request_dest = create_path_request_destination().desc.address_hash;
         let discovery_destination = Arc::new(Mutex::new(create_discovery_destination(
@@ -4144,6 +4201,35 @@ async fn handle_path_request(
         .ingress_record_pr(&iface);
 
     if let Some(request) = handler.path_requests.decode(packet.data.as_slice()) {
+        // Attribution log: ingress interface, target destination, original
+        // requester and tag. The recursive re-emitted packet preserves the
+        // requester, but this log captures it at the point of arrival.
+        if log::log_enabled!(log::Level::Debug) {
+            let known_hops = handler
+                .send_ctx
+                .path_table
+                .read()
+                .unwrap()
+                .get(&request.destination)
+                .map(|entry| entry.hops);
+            let local = handler
+                .single_in_destinations
+                .contains_key(&request.destination);
+            log::debug!(
+                "tp({}): path request ingress={} target={} requester={} tag={:02x?} known_hops={:?} local={}",
+                handler.config.name,
+                iface,
+                request.destination,
+                request
+                    .requesting_transport
+                    .map(|transport| transport.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                &request.tag_bytes,
+                known_hops,
+                local,
+            );
+        }
+
         if let Some(dest) = handler.single_in_destinations.get(&request.destination) {
             let mut rng = UnwrapErr(SysRng);
             // No app data is passed, so the response carries the destination's
@@ -4295,29 +4381,31 @@ async fn handle_path_request(
                     );
                     return;
                 }
+                // The Python reference always replaces the requestor with the
+                // forwarding transport's own ID; `generate` does the same.
                 if let Some(packet) = handler.path_requests.generate_recursive(
-                &request.destination,
-                iface,
-                Some(request.tag_bytes.clone()),
-            ) {
-                let sent_any = handler
-                    .forward_via_non_hot_ifaces(
-                        &packet,
-                        pending,
-                        Some(iface),
-                        &request.destination,
-                        "recursive PR",
-                        search_mode_filter,
-                    )
-                    .await;
+                    &request.destination,
+                    iface,
+                    Some(request.tag_bytes.clone()),
+                ) {
+                    let sent_any = handler
+                        .forward_via_non_hot_ifaces(
+                            &packet,
+                            pending,
+                            Some(iface),
+                            &request.destination,
+                            "recursive PR",
+                            search_mode_filter,
+                        )
+                        .await;
 
-                if !sent_any {
-                    pending.push(TxMessage {
-                        tx_type: TxMessageType::Broadcast(Some(iface)),
-                        packet,
-                    });
+                    if !sent_any {
+                        pending.push(TxMessage {
+                            tx_type: TxMessageType::Broadcast(Some(iface)),
+                            packet,
+                        });
+                    }
                 }
-            }
             }
         }
     }
