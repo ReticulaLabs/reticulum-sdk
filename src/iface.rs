@@ -636,6 +636,18 @@ pub fn encode_tx(
     packet: &Packet,
     buffer: &mut [u8],
 ) -> Result<usize, RnsError> {
+    // Mirror Python's `Packet.send()`/`Transport._outbound()`: a packet at or
+    // above the hop limit must never be transmitted. Python peers reject such
+    // frames on unpack, so sending one only wastes bandwidth.
+    if packet.header.hops >= crate::packet::HOP_LIMIT {
+        log::debug!(
+            "iface: refusing to send packet with hop count {} (limit {})",
+            packet.header.hops,
+            crate::packet::HOP_LIMIT,
+        );
+        return Err(RnsError::PacketError);
+    }
+
     let mut out = crate::buffer::OutputBuffer::new(buffer);
     packet.serialize(&mut out)?;
     let len = out.offset();
@@ -3422,6 +3434,33 @@ mod tests {
                 "{lbl}",
             );
         }
+    }
+
+    #[test]
+    fn encode_tx_refuses_packets_at_hop_limit() {
+        fn packet(hops: u8) -> Packet {
+            Packet {
+                header: Header {
+                    hops,
+                    ..Default::default()
+                },
+                ifac: None,
+                destination: crate::hash::AddressHash::new([0x02; 16]),
+                transport: None,
+                context: PacketContext::None,
+                data: PacketDataBuffer::new_from_slice(b"hop limit"),
+            }
+        }
+
+        let mut frame = [0u8; 1024];
+        assert!(
+            encode_tx(None, &packet(crate::packet::HOP_LIMIT - 1), &mut frame).is_ok(),
+            "packet just below the hop limit must be encodable"
+        );
+        assert!(
+            encode_tx(None, &packet(crate::packet::HOP_LIMIT), &mut frame).is_err(),
+            "packet at the hop limit must not be transmitted, matching Python Packet.send()"
+        );
     }
 
     /// The interface TX/RX helpers must be mutually inverting, and must

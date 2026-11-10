@@ -95,7 +95,7 @@ pub use discovery::DiscoveryInterfaceKind;
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
-pub const PATHFINDER_M: usize = 128; // Max hops
+pub const PATHFINDER_M: usize = crate::packet::HOP_LIMIT as usize; // Max hops
 
 const INTERVAL_LINKS_CHECK: Duration = Duration::from_secs(1);
 const INTERVAL_PENDING_PROOF_TIMEOUT: Duration = Duration::from_secs(60);
@@ -4570,12 +4570,13 @@ async fn handle_link_request_as_intermediate(
         remaining_hops,
     );
 
-    // A link request that has already traversed the maximum allowed hop
-    // count is either malformed or caught in a routing loop. Never
-    // forward it further.
-    if packet.header.hops > PATHFINDER_M as u8 {
+    // A link request that has already reached the maximum allowed hop count
+    // is either malformed or caught in a routing loop. Never forward it
+    // further. This mirrors Python, where `Packet.unpack()` rejects
+    // `hops >= PATHFINDER_M` and `_outbound()` refuses to send them.
+    if packet.header.hops >= PATHFINDER_M as u8 {
         log::warn!(
-            "tp({}): dropping link request {} for {} exceeding max hops ({})",
+            "tp({}): dropping link request {} for {} at or above max hops ({})",
             handler.config.name,
             LinkId::from(packet),
             packet.destination,

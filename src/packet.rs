@@ -13,6 +13,12 @@ pub const RETICULUM_MTU: usize = 500usize;
 pub const RETICULUM_HEADER_MINSIZE: usize = 2 + 1 + 16;
 pub const RETICULUM_MAX_HEADER_SIZE: usize = 35usize;
 pub const RETICULUM_MIN_IFAC_SIZE: usize = 1usize;
+/// Maximum hop count a packet may have on the wire.
+///
+/// `Packet.unpack()` rejects frames with `hops >= HOP_LIMIT`, and the outbound
+/// path refuses to send packets at or above the limit. Packets with a larger
+/// hop field are malformed or caught in a routing loop.
+pub const HOP_LIMIT: u8 = 128;
 pub const PACKET_MDU: usize = RETICULUM_MTU - RETICULUM_MAX_HEADER_SIZE - RETICULUM_MIN_IFAC_SIZE;
 pub const RETICULUM_TOKEN_OVERHEAD: usize = 48usize;
 pub const RETICULUM_AES_BLOCK_SIZE: usize = 16usize;

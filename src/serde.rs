@@ -89,6 +89,13 @@ impl Packet {
     ) -> Result<Packet, RnsError> {
         let mut header = Header::deserialize(buffer)?;
 
+        // frames at or above the hop limit are malformed or stuck in a routing
+        // loop and must not be processed. Without this, a 128-hop frame would be
+        // accepted, incremented to 129 and forwarded
+        if header.hops >= crate::packet::HOP_LIMIT {
+            return Err(RnsError::PacketError);
+        }
+
         let ifac = if ifac_len > 0 {
             if ifac_len > PACKET_IFAC_MAX_LENGTH {
                 return Err(RnsError::PacketError);
@@ -172,6 +179,23 @@ mod tests {
 
         let expected = test_vectors::decode_hex(test_vectors::FORWARDED_ANNOUNCE_PACKET_HEX);
         assert_eq!(output_buffer.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn deserialize_enforces_hop_limit() {
+        let mut packet_bytes = test_vectors::decode_hex(test_vectors::ANNOUNCE_PACKET_HEX);
+
+        packet_bytes[1] = crate::packet::HOP_LIMIT - 1;
+        assert!(
+            Packet::deserialize(&mut InputBuffer::new(&packet_bytes)).is_ok(),
+            "packet just below the hop limit must be accepted"
+        );
+
+        packet_bytes[1] = crate::packet::HOP_LIMIT;
+        assert!(
+            Packet::deserialize(&mut InputBuffer::new(&packet_bytes)).is_err(),
+            "packet at the hop limit must be rejected, matching Python Packet.unpack()"
+        );
     }
 
     #[test]
