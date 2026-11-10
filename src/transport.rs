@@ -2699,10 +2699,12 @@ fn rpc_interface_stats(handler: Option<&mut TransportHandler>) -> Value {
     };
 
     let mut total_txb: u64 = 0;
+    let mut total_rxb: u64 = 0;
     let interfaces: Vec<Value> = stats
         .into_iter()
         .map(|s| {
             total_txb += s.bytes_tx;
+            total_rxb += s.bytes_rx;
             Value::Map(vec![
                 (Value::from("name"), Value::from(s.name)),
                 (Value::from("type"), Value::from(s.interface_type)),
@@ -2712,8 +2714,9 @@ fn rpc_interface_stats(handler: Option<&mut TransportHandler>) -> Value {
                 (Value::from("clients"), Value::Nil),
                 (Value::from("error_count"), Value::from(s.error_count)),
                 (Value::from("packets_tx"), Value::from(s.packets_tx)),
+                (Value::from("packets_rx"), Value::from(s.packets_rx)),
                 (Value::from("txb"), Value::from(s.bytes_tx)),
-                (Value::from("rxb"), Value::from(0)),
+                (Value::from("rxb"), Value::from(s.bytes_rx)),
                 (Value::from("txbuffered"), Value::from(s.tx_queue as u64)),
                 (Value::from("announce_queue"), Value::from(s.announce_queue as u64)),
                 (Value::from("channel_load"), Value::from(s.channel_load)),
@@ -2729,13 +2732,6 @@ fn rpc_interface_stats(handler: Option<&mut TransportHandler>) -> Value {
             ])
         })
         .collect();
-
-    // The SDK does not track received bytes per interface, so `rxb` is
-    // reported as the total number of received packets (a best-effort proxy).
-    let total_rxb: u64 = handler.packets_received_by_type.announce
-        + handler.packets_received_by_type.link_request
-        + handler.packets_received_by_type.proof
-        + handler.packets_received_by_type.data;
 
     let rss = handler
         .last_rssi
@@ -3229,6 +3225,7 @@ impl TransportHandler {
         }
     }
 
+    #[cfg(test)]
     async fn filter_duplicate_packets(&mut self, packet: &Packet) -> bool {
         self.filter_duplicate_packets_detailed(packet).await.0
     }
@@ -5214,7 +5211,8 @@ async fn manage_transport(
                 // that is still exchanging data (see `cleanup_inactive`).
                 {
                     let mgr = send_ctx.iface_manager.lock().await;
-                    mgr.record_interface_activity(&message.address);
+                    let wire_len = crate::iface::packet_wire_len(&message.packet);
+                    mgr.record_interface_rx(&message.address, wire_len);
                 }
 
                 // Mirror the packet to attached RPC/management clients. This

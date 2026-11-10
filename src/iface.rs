@@ -393,7 +393,7 @@ pub struct RxMessage {
 
 /// Compute the on-wire size of a packet, matching the formula used by
 /// both the data pacer and the announce pacer.
-fn packet_wire_len(packet: &Packet) -> usize {
+pub(crate) fn packet_wire_len(packet: &Packet) -> usize {
     let transport_size = if packet.header.header_type == HeaderType::Type2 {
         ADDRESS_HASH_SIZE
     } else {
@@ -480,6 +480,12 @@ pub struct InterfaceQueueLength {
     pub announce: usize,
     /// Cumulative number of packets sent through this interface.
     pub packets_tx: u64,
+    /// Cumulative number of data bytes sent through this interface.
+    pub bytes_tx: u64,
+    /// Cumulative number of packets received on this interface.
+    pub packets_rx: u64,
+    /// Cumulative number of data bytes received on this interface.
+    pub bytes_rx: u64,
     /// Cumulative microseconds spent in pacing waits for this interface.
     pub pacing_wait_us: u64,
     /// Last computed pacing interval in microseconds (0 if not pacing).
@@ -514,6 +520,10 @@ pub struct InterfaceStats {
     pub packets_tx: u64,
     /// Cumulative number of data bytes sent through this interface.
     pub bytes_tx: u64,
+    /// Cumulative number of packets received on this interface.
+    pub packets_rx: u64,
+    /// Cumulative number of data bytes received on this interface.
+    pub bytes_rx: u64,
     /// Number of outbound packets currently queued for the interface worker.
     pub tx_queue: usize,
     /// Number of forwarded announces waiting in the interface announce pacer.
@@ -1005,6 +1015,10 @@ struct LocalInterface {
     packets_tx: AtomicU64,
     /// Cumulative number of data bytes sent through this interface.
     bytes_tx: Arc<AtomicU64>,
+    /// Cumulative number of packets received on this interface.
+    packets_rx: AtomicU64,
+    /// Cumulative number of data bytes received on this interface.
+    bytes_rx: AtomicU64,
     /// Cumulative microseconds spent in pacing waits for this interface.
     pacing_wait_us: AtomicU64,
     /// Last computed pacing interval in microseconds.
@@ -1540,6 +1554,8 @@ impl InterfaceManager {
             last_data_send: std::sync::Mutex::new(Instant::now()),
             packets_tx: AtomicU64::new(0),
             bytes_tx,
+            packets_rx: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
             pacing_wait_us: AtomicU64::new(0),
             last_pacing_interval_us: AtomicU64::new(0),
             ia_freq_deque: std::sync::Mutex::new(VecDeque::with_capacity(INGRESS_FREQ_SAMPLES)),
@@ -1730,6 +1746,9 @@ impl InterfaceManager {
                     None => 0,
                 },
                 packets_tx: iface.packets_tx.load(Ordering::Relaxed),
+                bytes_tx: iface.bytes_tx.load(Ordering::Relaxed),
+                packets_rx: iface.packets_rx.load(Ordering::Relaxed),
+                bytes_rx: iface.bytes_rx.load(Ordering::Relaxed),
                 pacing_wait_us: iface.pacing_wait_us.load(Ordering::Relaxed),
                 last_pacing_interval_us: iface.last_pacing_interval_us.load(Ordering::Relaxed),
                 channel_load,
@@ -1758,6 +1777,20 @@ impl InterfaceManager {
         let Some(iface) = self.iface_by_address(address) else {
             return;
         };
+        *iface.last_activity.lock().unwrap() = Instant::now();
+    }
+
+    /// Record a received packet and its on-wire size for an interface.
+    ///
+    /// This performs the same activity refresh as
+    /// [`Self::record_interface_activity`] and additionally increments the
+    /// per-interface RX counters exposed via RPC and Prometheus metrics.
+    pub fn record_interface_rx(&self, address: &AddressHash, bytes: usize) {
+        let Some(iface) = self.iface_by_address(address) else {
+            return;
+        };
+        iface.packets_rx.fetch_add(1, Ordering::Relaxed);
+        iface.bytes_rx.fetch_add(bytes as u64, Ordering::Relaxed);
         *iface.last_activity.lock().unwrap() = Instant::now();
     }
 
@@ -2125,6 +2158,8 @@ impl InterfaceManager {
                     mode: iface.mode,
                     packets_tx: iface.packets_tx.load(Ordering::Relaxed),
                     bytes_tx: iface.bytes_tx.load(Ordering::Relaxed),
+                    packets_rx: iface.packets_rx.load(Ordering::Relaxed),
+                    bytes_rx: iface.bytes_rx.load(Ordering::Relaxed),
                     tx_queue: channel_queue_len(&iface.tx_send),
                     announce_queue,
                     channel_load,
@@ -2953,6 +2988,8 @@ mod tests {
                 packet: Packet::default(),
             })
             .await;
+        manager.record_interface_rx(&iface, 120);
+        manager.record_interface_rx(&iface, 80);
         rx_channel
             .send(RxMessage {
                 address: iface,
@@ -2970,6 +3007,13 @@ mod tests {
         assert_eq!(lengths.interfaces[0].address, iface);
         assert_eq!(lengths.interfaces[0].tx, 2);
         assert_eq!(lengths.interfaces[0].announce, 0);
+        assert_eq!(lengths.interfaces[0].packets_rx, 2);
+        assert_eq!(lengths.interfaces[0].bytes_rx, 200);
+
+        let stats = manager.interface_stats_list();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].packets_rx, 2);
+        assert_eq!(stats[0].bytes_rx, 200);
     }
 
     #[tokio::test]
