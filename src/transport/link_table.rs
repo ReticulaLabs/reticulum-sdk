@@ -23,6 +23,123 @@ pub struct LinkEntry {
     pub forward_count: u64,
 }
 
+/// Which kind of traffic is being routed through a link.
+///
+/// Used only to keep the existing trace wording for data versus proofs.
+#[derive(Clone, Copy)]
+enum DirectionKind {
+    Data,
+    Proof,
+}
+
+impl DirectionKind {
+    fn mismatch_prefix(self) -> &'static str {
+        match self {
+            Self::Data => "hop mismatch",
+            Self::Proof => "proof hop mismatch",
+        }
+    }
+
+    fn no_match_subject(self) -> &'static str {
+        match self {
+            Self::Data => "link",
+            Self::Proof => "proof of link",
+        }
+    }
+}
+
+impl LinkEntry {
+    /// Select the interface a link packet or proof should be forwarded to.
+    ///
+    /// The link carries traffic in two directions:
+    ///
+    /// * `next_hop_iface` is the interface toward the link destination;
+    /// * `received_from` is the interface toward the initiator.
+    ///
+    /// On a shared medium both are the same, so direction does not matter
+    /// and either expected hop count is accepted. Otherwise a packet must
+    /// arrive on the interface matching the direction it is travelling,
+    /// with the hop count recorded for that direction.
+    ///
+    /// A link-request proof is authoritative: when `is_lrproof` is set it is
+    /// accepted on any hop count from the destination side (and on the
+    /// shared medium), because it establishes the real hop count and
+    /// rebalances the path table. It is still subject to the initiator-side
+    /// hop check.
+    fn outbound_iface(
+        &self,
+        link: AddressHash,
+        received_on: AddressHash,
+        hops: u8,
+        is_lrproof: bool,
+        kind: DirectionKind,
+    ) -> Option<AddressHash> {
+        if self.next_hop_iface == self.received_from {
+            // Shared medium: repeat on that interface if the hop count
+            // matches either direction. Loop prevention is handled here.
+            if hops == self.remaining_hops || hops == self.taken_hops || is_lrproof {
+                Some(self.next_hop_iface)
+            } else {
+                log::trace!(
+                    "link_table: {} for link {} on shared iface {}: \
+                     packet_hops={} remaining_hops={} taken_hops={}",
+                    kind.mismatch_prefix(),
+                    link,
+                    received_on,
+                    hops,
+                    self.remaining_hops,
+                    self.taken_hops,
+                );
+                None
+            }
+        } else if received_on == self.next_hop_iface {
+            // Destination side. An LRPROOF's hop count overrides the stored
+            // remaining_hops, so it is always forwarded toward the initiator.
+            if is_lrproof || hops == self.remaining_hops {
+                Some(self.received_from)
+            } else {
+                log::trace!(
+                    "link_table: {} for link {} from next-hop iface {}: \
+                     packet_hops={} remaining_hops={}",
+                    kind.mismatch_prefix(),
+                    link,
+                    received_on,
+                    hops,
+                    self.remaining_hops,
+                );
+                None
+            }
+        } else if received_on == self.received_from {
+            // Initiator side.
+            if hops == self.taken_hops {
+                Some(self.next_hop_iface)
+            } else {
+                log::trace!(
+                    "link_table: {} for link {} from received-from iface {}: \
+                     packet_hops={} taken_hops={}",
+                    kind.mismatch_prefix(),
+                    link,
+                    received_on,
+                    hops,
+                    self.taken_hops,
+                );
+                None
+            }
+        } else {
+            log::trace!(
+                "link_table: no matching interface for {} {} (received_on={}, \
+                 next_hop={}, received_from={})",
+                kind.no_match_subject(),
+                link,
+                received_on,
+                self.next_hop_iface,
+                self.received_from,
+            );
+            None
+        }
+    }
+}
+
 /// Result of processing an inbound proof against the link table.
 ///
 /// `propagation` is the packet/interface to forward the proof to (always
@@ -192,69 +309,13 @@ impl LinkTable {
             return None;
         }
 
-        let outbound_iface = if entry.next_hop_iface == entry.received_from {
-            // The link is carried on a single shared medium, so the
-            // receiving and outbound interface are the same. Direction
-            // doesn't matter: simply repeat the packet on that interface.
-            // This also covers the common single-interface
-            // node, where `received_on` always equals the shared interface
-            // — packets must NOT be dropped just because they arrived on
-            // the very interface we would transmit them on (loop prevention
-            // is handled by the hop-count checks below).
-            if packet.header.hops == entry.remaining_hops || packet.header.hops == entry.taken_hops
-            {
-                Some(entry.next_hop_iface)
-            } else {
-                log::trace!(
-                    "link_table: hop mismatch for link {} on shared iface {}: \
-                     packet_hops={} remaining_hops={} taken_hops={}",
-                    packet.destination,
-                    received_on,
-                    packet.header.hops,
-                    entry.remaining_hops,
-                    entry.taken_hops,
-                );
-                None
-            }
-        } else if received_on == entry.next_hop_iface {
-            if packet.header.hops == entry.remaining_hops {
-                Some(entry.received_from)
-            } else {
-                log::trace!(
-                    "link_table: hop mismatch for link {} from next-hop iface {}: \
-                     packet_hops={} remaining_hops={}",
-                    packet.destination,
-                    received_on,
-                    packet.header.hops,
-                    entry.remaining_hops,
-                );
-                None
-            }
-        } else if received_on == entry.received_from {
-            if packet.header.hops == entry.taken_hops {
-                Some(entry.next_hop_iface)
-            } else {
-                log::trace!(
-                    "link_table: hop mismatch for link {} from received-from iface {}: \
-                     packet_hops={} taken_hops={}",
-                    packet.destination,
-                    received_on,
-                    packet.header.hops,
-                    entry.taken_hops,
-                );
-                None
-            }
-        } else {
-            log::trace!(
-                "link_table: no matching interface for link {} (received_on={}, \
-                 next_hop={}, received_from={})",
-                packet.destination,
-                received_on,
-                entry.next_hop_iface,
-                entry.received_from,
-            );
-            None
-        };
+        let outbound_iface = entry.outbound_iface(
+            packet.destination,
+            received_on,
+            packet.header.hops,
+            false,
+            DirectionKind::Data,
+        );
 
         outbound_iface.map(|iface| {
             log::trace!(
@@ -290,71 +351,13 @@ impl LinkTable {
         let entry = self.0.get_mut(&proof.destination)?;
         let is_lrproof = proof.context == PacketContext::LinkRequestProof;
 
-        let outbound_iface = if entry.next_hop_iface == entry.received_from {
-            // The link is carried on a single shared medium: direction
-            // doesn't matter, just repeat the proof there if the hop count
-            // matches one of the expected values (LRPROOFs are tolerated on
-            // any hop count — the proof is authoritative and rebalances).
-            if proof.header.hops == entry.remaining_hops
-                || proof.header.hops == entry.taken_hops
-                || is_lrproof
-            {
-                Some(entry.next_hop_iface)
-            } else {
-                log::trace!(
-                    "link_table: proof hop mismatch for link {} on shared iface {}: \
-                     packet_hops={} remaining_hops={} taken_hops={}",
-                    proof.destination,
-                    received_on,
-                    proof.header.hops,
-                    entry.remaining_hops,
-                    entry.taken_hops,
-                );
-                None
-            }
-        } else if received_on == entry.next_hop_iface {
-            // Destination side: an LRPROOF is authoritative and rebalances
-            // (its hop count overrides the stored remaining_hops), so it is
-            // always forwarded toward the initiator.  Message proofs must
-            // match the destination-side hop count.
-            if is_lrproof || proof.header.hops == entry.remaining_hops {
-                Some(entry.received_from)
-            } else {
-                log::trace!(
-                    "link_table: proof hop mismatch for link {} from next-hop iface {}: \
-                     packet_hops={} remaining_hops={}",
-                    proof.destination,
-                    received_on,
-                    proof.header.hops,
-                    entry.remaining_hops,
-                );
-                None
-            }
-        } else if received_on == entry.received_from {
-            if proof.header.hops == entry.taken_hops {
-                Some(entry.next_hop_iface)
-            } else {
-                log::trace!(
-                    "link_table: proof hop mismatch for link {} from received-from iface {}: \
-                     packet_hops={} taken_hops={}",
-                    proof.destination,
-                    received_on,
-                    proof.header.hops,
-                    entry.taken_hops,
-                );
-                None
-            }
-        } else {
-            log::trace!(
-                "link_table: no matching interface for proof of link {} (received_on={}, \
-                 next_hop={}, received_from={})",
-                proof.destination,
-                received_on,
-                entry.next_hop_iface,
-                entry.received_from,
-            );
-            None
-        };
+        let outbound_iface = entry.outbound_iface(
+            proof.destination,
+            received_on,
+            proof.header.hops,
+            is_lrproof,
+            DirectionKind::Proof,
+        );
 
         let outbound_iface = outbound_iface?;
 
@@ -708,6 +711,34 @@ mod tests {
             outcome2.rebalance.is_none(),
             "second LRPROOF for the same link must not re-trigger rebalance"
         );
+    }
+
+    #[test]
+    fn lrproof_on_initiator_side_still_requires_taken_hop_count() {
+        let destination = AddressHash::new_from_slice(b"link-destination");
+        let request_iface = AddressHash::new_from_slice(b"request-iface");
+        let destination_iface = AddressHash::new_from_slice(b"destination-iface");
+        let mut request = link_request(destination);
+        request.header.hops = 1;
+        let link_id = LinkId::from(&request);
+        let mut table = LinkTable::new();
+
+        table.add(&request, destination, request_iface, destination_iface, 2);
+
+        // An LRPROOF is authoritative on the destination side, but a proof
+        // arriving from the initiator side must still match taken_hops.
+        let mismatched = link_proof(link_id, 5);
+        assert!(
+            table.handle_proof(&mismatched, request_iface).is_none(),
+            "LRPROOF on the initiator side must not bypass the taken_hops check"
+        );
+
+        let matching = link_proof(link_id, 1);
+        let (_, iface) = table
+            .handle_proof(&matching, request_iface)
+            .expect("matching LRPROOF from initiator side forwards")
+            .propagation;
+        assert_eq!(iface, destination_iface);
     }
 
     #[test]
