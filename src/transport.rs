@@ -3520,6 +3520,36 @@ async fn handle_proof(
     }
 }
 
+/// Build a solicited path-response announce for a directly connected peer.
+///
+/// Both the cached-announce path and the pending-discovery response use the
+/// same wire shape: a Type2 announce carrying the local transport ID and the
+/// source announce's context flag and payload.
+fn build_path_response(
+    transport_id: AddressHash,
+    destination: AddressHash,
+    context_flag: crate::packet::ContextFlag,
+    hops: u8,
+    data: PacketDataBuffer,
+) -> Packet {
+    Packet {
+        header: Header {
+            ifac_flag: IfacFlag::Open,
+            header_type: HeaderType::Type2,
+            context_flag,
+            propagation_type: PropagationType::Transport,
+            destination_type: DestinationType::Single,
+            packet_type: PacketType::Announce,
+            hops,
+        },
+        ifac: None,
+        destination,
+        transport: Some(transport_id),
+        context: PacketContext::PathResponse,
+        data,
+    }
+}
+
 /// Apply a verified path-table rebalance for `destination`.
 ///
 /// This unconditionally updates the path table. Callers are responsible
@@ -4147,23 +4177,13 @@ is_path_response={}",
             .handle_announce(packet, packet.transport, iface, path_expiry, iface_gravity, iface_bitrate);
 
         if let Some(response_iface) = handler.path_requests.take_discovery(&packet.destination) {
-            let transport_id = handler.config.identity.address_hash().clone();
-            let response = Packet {
-                header: Header {
-                    ifac_flag: IfacFlag::Open,
-                    header_type: HeaderType::Type2,
-                    context_flag: packet.header.context_flag,
-                    propagation_type: PropagationType::Transport,
-                    destination_type: DestinationType::Single,
-                    packet_type: PacketType::Announce,
-                    hops: packet.header.hops,
-                },
-                ifac: None,
-                destination: packet.destination,
-                transport: Some(transport_id),
-                context: PacketContext::PathResponse,
-                data: packet.data.clone(),
-            };
+            let response = build_path_response(
+                *handler.config.identity.address_hash(),
+                packet.destination,
+                packet.header.context_flag,
+                packet.header.hops,
+                packet.data.clone(),
+            );
 
             pending.push(TxMessage {
                 tx_type: TxMessageType::Direct(response_iface),
@@ -4352,23 +4372,13 @@ async fn handle_path_request(
                         request.destination,
                         hops,
                     );
-                    let transport_id = handler.config.identity.address_hash().clone();
-                    let response = Packet {
-                        header: Header {
-                            ifac_flag: IfacFlag::Open,
-                            header_type: HeaderType::Type2,
-                            context_flag: announce.header.context_flag,
-                            propagation_type: PropagationType::Transport,
-                            destination_type: DestinationType::Single,
-                            packet_type: PacketType::Announce,
-                            hops,
-                        },
-                        ifac: None,
-                        destination: request.destination,
-                        transport: Some(transport_id),
-                        context: PacketContext::PathResponse,
-                        data: announce.data,
-                    };
+                    let response = build_path_response(
+                        *handler.config.identity.address_hash(),
+                        request.destination,
+                        announce.header.context_flag,
+                        hops,
+                        announce.data,
+                    );
                     pending.push(TxMessage {
                         tx_type: TxMessageType::Direct(iface),
                         packet: response,
