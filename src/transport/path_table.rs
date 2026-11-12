@@ -457,8 +457,10 @@ impl PathEntry {
 
         // For an announce at the same hop count as the installed path,
         // prefer the interface with higher gravity (matching Python
-        // Transport.py:1836-1845); when gravity is equal, prefer the
-        // interface with the higher bitrate.
+        // Transport.py:1836-1845). When gravity is equal, the SDK
+        // additionally prefers the higher-bitrate interface. This is a
+        // local equal-hop path-selection optimisation only; it does not
+        // alter packet encoding, forwarding semantics, or interoperability.
         let prefers_interface = || {
             if incoming_gravity != self.iface_gravity {
                 incoming_gravity > self.iface_gravity
@@ -472,25 +474,28 @@ impl PathEntry {
         };
 
         if self.random_blobs.contains(&random_blob) {
-            // The same announce emission was already recorded. Accept it
-            // if it arrives via a strictly closer (fewer-hop) path, or via
-            // a preferred (higher-gravity, then higher-bitrate) interface at
-            // the same hop count: the path is updated when the same
-            // announce is received on an interface with higher gravity.
+            // The same announce emission was already recorded. Python only
+            // updates a known path for a higher-gravity interface; it does
+            // NOT switch to a same-emission copy merely because it arrived
+            // via fewer hops. Treating a closer replay as an update causes
+            // path churn in meshes where one emission arrives over several
+            // routes, and re-arms announce retransmission.
             if hops < self.hops {
                 log::trace!(
-                    "path_table accept same-emission announce for {} via closer path ({} < {} hops)",
+                    "path_table ignoring same-emission closer path for {} ({} < {} hops)",
                     destination,
                     hops,
                     self.hops,
                 );
-                return true;
+                return false;
             }
             if hops == self.hops && prefers_interface() {
                 log::trace!(
-                    "path_table accept same-emission announce for {} via preferred interface (gravity {} bitrate {:?})",
+                    "path_table accept same-emission announce for {} via preferred interface (gravity {} -> {}, bitrate {:?} / {:?})",
                     destination,
+                    self.iface_gravity,
                     incoming_gravity,
+                    self.iface_bitrate,
                     incoming_bitrate,
                 );
                 return true;
@@ -508,14 +513,16 @@ impl PathEntry {
                 return true;
             }
 
-            // Same emission time: Python only updates the path for a
-            // higher-gravity interface (Transport.py:1836-1845); extend that
-            // with a bitrate tie-break when gravity is equal.
+            // Same emission time: prefer a higher-gravity interface
+            // (Python), with the SDK's bitrate tie-break when gravity is
+            // equal.
             if announce_emitted == path_timebase && prefers_interface() {
                 log::trace!(
-                    "path_table accept announce for {} via preferred interface (gravity {} bitrate {:?})",
+                    "path_table accept announce for {} via preferred interface (gravity {} -> {}, bitrate {:?} / {:?})",
                     destination,
+                    self.iface_gravity,
                     incoming_gravity,
+                    self.iface_bitrate,
                     incoming_bitrate,
                 );
                 return true;
@@ -940,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn same_emission_with_fewer_hops_replaces_path() {
+    fn same_emission_with_fewer_hops_does_not_replace_path() {
         let destination = AddressHash::new_from_slice(b"replayed-destination");
         let first_iface = AddressHash::new_from_slice(b"first-iface");
         let second_iface = AddressHash::new_from_slice(b"second-iface");
@@ -955,8 +962,18 @@ mod tests {
             0,
             None,
         );
+
+        // The same emission at a closer hop count must NOT re-route a
+        // healthy path. Python only updates same-emission paths for a
+        // higher-gravity interface; accepting closer replays caused path
+        // churn and re-armed announce retransmission.
+        let closer = announce_with_random_blob(destination, 1, blob);
+        assert!(
+            !table.would_update_path(&closer, 0, None),
+            "same-emission closer path must not be treated as a path update"
+        );
         table.handle_announce(
-            &announce_with_random_blob(destination, 1, blob),
+            &closer,
             None,
             second_iface,
             Duration::from_secs(60 * 60 * 24 * 7),
@@ -964,12 +981,9 @@ mod tests {
             None,
         );
 
-        // The same emission arriving via a strictly closer (fewer-hop)
-        // path must replace the existing route, so a multi-interface node
-        // converges on the closest peer for a single announce emission.
         let (_, iface, hops) = table.next_hop_route(&destination).unwrap();
-        assert_eq!(iface, second_iface);
-        assert_eq!(hops, 1);
+        assert_eq!(iface, first_iface);
+        assert_eq!(hops, 2);
     }
 
     #[test]

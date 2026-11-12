@@ -2251,6 +2251,18 @@ async fn handle_rpc_listen(
                         Value::from(msg.packet.header.header_type as u8 as u64),
                     ),
                     (
+                        Value::from("destination_type"),
+                        Value::from(msg.packet.header.destination_type as u8 as u64),
+                    ),
+                    (
+                        Value::from("transport"),
+                        msg.packet
+                            .transport
+                            .as_ref()
+                            .map(|transport| Value::Binary(transport.as_slice().to_vec()))
+                            .unwrap_or(Value::Nil),
+                    ),
+                    (
                         Value::from("packet_type"),
                         Value::from(msg.packet.header.packet_type as u8 as u64),
                     ),
@@ -3220,7 +3232,20 @@ impl TransportHandler {
         }
 
         match packet.transport {
-            Some(transport_id) => transport_id == *self.config.identity.address_hash(),
+            Some(transport_id) => {
+                let local = *self.config.identity.address_hash();
+                if transport_id != local && packet.header.packet_type == PacketType::LinkRequest {
+                    log::debug!(
+                        "tp({}): dropping link request for other transport: dst={} transport={} local_transport={} ingress_hops={}",
+                        self.config.name,
+                        packet.destination,
+                        transport_id,
+                        local,
+                        packet.header.hops,
+                    );
+                }
+                transport_id == local
+            }
             None => true,
         }
     }
@@ -4610,7 +4635,19 @@ async fn handle_link_request_as_intermediate(
         next_hop_iface,
         remaining_hops,
     ) {
-        AddLinkRequest::New => {}
+        AddLinkRequest::New => {
+            log::debug!(
+                "tp({}): forwarding new link request dst={} ingress={} transport={:?} next_hop={} to_iface={} packet_hops={} remaining_hops={}",
+                handler.config.name,
+                packet.destination,
+                received_from,
+                packet.transport,
+                next_hop_transport,
+                next_hop_iface,
+                packet.header.hops,
+                remaining_hops,
+            );
+        }
         AddLinkRequest::Retransmission => {
             log::trace!(
                 "tp({}): re-forwarding retransmitted link request {} for {}",
@@ -4781,10 +4818,13 @@ async fn handle_link_request(
             )
             .await;
         } else {
-            log::trace!(
-                "tp({}): dropping link request to unknown destination {}",
+            log::debug!(
+                "tp({}): dropping link request to unknown destination {} (ingress={} transport={:?} hops={})",
                 handler.config.name,
-                packet.destination
+                packet.destination,
+                iface,
+                packet.transport,
+                packet.header.hops,
             );
         }
     }
@@ -7615,13 +7655,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_emission_on_two_interfaces_converges_on_closest_path() {
-        // Regression test for the multi-interface path selection bug: a
-        // single announce emission carries the same hop-invariant packet
-        // hash on every interface, so the copy heard on a second interface
-        // must still reach the path table. When the second copy arrives via
-        // a strictly closer (fewer-hop) path, the route must be updated to
-        // it instead of pinning traffic to the stale longer path.
+    async fn same_emission_on_two_interfaces_keeps_original_path() {
+        // a single announce emission carries the same hop-invariant packet
+        // hash on every interface, but a copy arriving via a strictly closer
+        // path is NOT treated as a path update. Only a higher-gravity interface
+        // may re-route a known same-emission path. Accepting closer replays caused
+        // path churn and re-armed announce retransmission on multi-interface hubs.
         let transport = Transport::new(Default::default());
         let handler = transport.get_handler();
         let mut rng = UnwrapErr(SysRng);
@@ -7687,10 +7726,10 @@ mod tests {
             .next_hop_route(&destination)
             .unwrap();
         assert_eq!(
-            iface, fast_iface,
-            "path must converge to the closest (1-hop) interface for the same emission"
+            iface, slow_iface,
+            "same-emission closer path must not replace a healthy route"
         );
-        assert_eq!(hops, 1);
+        assert_eq!(hops, 2);
     }
 
     #[tokio::test]
