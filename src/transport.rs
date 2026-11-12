@@ -2566,16 +2566,16 @@ dest_type={:?} ctx={:?} packet_hops={} transport={} transport_matches_destinatio
             )
         };
 
-        let would_update = handler
+        let announce_decision = handler
             .send_ctx
             .path_table
             .read()
             .unwrap()
-            .would_update_path(&packet, iface_gravity, iface_bitrate);
+            .evaluate_announce(&packet, iface_gravity, iface_bitrate);
 
         // Path responses are exempt from the rate limiter.
         if packet.context != PacketContext::PathResponse {
-            if would_update
+            if announce_decision.would_update
                 && let Some(blocked_until) = handler.announce_limits.check(&packet.destination)
             {
                 handler.announces_rate_limited += 1;
@@ -2655,7 +2655,7 @@ is_path_response={}",
             // received.  Gating on `would_update_path` also prevents
             // circulating announces from re-arming the announce table and
             // looping endlessly with inflated hop counts.
-            if packet.context != PacketContext::PathResponse && would_update {
+            if packet.context != PacketContext::PathResponse && announce_decision.would_update {
                 let from_local_client = handler
                     .send_ctx
                     .iface_manager
@@ -2681,7 +2681,15 @@ is_path_response={}",
             .path_table
             .write()
             .unwrap()
-            .handle_announce(packet, packet.transport, iface, path_expiry, iface_gravity, iface_bitrate);
+            .handle_announce_with_decision(
+                packet,
+                packet.transport,
+                iface,
+                path_expiry,
+                iface_gravity,
+                iface_bitrate,
+                announce_decision,
+            );
 
         if let Some(response_iface) = handler.path_requests.take_discovery(&packet.destination) {
             let response = build_path_response(

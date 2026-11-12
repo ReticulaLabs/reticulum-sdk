@@ -61,6 +61,15 @@ pub struct PathTable {
     reroute_eager: bool,
 }
 
+/// Result of deciding whether an inbound announce should update the path
+/// table, including the decoded random blob needed to install it.
+pub(super) struct AnnounceDecision {
+    /// Whether the announce would install or improve the path.
+    pub(super) would_update: bool,
+    /// The announce's random blob, decoded while evaluating the decision.
+    random_blob: Option<RandomBlob>,
+}
+
 impl PathTable {
     pub fn new(reroute_eager: bool) -> Self {
         Self {
@@ -154,6 +163,14 @@ impl PathTable {
         }
     }
 
+    /// Install an announce into the path table.
+    ///
+    /// Convenience wrapper that evaluates the acceptance decision and
+    /// installs in one call. Production transport code uses
+    /// [`Self::evaluate_announce`] plus [`Self::handle_announce_with_decision`]
+    /// so the decision can also gate rate limiting and retransmission.
+    /// Kept as the simple entry point for callers and tests.
+    #[allow(dead_code)]
     pub fn handle_announce(
         &mut self,
         announce: &Packet,
@@ -163,12 +180,41 @@ impl PathTable {
         iface_gravity: i64,
         iface_bitrate: Option<f64>,
     ) -> bool {
-        if !self.would_update_path(announce, iface_gravity, iface_bitrate) {
+        let decision = self.evaluate_announce(announce, iface_gravity, iface_bitrate);
+        self.handle_announce_with_decision(
+            announce,
+            transport_id,
+            iface,
+            path_expiry,
+            iface_gravity,
+            iface_bitrate,
+            decision,
+        )
+    }
+
+    /// Install an announce whose acceptance decision has already been
+    /// evaluated by [`Self::evaluate_announce`].
+    ///
+    /// Callers that use the decision for other work (rate limiting,
+    /// retransmission) can pass it here so the random blob is decoded once
+    /// and the path comparison is not repeated for the same packet.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_announce_with_decision(
+        &mut self,
+        announce: &Packet,
+        transport_id: Option<AddressHash>,
+        iface: AddressHash,
+        path_expiry: Duration,
+        iface_gravity: i64,
+        iface_bitrate: Option<f64>,
+        decision: AnnounceDecision,
+    ) -> bool {
+        if !decision.would_update {
             return false;
         }
 
         let hops = announce.header.hops;
-        let random_blob = announce_random_blob(announce);
+        let random_blob = decision.random_blob;
         let received_from = transport_id.unwrap_or(announce.destination);
         let direct_announce = transport_id.is_none();
         let self_referential_transport = transport_id == Some(announce.destination);
@@ -221,20 +267,22 @@ self_referential_transport={}",
         true
     }
 
-    /// Whether an announce for this destination would update the installed
-    /// path (a fresh destination, or a strictly better / newer emission).
-    /// Non-mutating — used to gate the per-destination announce rate limiter
-    /// on announces that actually change the path, matching Python's
-    /// `should_add` gating (Transport.py).
-    pub fn would_update_path(
+    /// Evaluate whether an announce for this destination would update the
+    /// installed path (a fresh destination, or a strictly better / newer
+    /// emission), returning the decoded random blob alongside the decision.
+    ///
+    /// Non-mutating. The result can be passed to
+    /// [`Self::handle_announce_with_decision`] so the comparison and blob
+    /// decode are not repeated for the same packet.
+    pub(super) fn evaluate_announce(
         &self,
         announce: &Packet,
         incoming_gravity: i64,
         incoming_bitrate: Option<f64>,
-    ) -> bool {
+    ) -> AnnounceDecision {
         let hops = announce.header.hops;
         let random_blob = announce_random_blob(announce);
-        match self.map.get(&announce.destination) {
+        let would_update = match self.map.get(&announce.destination) {
             None => true,
             Some(entry) => match random_blob {
                 Some(blob) => entry.should_accept(
@@ -252,7 +300,31 @@ self_referential_transport={}",
                     }
                 }
             },
+        };
+
+        AnnounceDecision {
+            would_update,
+            random_blob,
         }
+    }
+
+    /// Whether an announce for this destination would update the installed
+    /// path (a fresh destination, or a strictly better / newer emission).
+    /// Non-mutating — used to gate the per-destination announce rate limiter
+    /// on announces that actually change the path, matching Python's
+    /// `should_add` gating (Transport.py).
+    ///
+    /// Kept for compatibility and tests; [`Self::evaluate_announce`] is the
+    /// production entry point because it also returns the decoded blob.
+    #[allow(dead_code)]
+    pub fn would_update_path(
+        &self,
+        announce: &Packet,
+        incoming_gravity: i64,
+        incoming_bitrate: Option<f64>,
+    ) -> bool {
+        self.evaluate_announce(announce, incoming_gravity, incoming_bitrate)
+            .would_update
     }
 
     /// Remove a specific destination from the path table.
@@ -610,7 +682,9 @@ fn timebase_from_random_blob(random_blob: RandomBlob) -> u64 {
 mod tests {
     use super::{PATH_REFRESH_INTERVAL, PathTable};
     use crate::{
+        destination::{NAME_HASH_LENGTH, RAND_HASH_LENGTH},
         hash::AddressHash,
+        identity::PUBLIC_KEY_LENGTH,
         packet::{
             DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer,
             PacketType, PropagationType,
@@ -709,6 +783,75 @@ mod tests {
         let mut worse = announce.clone();
         worse.header.hops = 2;
         assert!(!table.would_update_path(&worse, 0, None));
+    }
+
+    #[test]
+    fn handle_announce_with_decision_installs_using_evaluated_blob() {
+        let destination = AddressHash::new_from_slice(b"decision-destination");
+        let iface = AddressHash::new_from_slice(b"decision-iface");
+        let mut table = PathTable::new(false);
+
+        let blob_offset = PUBLIC_KEY_LENGTH * 2 + NAME_HASH_LENGTH;
+        let mut data = vec![0u8; blob_offset + RAND_HASH_LENGTH];
+        // Leave the first emission's timebase at zero.
+        let announce = Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                destination_type: DestinationType::Single,
+                hops: 1,
+                ..Default::default()
+            },
+            destination,
+            transport: None,
+            context: PacketContext::None,
+            ifac: None,
+            data: PacketDataBuffer::new_from_slice(&data),
+        };
+
+        let decision = table.evaluate_announce(&announce, 0, None);
+        assert!(decision.would_update);
+        assert!(table.handle_announce_with_decision(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(3600),
+            0,
+            None,
+            decision,
+        ));
+
+        // The same emission must be rejected without re-evaluating the blob,
+        // and the rejected install must leave the installed path untouched.
+        let decision = table.evaluate_announce(&announce, 0, None);
+        assert!(!decision.would_update);
+        assert!(!table.handle_announce_with_decision(
+            &announce,
+            None,
+            iface,
+            Duration::from_secs(3600),
+            0,
+            None,
+            decision,
+        ));
+        assert_eq!(table.get(&destination).unwrap().hops, 1);
+
+        // A newer emission (higher timebase) is accepted.
+        data[blob_offset + RAND_HASH_LENGTH - 1] = 1;
+        let newer = Packet {
+            data: PacketDataBuffer::new_from_slice(&data),
+            ..announce
+        };
+        let decision = table.evaluate_announce(&newer, 0, None);
+        assert!(decision.would_update);
+        assert!(table.handle_announce_with_decision(
+            &newer,
+            None,
+            iface,
+            Duration::from_secs(3600),
+            0,
+            None,
+            decision,
+        ));
     }
 
     #[test]
